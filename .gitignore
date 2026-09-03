@@ -1,0 +1,44 @@
+# ========== Gradle 构建产物 ==========
+.gradle/
+build/
+**/build/
+# Gradle 自动生成的 daemon 配置(机器相关)
+/gradle/gradle-daemon-jvm.properties
+
+# ========== 本机配置(含 SDK 路径,严禁上传) ==========
+local.properties
+
+# ========== IDE 配置(含机器相关的绝对路径,不共享) ==========
+.idea/
+*.iml
+
+# ========== Kotlin 编译会话缓存 ==========
+.kotlin/
+
+# ========== 打包产物与签名文件 ==========
+*.apk
+*.aab
+*.ap_
+*.keystore
+*.jks
+*.p12
+*.key
+/app/release/
+
+# ========== JVM 崩溃日志 ==========
+hs_err_pid*.log
+replay_pid*.log
+*.hprof
+*.dump
+
+# ========== 原生构建产物 ==========
+.externalNativeBuild/
+.cxx/
+
+# ========== 测试/模拟器截图 ==========
+captures/
+
+# ========== 操作系统垃圾文件 ==========
+.DS_Store
+Thumbs.db
+Desktop.ini
