@@ -25,6 +25,8 @@ import java.io.InputStream
 import java.net.URLEncoder
 import kotlinx.coroutines.delay
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
 
 class ApiException(message: String) : Exception(message)
@@ -248,9 +250,17 @@ class LanraragiRepository(
         }
     }
 
-    suspend fun renameCategory(id: String, name: String) {
+    suspend fun getBookmarkCategoryId(): String = network {
+        val resp = api.getBookmarkCategoryLink()
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        val root = body?.let(ApiClient.json::parseToJsonElement) as? JsonObject
+        (root?.get("category_id") as? JsonPrimitive)?.content.orEmpty()
+    }
+
+    suspend fun renameCategory(id: String, name: String, pinned: Boolean) {
         network {
-            val resp = api.renameCategory(id, name)
+            val resp = api.renameCategory(id, name, pinned)
             ensureSuccess(resp, resp.body()?.string())
         }
     }

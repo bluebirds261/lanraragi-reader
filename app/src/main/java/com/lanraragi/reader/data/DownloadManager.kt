@@ -13,8 +13,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -50,7 +50,8 @@ typealias DownloadWork = suspend (onProgress: (Float?) -> Unit) -> Unit
 
 /**
  * 统一下载任务管理器：把离线缓存、原档下载、收藏单页收拢成同一个队列。
- * 并发数通过构造参数注入，默认 2；UI 可以订阅 [activeCount] 做真实的活动任务徽标。
+ * 并发数通过构造参数注入，默认 2；可在运行时安全更新。
+ * UI 可以订阅 [activeCount] 做真实的活动任务徽标。
  */
 class DownloadManager(
     private val scope: CoroutineScope,
@@ -64,7 +65,8 @@ class DownloadManager(
     /** 活动任务数量：WAITING/RUNNING。PAUSED 不计入。 */
     val activeCount: StateFlow<Int> = _activeCount.asStateFlow()
 
-    private val semaphore = Semaphore(maxConcurrent.coerceAtLeast(1))
+    private var maxConcurrent = maxConcurrent.coerceIn(1, 8)
+    private val dispatchMutex = Mutex()
     private val jobs = ConcurrentHashMap<String, Job>()
     private val works = ConcurrentHashMap<String, DownloadWork>()
     private val retriedIds = ConcurrentHashMap.newKeySet<String>()
@@ -84,9 +86,15 @@ class DownloadManager(
         _tasks.update { it + DownloadTask(id = id, type = type, arcid = arcid, title = title) }
         refreshActiveCount()
         persist()
-        startWorker(id)
+        requestDispatch()
         syncService()
         return id
+    }
+
+    /** 更新并发上限；已运行任务不中断，新任务会按新上限派发。 */
+    fun setMaxConcurrent(value: Int) {
+        maxConcurrent = value.coerceIn(1, 8)
+        requestDispatch()
     }
 
     fun pause(id: String) {
@@ -104,7 +112,7 @@ class DownloadManager(
         retriedIds.remove(id)
         update(id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
         persist()
-        startWorker(id)
+        requestDispatch()
         syncService()
     }
 
@@ -114,7 +122,7 @@ class DownloadManager(
         retriedIds.remove(id)
         update(id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
         persist()
-        startWorker(id)
+        requestDispatch()
         syncService()
     }
 
@@ -139,8 +147,8 @@ class DownloadManager(
         targets.forEach { task ->
             retriedIds.remove(task.id)
             update(task.id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
-            startWorker(task.id)
         }
+        requestDispatch()
         refreshActiveCount()
         persist()
         syncService()
@@ -211,37 +219,58 @@ class DownloadManager(
         maybeStopService()
     }
 
-    private fun startWorker(id: String) {
-        val job = scope.launch {
-            semaphore.withPermit {
-                val task = find(id) ?: return@withPermit
-                if (task.state != TaskState.WAITING) return@withPermit
-                update(id) { it.copy(state = TaskState.RUNNING, error = null) }
-                persist()
-                val work = works[id]
-                if (work == null) {
-                    markFailed(id, "任务不可用，请重新发起")
-                    return@withPermit
-                }
-                try {
-                    work { p -> updateProgress(id, p) }
-                    markDone(id)
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    val msg = e.message ?: "下载失败"
-                    if (retriedIds.add(id)) {
-                        update(id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
-                        persist()
-                        startWorker(id)
-                    } else {
-                        markFailed(id, msg)
-                    }
+    private fun requestDispatch() {
+        scope.launch {
+            dispatchMutex.withLock { dispatchWaitingTasks() }
+        }
+    }
+
+    private fun dispatchWaitingTasks() {
+        val availableSlots = (maxConcurrent - jobs.size).coerceAtLeast(0)
+        if (availableSlots == 0) return
+        _tasks.value
+            .asSequence()
+            .filter {
+                it.state == TaskState.WAITING &&
+                    !jobs.containsKey(it.id) &&
+                    works.containsKey(it.id)
+            }
+            .take(availableSlots)
+            .forEach { task ->
+                val job = scope.launch { runWorker(task.id) }
+                jobs[task.id] = job
+            }
+    }
+
+    private suspend fun runWorker(id: String) {
+        try {
+            val task = find(id) ?: return
+            if (task.state != TaskState.WAITING) return
+            update(id) { it.copy(state = TaskState.RUNNING, error = null) }
+            persist()
+            val work = works[id]
+            if (work == null) {
+                markFailed(id, "任务不可用，请重新发起")
+                return
+            }
+            try {
+                work { p -> updateProgress(id, p) }
+                markDone(id)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                val msg = e.message ?: "下载失败"
+                if (retriedIds.add(id)) {
+                    update(id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
+                    persist()
+                } else {
+                    markFailed(id, msg)
                 }
             }
+        } finally {
+            jobs.remove(id)
+            requestDispatch()
         }
-        jobs[id] = job
-        job.invokeOnCompletion { jobs.remove(id, job) }
     }
 
     private fun updateProgress(id: String, p: Float?) {

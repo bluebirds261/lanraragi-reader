@@ -78,17 +78,17 @@ object ApiClient {
     fun pageUrl(arcid: String, rawPath: String, thumbnail: Boolean = false): String {
         val encoded = if (rawPath.contains('%')) rawPath else Uri.encode(rawPath)
         val thumb = if (thumbnail) "&thumbnail=true" else ""
-        return "$SENTINEL_BASE/api/archives/$arcid/page?path=$encoded$thumb"
+        return "${SENTINEL_BASE}api/archives/$arcid/page?path=$encoded$thumb"
     }
 
-    fun thumbnailUrl(arcid: String): String = "$SENTINEL_BASE/api/archives/$arcid/thumbnail"
+    fun thumbnailUrl(arcid: String): String = "${SENTINEL_BASE}api/archives/$arcid/thumbnail"
 
     /** 单行本封面（A11）：`GET /api/tankoubons/{id}/thumbnail`。 */
-    fun tankoubonThumbnailUrl(id: String): String = "$SENTINEL_BASE/api/tankoubons/$id/thumbnail"
+    fun tankoubonThumbnailUrl(id: String): String = "${SENTINEL_BASE}api/tankoubons/$id/thumbnail"
 
     /** 某页的低分辨率缩略图 URL（省流量模式用；page 从 1 起）。 */
     fun pageThumbnailUrl(arcid: String, pageIndex: Int): String =
-        "$SENTINEL_BASE/api/archives/$arcid/thumbnail?page=${pageIndex + 1}"
+        "${SENTINEL_BASE}api/archives/$arcid/thumbnail?page=${pageIndex + 1}"
 
     /** 把 /files 返回的相对分页 URL 转成绝对地址（占位 host，拦截器会改写为真实服务器）。 */
     fun toAbsoluteUrl(pathOrUrl: String): String {

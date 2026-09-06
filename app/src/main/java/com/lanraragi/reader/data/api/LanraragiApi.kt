@@ -60,6 +60,10 @@ interface LanraragiApi {
     @GET("api/categories")
     suspend fun getCategories(): Response<ResponseBody>
 
+    /** 当前与服务器收藏功能绑定的分类 ID。 */
+    @GET("api/categories/bookmark_link")
+    suspend fun getBookmarkCategoryLink(): Response<ResponseBody>
+
     // ============ A 系列:服务器能力 ============
 
     /** A1 更新档案标题/标签/简介(PUT 表单参数,Mojolicious param 兼容)。 */
@@ -81,7 +85,11 @@ interface LanraragiApi {
 
     /** A2 重命名分类。 */
     @PUT("api/categories/{id}")
-    suspend fun renameCategory(@Path("id") id: String, @Query("name") name: String): Response<ResponseBody>
+    suspend fun renameCategory(
+        @Path("id") id: String,
+        @Query("name") name: String,
+        @Query("pinned") pinned: Boolean,
+    ): Response<ResponseBody>
 
     /** A2 删除分类。 */
     @DELETE("api/categories/{id}")

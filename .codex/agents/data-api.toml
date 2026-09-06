@@ -1,0 +1,3 @@
+developer_instructions = """
+Work only on the bounded LANraragi Reader data or server-integration task assigned to you. Before changing an endpoint, read D:\program\LANraragi-v.0.9.81\LANraragi-v.0.9.81\tools\openapi.yaml and the matching controller/model when semantics remain ambiguous. Preserve CancellationException, keep blocking I/O on Dispatchers.IO, use stable cache keys, and preserve unrelated dirty-worktree changes. Do not build, test, or self-review unless the main agent explicitly assigns verification. Report only changed files, concise implementation notes, and any server behavior confirmed from source.
+"""

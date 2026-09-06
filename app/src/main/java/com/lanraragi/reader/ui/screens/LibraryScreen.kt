@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -102,10 +101,15 @@ import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.ArchiveCard
 import com.lanraragi.reader.ui.ArchiveListRow
+import com.lanraragi.reader.ui.CategoryManagementSheet
+import com.lanraragi.reader.ui.CategoryRefreshBus
 import com.lanraragi.reader.ui.EmptyBox
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.TagFilterChip
+import com.lanraragi.reader.ui.categoryDisplayName
+import com.lanraragi.reader.ui.categoryNameError
+import com.lanraragi.reader.ui.isProtectedCategoryName
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -146,7 +150,9 @@ data class LibraryState(
     val sortby: String = "title",
     val order: String = "asc",
     val categoryId: String = "",
+    val bookmarkCategoryId: String = "",
     val categories: List<Category> = emptyList(),
+    val categoryBusy: Boolean = false,
     val tags: List<TagStat> = emptyList(),
     val tagsLoading: Boolean = false,
     val newOnly: Boolean = false,
@@ -179,6 +185,7 @@ class LibraryViewModel(
     private val query = MutableStateFlow("")
     private val loadMutex = Mutex()
     private var nextStart = 0
+    private var categoryMutationInFlight = false
 
     private val _state = MutableStateFlow(LibraryState())
     val state = _state.asStateFlow()
@@ -205,12 +212,23 @@ class LibraryViewModel(
 
         viewModelScope.launch {
             try {
-                val cats = repository.getCategories()
-
-                _state.update {
-                    it.copy(categories = cats)
-                }
+                reloadCategories()
             } catch (_: Exception) {
+            }
+        }
+
+        viewModelScope.launch {
+            CategoryRefreshBus.revision.drop(1).collect {
+                try {
+                    val clearedSelection = reloadCategories()
+                    if (clearedSelection) refresh()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    _state.update {
+                        it.copy(message = e.message ?: "刷新分类失败")
+                    }
+                }
             }
         }
 
@@ -343,8 +361,9 @@ class LibraryViewModel(
 
     fun refresh() {
         viewModelScope.launch {
-            _scrollToTop.emit(Unit)
-            loadPage(0, append = false)
+            if (loadPage(0, append = false)) {
+                _scrollToTop.emit(Unit)
+            }
         }
     }
 
@@ -550,60 +569,117 @@ class LibraryViewModel(
 
     fun createCategory(name: String) {
         val n = name.trim()
-        if (n.isEmpty()) return
-        viewModelScope.launch {
-            try {
-                repository.createCategory(n)
-                reloadCategories()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                _state.update { it.copy(message = e.message ?: "新建分类失败") }
-            }
+        categoryNameError(n)?.let {
+            showMessage(it)
+            return
+        }
+        mutateCategory("新建分类失败") {
+            repository.createCategory(n)
         }
     }
 
     fun renameCategory(id: String, name: String) {
+        val category = _state.value.categories.firstOrNull { it.id == id }
+        if (category == null) {
+            showMessage("分类不存在，请刷新后重试")
+            return
+        }
+        if (
+            category.id == _state.value.bookmarkCategoryId ||
+            isProtectedCategoryName(category.name)
+        ) {
+            showMessage("系统分类不能重命名")
+            return
+        }
+
         val n = name.trim()
-        if (n.isEmpty()) return
-        viewModelScope.launch {
-            try {
-                repository.renameCategory(id, n)
-                reloadCategories()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                _state.update { it.copy(message = e.message ?: "重命名分类失败") }
-            }
+        categoryNameError(n)?.let {
+            showMessage(it)
+            return
+        }
+        mutateCategory("重命名分类失败") {
+            repository.renameCategory(id, n, category.pinned != 0)
         }
     }
 
     fun deleteCategory(id: String) {
-        viewModelScope.launch {
-            try {
-                repository.deleteCategory(id)
-                if (_state.value.categoryId == id) {
-                    setCategoryId("")
-                }
-                reloadCategories()
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                _state.update { it.copy(message = e.message ?: "删除分类失败") }
-            }
+        val category = _state.value.categories.firstOrNull { it.id == id }
+        if (category == null) {
+            showMessage("分类不存在，请刷新后重试")
+            return
         }
+        if (
+            category.id == _state.value.bookmarkCategoryId ||
+            isProtectedCategoryName(category.name)
+        ) {
+            showMessage("系统分类不能删除")
+            return
+        }
+
+        mutateCategory("删除分类失败") {
+            repository.deleteCategory(id)
+        }
+    }
+
+    fun showMessage(message: String) {
+        _state.update { it.copy(message = message) }
     }
 
     fun clearMessage() = _state.update { it.copy(message = null) }
 
-    private suspend fun reloadCategories() {
-        try {
-            val cats = repository.getCategories()
-            _state.update { it.copy(categories = cats) }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (_: Exception) {
+    private fun mutateCategory(
+        errorMessage: String,
+        operation: suspend () -> Unit,
+    ) {
+        if (categoryMutationInFlight) return
+        categoryMutationInFlight = true
+        _state.update { it.copy(categoryBusy = true) }
+
+        viewModelScope.launch {
+            try {
+                operation()
+
+                var clearedSelection = false
+                try {
+                    clearedSelection = reloadCategories()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    _state.update {
+                        it.copy(
+                            message = e.message ?: "分类已更新，但重新加载失败",
+                        )
+                    }
+                }
+
+                CategoryRefreshBus.notifyChanged()
+                if (clearedSelection) refresh()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: errorMessage) }
+            } finally {
+                categoryMutationInFlight = false
+                _state.update { it.copy(categoryBusy = false) }
+            }
         }
+    }
+
+    private suspend fun reloadCategories(): Boolean {
+        val categories = repository.getCategories()
+        val bookmarkCategoryId = repository.getBookmarkCategoryId()
+        var clearedSelection = false
+        _state.update { current ->
+            clearedSelection =
+                current.categoryId.isNotEmpty() &&
+                    categories.none { it.id == current.categoryId }
+            current.copy(
+                categories = categories,
+                categoryId = if (clearedSelection) "" else current.categoryId,
+                bookmarkCategoryId = bookmarkCategoryId,
+            )
+        }
+        return clearedSelection
     }
 
     fun toggleNewOnly() {
@@ -936,8 +1012,8 @@ class LibraryViewModel(
     private suspend fun loadPage(
         start: Int,
         append: Boolean,
-    ) {
-        loadMutex.withLock {
+    ): Boolean {
+        return loadMutex.withLock {
             val s = _state.value
 
             if (append) {
@@ -1009,6 +1085,8 @@ class LibraryViewModel(
                     )
                 }
 
+                true
+
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -1019,6 +1097,8 @@ class LibraryViewModel(
                         error = e.message ?: "加载失败",
                     )
                 }
+
+                false
             }
         }
     }
@@ -1303,8 +1383,6 @@ fun LibraryScreen(
                                             coverUrl = ApiClient.thumbnailUrl(archive.arcid) +
                                                 if (state.coverVersion > 0) "?v=${state.coverVersion}" else "",
                                             isCached = archive.arcid in state.offlineArcidSet,
-                                            isFavorite = archive.arcid in state.favArcidSet,
-                                            onToggleFavorite = { vm.toggleFavorite(archive.arcid) },
                                         )
                                     }
 
@@ -1405,8 +1483,6 @@ fun LibraryScreen(
                                                 if (state.coverVersion > 0) "?v=${state.coverVersion}" else "",
                                             compact = compactGrid,
                                             isCached = archive.arcid in state.offlineArcidSet,
-                                            isFavorite = archive.arcid in state.favArcidSet,
-                                            onToggleFavorite = { vm.toggleFavorite(archive.arcid) },
                                         )
                                     }
 
@@ -1612,9 +1688,15 @@ fun LibraryScreen(
     }
 
     if (showCategoryManager) {
-        CategoryManagerSheet(
-            state = state,
-            vm = vm,
+        CategoryManagementSheet(
+            categories = state.categories,
+            protectedCategoryIds = setOf(state.bookmarkCategoryId).filter(String::isNotBlank).toSet(),
+            loading = false,
+            busy = state.categoryBusy,
+            onCreate = vm::createCategory,
+            onRename = vm::renameCategory,
+            onDelete = vm::deleteCategory,
+            onValidationError = vm::showMessage,
             onDismiss = {
                 showCategoryManager = false
             },
@@ -1698,7 +1780,7 @@ fun LibraryScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(
-                                categoryLabel(c.name),
+                                categoryDisplayName(c.name),
                                 style = MaterialTheme.typography.bodyLarge,
                             )
                         }
@@ -1905,7 +1987,10 @@ private fun BatchTextButton(
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+@OptIn(
+    ExperimentalFoundationApi::class,
+    ExperimentalMaterial3Api::class,
+)
 @Composable
 private fun PresetPanel(
     state: LibraryState,
@@ -1929,36 +2014,18 @@ private fun PresetPanel(
             56.dp.toPx()
         }
 
-    Box(
-        Modifier.fillMaxSize()
+    val sheetState =
+        rememberModalBottomSheetState()
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
     ) {
-
-        // 遮罩
-        Box(
+        Column(
             Modifier
-                .fillMaxSize()
-                .background(
-                    Color.Black.copy(alpha = 0.55f)
-                )
-                .clickable(
-                    onClick = onDismiss
-                ),
-        )
-
-        // 右侧侧栏
-        Box(
-            Modifier
-                .align(Alignment.CenterEnd)
-                .fillMaxHeight()
-                .fillMaxWidth(2f / 3f)
-                .background(
-                    MaterialTheme.colorScheme.surface
-                ),
+                .fillMaxWidth()
+                .navigationBarsPadding(),
         ) {
-
-            Column(
-                Modifier.fillMaxSize()
-            ) {
 
                 Row(
                     Modifier
@@ -2012,7 +2079,14 @@ private fun PresetPanel(
 
                 } else {
 
-                    LazyColumn {
+                    LazyColumn(
+                        modifier =
+                            Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = false),
+                        contentPadding =
+                            PaddingValues(bottom = 24.dp),
+                    ) {
 
                         itemsIndexed(
                             presets,
@@ -2199,7 +2273,6 @@ private fun PresetPanel(
                     }
                 }
             }
-        }
     }
 }
 
@@ -2337,7 +2410,7 @@ private fun FilterSheet(
                             },
                             label = {
                                 Text(
-                                    "分类: ${categoryLabel(catName)}"
+                                    "分类: ${categoryDisplayName(catName)}"
                                 )
                             },
                         )
@@ -2630,7 +2703,7 @@ private fun FilterSheet(
                         },
                         label = {
                             Text(
-                                categoryLabel(c.name)
+                                categoryDisplayName(c.name)
                             )
                         },
                     )
@@ -2724,33 +2797,6 @@ private fun FilterSheet(
                 }
             },
         )
-    }
-}
-
-/**
- * 分类名本地化：
- * LANraragi 默认分类映射为中文。
- */
-private fun categoryLabel(name: String?): String {
-    if (name == null) {
-        return ""
-    }
-
-    val n = name.lowercase().trim()
-
-    return when {
-        n.contains("favorites") ||
-                n.contains("favourite") -> {
-            "收藏"
-        }
-
-        n.contains("duplicate") -> {
-            "重复"
-        }
-
-        else -> {
-            name
-        }
     }
 }
 

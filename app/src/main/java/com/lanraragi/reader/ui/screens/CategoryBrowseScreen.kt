@@ -213,9 +213,10 @@ class CategoryBrowseViewModel(private val container: AppContainer) : ViewModel()
     fun renameCategory(id: String, name: String) {
         val n = name.trim()
         if (n.isEmpty()) return
+        val category = _state.value.categories.firstOrNull { it.id == id } ?: return
         viewModelScope.launch {
             try {
-                repository.renameCategory(id, n)
+                repository.renameCategory(id, n, category.pinned != 0)
                 reloadCategories()
             } catch (e: CancellationException) {
                 throw e

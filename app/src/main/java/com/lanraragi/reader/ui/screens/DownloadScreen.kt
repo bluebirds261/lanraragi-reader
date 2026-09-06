@@ -234,8 +234,8 @@ fun DownloadScreen(
                             },
                         )
                         DropdownMenuItem(
-                            text = { Text("删除全部任务") },
-                            enabled = downloadTasks.isNotEmpty(),
+                            text = { Text("删除") },
+                            enabled = downloadTasks.any { it.state == TaskState.DONE || it.state == TaskState.FAILED },
                             onClick = {
                                 showQueueMenu = false
                                 showClearAllConfirm = true
@@ -345,10 +345,11 @@ fun DownloadScreen(
                                     LocalArchiveItem(
                                         uploading = item.arcid in vm.uploadingArcids,
                                         onUpload = { vm.uploadLocal(item) },
+                                        onClick = { navController?.navigate(Routes.detail(item.arcid)) },
                                     ) {
                                         ArchiveListRow(
                                             archive = item,
-                                            onClick = { navController?.navigate(Routes.detail(item.arcid)) },
+                                            onClick = {},
                                             isOffline = true,
                                             offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
                                         )
@@ -397,10 +398,11 @@ fun DownloadScreen(
                                     LocalArchiveItem(
                                         uploading = item.arcid in vm.uploadingArcids,
                                         onUpload = { vm.uploadLocal(item) },
+                                        onClick = { navController?.navigate(Routes.detail(item.arcid)) },
                                     ) {
                                         ArchiveCard(
                                             archive = item,
-                                            onClick = { navController?.navigate(Routes.detail(item.arcid)) },
+                                            onClick = {},
                                             compact = viewMode == "compact",
                                             isOffline = true,
                                             offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
@@ -432,12 +434,12 @@ fun DownloadScreen(
     if (showClearAllConfirm) {
         AlertDialog(
             onDismissRequest = { showClearAllConfirm = false },
-            title = { Text("删除全部下载任务？") },
-            text = { Text("会取消当前下载并删除任务记录，不会删除已经完成的离线档案。") },
+            title = { Text("删除已完成和失败的任务？") },
+            text = { Text("只会清理已完成或失败的任务记录，不会影响进行中、等待或暂停的下载，也不会删除离线档案。") },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        downloadTasks.forEach { container.downloadManager.remove(it.id) }
+                        container.downloadManager.clearFinished()
                         showClearAllConfirm = false
                     },
                 ) { Text("删除") }
@@ -453,6 +455,7 @@ fun DownloadScreen(
 private fun LocalArchiveItem(
     uploading: Boolean,
     onUpload: () -> Unit,
+    onClick: () -> Unit,
     content: @Composable () -> Unit,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
@@ -460,7 +463,7 @@ private fun LocalArchiveItem(
         Modifier
             .fillMaxWidth()
             .combinedClickable(
-                onClick = {},
+                onClick = onClick,
                 onLongClick = { menuOpen = true },
             ),
     ) {

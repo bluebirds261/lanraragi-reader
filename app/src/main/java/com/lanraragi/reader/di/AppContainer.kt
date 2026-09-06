@@ -60,6 +60,14 @@ class AppContainer(val context: Context) {
                 }
         }
 
+        // 下载并发限制由 DataStore 单一来源驱动，变更只影响后续派发的任务。
+        applicationScope.launch {
+            settingsRepository.settings
+                .map { it.downloadConcurrency }
+                .distinctUntilChanged()
+                .collect(downloadManager::setMaxConcurrent)
+        }
+
         // 本地图库只在扫描根目录集合发生变化时重新扫描。
         applicationScope.launch {
             settingsRepository.settings

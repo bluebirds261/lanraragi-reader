@@ -3,12 +3,26 @@ package com.lanraragi.reader.data
 import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
+import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.Archive
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
+import java.io.File
+import java.security.MessageDigest
 import java.util.UUID
+
+@Serializable
+private data class LocalScanIndex(
+    val rootSignatures: Map<String, String> = emptyMap(),
+    val archives: List<Archive> = emptyList(),
+)
 
 /**
  * 扫描本地外部文件夹中的画廊（压缩包或图片文件夹）。
@@ -24,39 +38,49 @@ class LocalScanManager(private val context: Context) {
     private val _isScanning = MutableStateFlow(false)
     val isScanning = _isScanning.asStateFlow()
 
-    private var lastScanSignature: String? = null
+    private val indexFile = File(context.filesDir, "local/index.json")
+    private val scanMutex = Mutex()
+    private var lastRootSignatures: Map<String, String> = emptyMap()
     private var lastScanUris: Set<String> = emptySet()
 
+    init {
+        loadIndex()
+    }
+
     suspend fun scan(uris: Set<String>, force: Boolean = false) = withContext(Dispatchers.IO) {
-        val normalizedUris = uris.filter { it.isNotBlank() }.toSortedSet()
-        if (normalizedUris.isEmpty()) {
-            lastScanSignature = "empty"
-            lastScanUris = emptySet()
-            if (_localArchives.value.isNotEmpty()) _localArchives.value = emptyList()
-            return@withContext
-        }
+        scanMutex.withLock {
+            val normalizedUris = uris.filter { it.isNotBlank() }.toSortedSet()
+            if (normalizedUris.isEmpty()) {
+                lastRootSignatures = emptyMap()
+                lastScanUris = emptySet()
+                if (_localArchives.value.isNotEmpty()) _localArchives.value = emptyList()
+                persistIndex()
+                return@withLock
+            }
 
-        val signature = buildSignature(normalizedUris)
-        if (!force && normalizedUris == lastScanUris && signature == lastScanSignature) {
-            return@withContext
-        }
+            val rootSignatures = normalizedUris.associateWith(::buildRootSignature)
+            if (!force && normalizedUris == lastScanUris && rootSignatures == lastRootSignatures) {
+                return@withLock
+            }
 
-        _isScanning.value = true
-        try {
-            val list = mutableListOf<Archive>()
-            normalizedUris.forEach { uriString ->
-                runCatching {
-                    val root = DocumentFile.fromTreeUri(context, Uri.parse(uriString))
-                    if (root != null && root.isDirectory) {
-                        scanRecursive(root, list)
+            _isScanning.value = true
+            try {
+                val list = mutableListOf<Archive>()
+                normalizedUris.forEach { uriString ->
+                    runCatching {
+                        val root = DocumentFile.fromTreeUri(context, Uri.parse(uriString))
+                        if (root != null && root.isDirectory) {
+                            scanRecursive(root, list)
+                        }
                     }
                 }
+                _localArchives.value = list.distinctBy { it.arcid }.sortedBy { it.title.lowercase() }
+                lastScanUris = normalizedUris
+                lastRootSignatures = rootSignatures
+                persistIndex()
+            } finally {
+                _isScanning.value = false
             }
-            _localArchives.value = list.distinctBy { it.arcid }.sortedBy { it.title.lowercase() }
-            lastScanUris = normalizedUris
-            lastScanSignature = buildSignature(normalizedUris)
-        } finally {
-            _isScanning.value = false
         }
     }
 
@@ -64,30 +88,51 @@ class LocalScanManager(private val context: Context) {
      * 只读取目录元数据建立签名，不解析压缩包内容。
      * Android SAF 没有可靠的目录 mtime，因此这里组合 URI、名称、类型、大小和 mtime。
      */
-    private fun buildSignature(uris: Set<String>): String {
-        return uris.joinToString("|") { uriString ->
-            val root = DocumentFile.fromTreeUri(context, Uri.parse(uriString))
-            if (root == null || !root.isDirectory) {
-                "$uriString:missing"
-            } else {
-                signatureRecursive(root)
-            }
+    private fun buildRootSignature(uriString: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        digest.update(uriString.toByteArray())
+        val root = DocumentFile.fromTreeUri(context, Uri.parse(uriString))
+        if (root == null || !root.isDirectory) {
+            digest.update("missing".toByteArray())
+        } else {
+            updateSignature(digest, root)
         }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
-    private fun signatureRecursive(file: DocumentFile): String {
-        if (!file.isDirectory) {
-            return listOf(file.uri.toString(), file.name.orEmpty(), file.length(), file.lastModified())
-                .joinToString(":")
-        }
+    private fun updateSignature(digest: MessageDigest, file: DocumentFile) {
+        digest.update(file.uri.toString().toByteArray())
+        digest.update(file.name.orEmpty().toByteArray())
+        digest.update(byteArrayOf(if (file.isDirectory) 1 else 0))
+        digest.update(file.length().toString().toByteArray())
+        digest.update(file.lastModified().toString().toByteArray())
+        if (!file.isDirectory) return
         return try {
             file.listFiles()
                 .sortedBy { it.uri.toString() }
-                .joinToString(";") { child ->
-                    signatureRecursive(child)
-                }
+                .forEach { child -> updateSignature(digest, child) }
         } catch (_: Exception) {
-            "${file.uri}:unreadable"
+            digest.update("unreadable".toByteArray())
+        }
+    }
+
+    private fun loadIndex() {
+        val saved = runCatching {
+            if (indexFile.exists()) ApiClient.json.decodeFromString<LocalScanIndex>(indexFile.readText()) else null
+        }.getOrNull() ?: return
+        lastRootSignatures = saved.rootSignatures
+        lastScanUris = saved.rootSignatures.keys
+        _localArchives.value = saved.archives
+    }
+
+    private fun persistIndex() {
+        runCatching {
+            indexFile.parentFile?.mkdirs()
+            indexFile.writeText(
+                ApiClient.json.encodeToString(
+                    LocalScanIndex(lastRootSignatures, _localArchives.value),
+                ),
+            )
         }
     }
 

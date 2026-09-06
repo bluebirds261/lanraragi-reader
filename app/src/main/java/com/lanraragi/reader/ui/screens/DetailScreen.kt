@@ -44,7 +44,6 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -118,6 +117,8 @@ import com.lanraragi.reader.data.model.TocEntry
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.ArchiveCover
+import com.lanraragi.reader.ui.CategoryManagementSheet
+import com.lanraragi.reader.ui.CategoryRefreshBus
 import com.lanraragi.reader.ui.CoverChangeBus
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.FilterBus
@@ -127,7 +128,9 @@ import com.lanraragi.reader.ui.LoadingImage
 import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.TagAssistChip
 import com.lanraragi.reader.ui.TagRules
+import com.lanraragi.reader.ui.categoryNameError
 import com.lanraragi.reader.ui.edgeSwipeBack
+import com.lanraragi.reader.ui.isProtectedCategoryName
 import com.lanraragi.reader.ui.rememberTagColor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -167,7 +170,9 @@ class DetailViewModel(
         val clearNewOnOpen: Boolean = true,
         val categories: List<Category> = emptyList(),
         val archiveCategoryIds: Set<String> = emptySet(),
+        val bookmarkCategoryId: String = "",
         val categoryLoading: Boolean = false,
+        val categoryBusy: Boolean = false,
         val plugins: List<PluginInfo> = emptyList(),
         val pluginsLoading: Boolean = false,
         val pluginRunning: Boolean = false,
@@ -181,6 +186,7 @@ class DetailViewModel(
     val state = _state.asStateFlow()
 
     private var lastArchFailed = false
+    private var categoryMutationInFlight = false
 
     init {
         load()
@@ -360,7 +366,7 @@ class DetailViewModel(
     }
 
     fun loadCategories() {
-        if (_state.value.categoryLoading) return
+        if (_state.value.categoryLoading || categoryMutationInFlight) return
 
         viewModelScope.launch {
             _state.update {
@@ -368,20 +374,8 @@ class DetailViewModel(
             }
 
             try {
-                val all =
-                    container.repository.getCategories()
-
-                val mine =
-                    container.repository.getArchiveCategories(arcid)
-
-                _state.update {
-                    it.copy(
-                        categories = all,
-                        archiveCategoryIds =
-                            mine.map { c -> c.id }.toSet(),
-                        categoryLoading = false,
-                    )
-                }
+                reloadCategoryState()
+                _state.update { it.copy(categoryLoading = false) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -396,41 +390,136 @@ class DetailViewModel(
     }
 
     fun toggleCategory(categoryId: String) {
+        mutateCategory("更新分类失败", notifyLibrary = false) {
+            if (categoryId in _state.value.archiveCategoryIds) {
+                container.repository.removeArchiveFromCategory(categoryId, arcid)
+            } else {
+                container.repository.addArchiveToCategory(categoryId, arcid)
+            }
+
+            val mine = container.repository.getArchiveCategories(arcid)
+            _state.update {
+                it.copy(archiveCategoryIds = mine.map(Category::id).toSet())
+            }
+        }
+    }
+
+    fun createCategory(name: String) {
+        val trimmed = name.trim()
+        categoryNameError(trimmed)?.let {
+            showMessage(it)
+            return
+        }
+
+        mutateCategory(
+            errorMessage = "新建分类失败",
+            notifyLibrary = true,
+            reloadAfter = true,
+        ) {
+            container.repository.createCategory(trimmed)
+        }
+    }
+
+    fun renameCategory(categoryId: String, name: String) {
+        val category = _state.value.categories.firstOrNull { it.id == categoryId }
+        if (category == null) {
+            showMessage("分类不存在，请刷新后重试")
+            return
+        }
+        if (
+            category.id == _state.value.bookmarkCategoryId ||
+            isProtectedCategoryName(category.name)
+        ) {
+            showMessage("系统分类不能重命名")
+            return
+        }
+
+        val trimmed = name.trim()
+        categoryNameError(trimmed)?.let {
+            showMessage(it)
+            return
+        }
+
+        mutateCategory(
+            errorMessage = "重命名分类失败",
+            notifyLibrary = true,
+            reloadAfter = true,
+        ) {
+            container.repository.renameCategory(categoryId, trimmed, category.pinned != 0)
+        }
+    }
+
+    fun deleteCategory(categoryId: String) {
+        val category = _state.value.categories.firstOrNull { it.id == categoryId }
+        if (category == null) {
+            showMessage("分类不存在，请刷新后重试")
+            return
+        }
+        if (
+            category.id == _state.value.bookmarkCategoryId ||
+            isProtectedCategoryName(category.name)
+        ) {
+            showMessage("系统分类不能删除")
+            return
+        }
+
+        mutateCategory(
+            errorMessage = "删除分类失败",
+            notifyLibrary = true,
+            reloadAfter = true,
+        ) {
+            container.repository.deleteCategory(categoryId)
+        }
+    }
+
+    private fun mutateCategory(
+        errorMessage: String,
+        notifyLibrary: Boolean = false,
+        reloadAfter: Boolean = false,
+        operation: suspend () -> Unit,
+    ) {
+        if (categoryMutationInFlight) return
+        categoryMutationInFlight = true
+        _state.update { it.copy(categoryBusy = true) }
+
         viewModelScope.launch {
             try {
-                if (
-                    categoryId in
-                    _state.value.archiveCategoryIds
-                ) {
-                    container.repository.removeArchiveFromCategory(
-                        categoryId,
-                        arcid,
-                    )
-                } else {
-                    container.repository.addArchiveToCategory(
-                        categoryId,
-                        arcid,
-                    )
+                operation()
+                if (reloadAfter) {
+                    try {
+                        reloadCategoryState()
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        _state.update {
+                            it.copy(
+                                message = e.message ?: "分类已更新，但重新加载失败",
+                            )
+                        }
+                    }
                 }
-
-                val mine =
-                    container.repository.getArchiveCategories(arcid)
-
-                _state.update {
-                    it.copy(
-                        archiveCategoryIds =
-                            mine.map { c -> c.id }.toSet(),
-                    )
-                }
+                if (notifyLibrary) CategoryRefreshBus.notifyChanged()
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _state.update {
-                    it.copy(
-                        message = e.message ?: "更新分类失败",
-                    )
-                }
+                _state.update { it.copy(message = e.message ?: errorMessage) }
+            } finally {
+                categoryMutationInFlight = false
+                _state.update { it.copy(categoryBusy = false) }
             }
+        }
+    }
+
+    private suspend fun reloadCategoryState() {
+        val all = container.repository.getCategories()
+        val mine = container.repository.getArchiveCategories(arcid)
+        val bookmarkCategoryId = container.repository.getBookmarkCategoryId()
+        _state.update {
+            it.copy(
+                categories = all,
+                archiveCategoryIds = mine.map(Category::id).toSet(),
+                bookmarkCategoryId = bookmarkCategoryId,
+            )
         }
     }
 
@@ -2505,12 +2594,17 @@ fun DetailScreen(
         }
 
         if (showCategorySheet) {
-            CategorySheet(
+            CategoryManagementSheet(
                 categories = state.categories,
-                archiveCategoryIds =
-                    state.archiveCategoryIds,
+                selectedCategoryIds = state.archiveCategoryIds,
+                protectedCategoryIds = setOf(state.bookmarkCategoryId).filter(String::isNotBlank).toSet(),
                 loading = state.categoryLoading,
+                busy = state.categoryBusy,
                 onToggle = vm::toggleCategory,
+                onCreate = vm::createCategory,
+                onRename = vm::renameCategory,
+                onDelete = vm::deleteCategory,
+                onValidationError = vm::showMessage,
                 onDismiss = {
                     showCategorySheet = false
                 },
@@ -2592,111 +2686,6 @@ fun DetailScreen(
                     showDeleteDialog = false
                 },
             )
-        }
-    }
-}
-
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun CategorySheet(
-    categories: List<Category>,
-    archiveCategoryIds: Set<String>,
-    loading: Boolean,
-    onToggle: (String) -> Unit,
-    onDismiss: () -> Unit,
-) {
-    val sheetState =
-        rememberModalBottomSheetState()
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-    ) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .verticalScroll(
-                    rememberScrollState(),
-                )
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 24.dp),
-        ) {
-            Text(
-                "分类",
-                style =
-                    MaterialTheme.typography.titleMedium,
-            )
-
-            Spacer(
-                Modifier.height(8.dp),
-            )
-
-            when {
-                loading && categories.isEmpty() -> {
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 16.dp),
-                        contentAlignment =
-                            Alignment.Center,
-                    ) {
-                        CircularProgressIndicator()
-                    }
-                }
-
-                categories.isEmpty() -> {
-                    Text(
-                        "暂无分类",
-                        style =
-                            MaterialTheme.typography.bodyMedium,
-                        color =
-                            MaterialTheme
-                                .colorScheme
-                                .onSurfaceVariant,
-                        modifier =
-                            Modifier.padding(
-                                vertical = 8.dp,
-                            ),
-                    )
-                }
-
-                else -> {
-                    categories.forEach { c ->
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clickable {
-                                    onToggle(c.id)
-                                }
-                                .padding(vertical = 2.dp),
-                            verticalAlignment =
-                                Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked =
-                                    c.id in
-                                            archiveCategoryIds,
-                                onCheckedChange = {
-                                    onToggle(c.id)
-                                },
-                            )
-
-                            Spacer(
-                                Modifier.width(8.dp),
-                            )
-
-                            Text(
-                                c.name,
-                                style =
-                                    MaterialTheme
-                                        .typography
-                                        .bodyLarge,
-                            )
-                        }
-                    }
-                }
-            }
         }
     }
 }

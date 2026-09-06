@@ -15,6 +15,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import java.math.BigDecimal
 
 private val Context.settingsDataStore by preferencesDataStore(name = "settings")
 
@@ -23,6 +24,27 @@ fun normalizeBaseUrl(input: String): String {
     if (t.isEmpty()) return ""
     return if (t.startsWith("http://") || t.startsWith("https://")) t else "https://$t"
 }
+
+const val AUTO_SCROLL_MIN_SECONDS = 0.5f
+const val AUTO_SCROLL_MAX_SECONDS = 30f
+const val AUTO_SCROLL_DEFAULT_SECONDS = 3f
+
+private fun parseAutoScrollSeconds(value: String): Double = when (value.trim().lowercase()) {
+    "slow" -> 6.0
+    "medium", "off" -> AUTO_SCROLL_DEFAULT_SECONDS.toDouble()
+    "fast" -> 1.5
+    else -> value.trim().toDoubleOrNull()?.coerceIn(
+        AUTO_SCROLL_MIN_SECONDS.toDouble(),
+        AUTO_SCROLL_MAX_SECONDS.toDouble(),
+    ) ?: AUTO_SCROLL_DEFAULT_SECONDS.toDouble()
+}
+
+fun autoScrollSeconds(value: String): Float = parseAutoScrollSeconds(value).toFloat()
+
+fun normalizeAutoScrollSpeed(value: String): String = BigDecimal
+    .valueOf(parseAutoScrollSeconds(value))
+    .stripTrailingZeros()
+    .toPlainString()
 
 data class Settings(
     val baseUrl: String = "",
@@ -33,7 +55,7 @@ data class Settings(
     val autoDoublePageLandscape: Boolean = true,
     val preloadOnlineCount: Int = 3,
     val readingDirection: String = "ltr",
-    val autoScrollSpeed: String = "off",
+    val autoScrollSpeed: String = "3",
     val galleryColumns: Int = 3,
     val previewColumns: Int = 4,
     val previewCount: Int = 12,
@@ -140,7 +162,7 @@ class SettingsRepository(private val context: Context) {
             autoDoublePageLandscape = p[KEY_AUTO_DOUBLE_PAGE_LANDSCAPE] ?: true,
             preloadOnlineCount = p[KEY_PRELOAD_ONLINE] ?: 3,
             readingDirection = p[KEY_DIRECTION] ?: "ltr",
-            autoScrollSpeed = p[KEY_AUTO_SCROLL_SPEED] ?: "off",
+            autoScrollSpeed = normalizeAutoScrollSpeed(p[KEY_AUTO_SCROLL_SPEED] ?: "3"),
             galleryColumns = p[KEY_GALLERY_COLS] ?: 3,
             previewColumns = p[KEY_PREVIEW_COLS] ?: 3,
             previewCount = p[KEY_PREVIEW_COUNT] ?: 12,
@@ -263,7 +285,9 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun setReaderMode(mode: String) { dataStore.edit { it[KEY_MODE] = mode } }
-    suspend fun setAutoScrollSpeed(s: String) { dataStore.edit { it[KEY_AUTO_SCROLL_SPEED] = s } }
+    suspend fun setAutoScrollSpeed(s: String) {
+        dataStore.edit { it[KEY_AUTO_SCROLL_SPEED] = normalizeAutoScrollSpeed(s) }
+    }
     suspend fun setMultiPageCount(n: Int) { dataStore.edit { it[KEY_MULTI] = n.coerceIn(2, 8) } }
     suspend fun setAutoDoublePageLandscape(enabled: Boolean) { dataStore.edit { it[KEY_AUTO_DOUBLE_PAGE_LANDSCAPE] = enabled } }
     suspend fun setPreloadOnlineCount(n: Int) { dataStore.edit { it[KEY_PRELOAD_ONLINE] = n.coerceIn(1, 20) } }
@@ -323,6 +347,6 @@ class SettingsRepository(private val context: Context) {
     suspend fun setPreloadLocalCount(n: Int) { dataStore.edit { it[KEY_PRELOAD_LOCAL] = n.coerceIn(1, 50) } }
     suspend fun setClearNewOnOpen(enabled: Boolean) { dataStore.edit { it[KEY_CLEAR_NEW_ON_OPEN] = enabled } }
     suspend fun setFeatureFlag(key: String, enabled: Boolean) { val updated = settings.first().featureFlags + (key to enabled); dataStore.edit { it[KEY_FEATURE_FLAGS] = ApiClient.json.encodeToString(updated) } }
-    suspend fun setOfflineCacheLimitGb(n: Int) { dataStore.edit { it[KEY_OFFLINE_CACHE_LIMIT] = n.coerceIn(0, 100) } }
+    suspend fun setOfflineCacheLimitGb(n: Int) { dataStore.edit { it[KEY_OFFLINE_CACHE_LIMIT] = n.coerceAtLeast(0) } }
     suspend fun setDownloadConcurrency(n: Int) { dataStore.edit { it[KEY_DOWNLOAD_CONCURRENCY] = n.coerceIn(1, 8) } }
 }

@@ -12,6 +12,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -23,6 +25,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -43,6 +46,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -50,6 +54,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
@@ -70,6 +75,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -79,13 +85,16 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.imageLoader
 import com.lanraragi.reader.R
+import com.lanraragi.reader.data.AUTO_SCROLL_MAX_SECONDS
+import com.lanraragi.reader.data.AUTO_SCROLL_MIN_SECONDS
 import com.lanraragi.reader.data.FeatureFlags
 import com.lanraragi.reader.data.OfflineUsage
-import com.lanraragi.reader.data.Settings
+import com.lanraragi.reader.data.autoScrollSeconds
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.ServerInfo
 import com.lanraragi.reader.data.model.ServerStats
 import com.lanraragi.reader.data.normalizeBaseUrl
+import com.lanraragi.reader.data.normalizeAutoScrollSpeed
 import com.lanraragi.reader.data.refreshServerInfo
 import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.di.AppContainer
@@ -116,8 +125,11 @@ private fun viewModeLabel(v: String) = when (v) {
     else -> "松散网格"
 }
 private fun readerModeLabel(m: String) = when (m) { "multi" -> "多页"; "continuous" -> "连续"; else -> "单页" }
-private fun autoScrollLabel(s: String) = when (s) { "slow" -> "慢"; "medium" -> "中"; "fast" -> "快"; else -> "关闭" }
-private fun directionLabel(d: String) = if (d == "rtl") "右→左" else "左→右"
+private fun directionLabel(d: String) = when (d) {
+    "rtl" -> "右→左"
+    "ttb" -> "上→下"
+    else -> "左→右"
+}
 private fun fitModeLabel(f: String) = when (f) {
     "fitHeight" -> "适应高度"; "fitScreen" -> "适应屏幕"; "original" -> "原始尺寸"; else -> "适应宽度"
 }
@@ -163,7 +175,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val preloadOnlineCount: Int = 3,
         val preloadLocalCount: Int = 5,
         val readingDirection: String = "ltr",
-        val autoScrollSpeed: String = "off",
+        val autoScrollSpeed: String = "3",
         val downloadDirUri: String? = null,
         val galleryColumns: Int = 3,
         val previewColumns: Int = 4,
@@ -192,6 +204,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val extraScanDirUris: Set<String> = emptySet(),
         val featureFlags: Map<String, Boolean> = emptyMap(),
         val offlineCacheLimitGb: Int = 0,
+        val downloadConcurrency: Int = 2,
         val offlineUsage: OfflineUsage = OfflineUsage(),
         val isScanning: Boolean = false,
         val translationUpdating: Boolean = false,
@@ -262,6 +275,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     extraScanDirUris = s.extraScanDirUris,
                     featureFlags = s.featureFlags,
                     offlineCacheLimitGb = s.offlineCacheLimitGb,
+                    downloadConcurrency = s.downloadConcurrency,
                 )
             }
         }
@@ -277,8 +291,9 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun setAutoScrollSpeed(s: String) {
-        _state.update { it.copy(autoScrollSpeed = s) }
-        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(s) }
+        val normalized = normalizeAutoScrollSpeed(s)
+        _state.update { it.copy(autoScrollSpeed = normalized) }
+        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(normalized) }
     }
 
     fun setMultiPageCount(n: Int) {
@@ -446,8 +461,14 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun setOfflineCacheLimitGb(n: Int) {
-        _state.update { it.copy(offlineCacheLimitGb = n) }
-        viewModelScope.launch { container.settingsRepository.setOfflineCacheLimitGb(n) }
+        val limit = n.coerceAtLeast(0)
+        _state.update { it.copy(offlineCacheLimitGb = limit) }
+        viewModelScope.launch { container.settingsRepository.setOfflineCacheLimitGb(limit) }
+    }
+
+    fun setDownloadConcurrency(n: Int) {
+        _state.update { it.copy(downloadConcurrency = n.coerceIn(1, 8)) }
+        viewModelScope.launch { container.settingsRepository.setDownloadConcurrency(n) }
     }
 
     fun addExtraScanDirUri(uri: String) {
@@ -689,7 +710,7 @@ fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpen
         Box(Modifier.padding(padding)) {
             when (section) {
                 SettingsSection.MAIN -> SettingsMainList { section = it }
-                SettingsSection.CONNECT -> ServerSection(state, vm)
+                SettingsSection.CONNECT -> ServerSection(container, state, vm)
                 SettingsSection.READER -> ReaderSection(state, vm)
                 SettingsSection.INTERFACE -> InterfaceSection(state, vm)
                 SettingsSection.STORAGE -> StorageSection(state, vm, context) {
@@ -697,7 +718,7 @@ fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpen
                 }
                 SettingsSection.SECURITY -> SecuritySection(state, vm)
                 SettingsSection.LABS -> LabsSection(state, vm)
-                SettingsSection.ABOUT -> AboutSection(container)
+                SettingsSection.ABOUT -> AboutSection()
             }
         }
     }
@@ -951,6 +972,7 @@ private fun formatTime(millis: Long): String =
     java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
         .format(java.util.Date(millis))
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -959,16 +981,12 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
             listOf("single" to "单页", "multi" to "多页", "continuous" to "连续"),
             vm::setReaderMode,
         )
-        DropdownRow(
-            "连续滚动速度", autoScrollLabel(state.autoScrollSpeed),
-            listOf("off" to "关闭", "slow" to "慢", "medium" to "中", "fast" to "快"),
-            vm::setAutoScrollSpeed,
-        )
+        AutoScrollSpeedRow(state.autoScrollSpeed, vm::setAutoScrollSpeed)
         IntDropdownRow("每屏页数", state.multiPageCount, (2..8).toList(), vm::setMultiPageCount)
         SwitchRow("横屏自动双页", state.autoDoublePageLandscape, vm::setAutoDoublePageLandscape)
         DropdownRow(
             "阅读方向", directionLabel(state.readingDirection),
-            listOf("ltr" to "左→右", "rtl" to "右→左"),
+            listOf("ltr" to "左→右", "rtl" to "右→左", "ttb" to "上→下"),
             vm::setReadingDirection,
         )
         DropdownRow(
@@ -992,7 +1010,20 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
 }
 
 @Composable
-private fun ServerSection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
+private fun ServerSection(
+    container: AppContainer,
+    state: SettingsViewModel.UiState,
+    vm: SettingsViewModel,
+) {
+    val serverInfo by ApiClient.config.serverInfo.collectAsState()
+    var showEditDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(state.url) {
+        if (state.url.isNotBlank() && ApiClient.config.serverInfo.value == null) {
+            refreshServerInfo(container.repository)
+        }
+    }
+
     LaunchedEffect(Unit) { vm.loadShinobuStatus() }
     Column(
         Modifier
@@ -1001,46 +1032,7 @@ private fun ServerSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        OutlinedTextField(
-            value = state.url,
-            onValueChange = vm::onUrlChange,
-            label = { Text("服务器地址 / hostname") },
-            placeholder = { Text("manga.example.com 或 http://192.168.1.10:3000") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = state.key,
-            onValueChange = vm::onKeyChange,
-            label = { Text("API Key") },
-            singleLine = true,
-            visualTransformation = PasswordVisualTransformation(),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        OutlinedTextField(
-            value = state.name,
-            onValueChange = vm::onNameChange,
-            label = { Text("服务器名称") },
-            placeholder = { Text("LANraragi") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedButton(
-                onClick = vm::test,
-                enabled = !state.testing && state.url.isNotBlank(),
-                modifier = Modifier.weight(1f),
-            ) {
-                if (state.testing) {
-                    CircularProgressIndicator(Modifier.width(18.dp).height(18.dp), strokeWidth = 2.dp)
-                } else {
-                    Text("测试连接")
-                }
-            }
-            Button(onClick = vm::save, enabled = !state.saving, modifier = Modifier.weight(1f)) {
-                Text(if (state.saving) "保存中…" else "保存")
-            }
-        }
+        ServerCard(state, serverInfo) { showEditDialog = true }
         Card(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Shinobu 文件监控", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
@@ -1075,6 +1067,153 @@ private fun ServerSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
         }
         Spacer(Modifier.height(80.dp))
     }
+
+    if (showEditDialog) {
+        ServerEditDialog(
+            state = state,
+            vm = vm,
+            onDismiss = { showEditDialog = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun AutoScrollSpeedRow(value: String, onChange: (String) -> Unit) {
+    var input by remember { mutableStateOf(value) }
+    val seconds = autoScrollSeconds(value)
+    val inputSeconds = input.toFloatOrNull()
+    val inputValid = inputSeconds != null &&
+        inputSeconds in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS
+
+    LaunchedEffect(value) {
+        val localValue = input.toFloatOrNull()
+        if (
+            localValue == null ||
+            localValue !in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS ||
+            normalizeAutoScrollSpeed(localValue.toString()) != value
+        ) {
+            input = value
+        }
+    }
+
+    fun update(secondsValue: Float) {
+        val normalized = normalizeAutoScrollSpeed(secondsValue.toString())
+        input = normalized
+        onChange(normalized)
+    }
+
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+    ) {
+        Text("连续滚动速度", style = MaterialTheme.typography.bodyLarge)
+        Text(
+            "滚过当前视口需要 ${normalizeAutoScrollSpeed(seconds.toString())} 秒",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Slider(
+            value = seconds,
+            onValueChange = ::update,
+            valueRange = AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS,
+            steps = 58,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(1.5f, 3f, 6f).forEach { preset ->
+                val normalized = normalizeAutoScrollSpeed(preset.toString())
+                FilterChip(
+                    selected = value == normalized,
+                    onClick = { update(preset) },
+                    label = { Text("$normalized 秒") },
+                )
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = input,
+            onValueChange = { newValue ->
+                input = newValue
+                newValue.toFloatOrNull()
+                    ?.takeIf { it in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS }
+                    ?.let { onChange(it.toString()) }
+            },
+            label = { Text("每个视口所需秒数") },
+            supportingText = { Text("可输入 0.5–30 秒") },
+            isError = input.isNotEmpty() && !inputValid,
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+private fun ServerEditDialog(
+    state: SettingsViewModel.UiState,
+    vm: SettingsViewModel,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("编辑服务器") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = state.url,
+                    onValueChange = vm::onUrlChange,
+                    label = { Text("服务器地址 / hostname") },
+                    placeholder = { Text("manga.example.com 或 http://192.168.1.10:3000") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = state.key,
+                    onValueChange = vm::onKeyChange,
+                    label = { Text("API Key") },
+                    singleLine = true,
+                    visualTransformation = PasswordVisualTransformation(),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = state.name,
+                    onValueChange = vm::onNameChange,
+                    label = { Text("服务器名称") },
+                    placeholder = { Text("LANraragi") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = vm::test,
+                    enabled = !state.testing && state.url.isNotBlank(),
+                ) {
+                    if (state.testing) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("测试连接")
+                    }
+                }
+                Button(
+                    onClick = {
+                        vm.save()
+                        onDismiss()
+                    },
+                    enabled = !state.saving && state.url.isNotBlank(),
+                ) {
+                    Text(if (state.saving) "保存中…" else "保存")
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 @Composable
@@ -1199,6 +1338,8 @@ private fun StorageSection(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
         )
+
+        DownloadConcurrencyRow(state.downloadConcurrency, vm::setDownloadConcurrency)
 
         Spacer(Modifier.height(16.dp))
         Text(
@@ -1374,16 +1515,7 @@ private fun StatCard(label: String, value: String) {
 }
 
 @Composable
-private fun AboutSection(container: AppContainer) {
-    val settings by container.settingsRepository.settings.collectAsStateWithLifecycle(initialValue = null)
-    val serverInfo by ApiClient.config.serverInfo.collectAsState()
-    // 重启后内存缓存丢失：已配置但缓存为空时惰性拉取一次，避免关于页误显示“未连接/未知”。
-    LaunchedEffect(settings?.baseUrl) {
-        val url = settings?.baseUrl
-        if (!url.isNullOrBlank() && ApiClient.config.serverInfo.value == null) {
-            refreshServerInfo(container.repository)
-        }
-    }
+private fun AboutSection() {
     Column(
         Modifier
             .fillMaxSize()
@@ -1411,8 +1543,6 @@ private fun AboutSection(container: AppContainer) {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(Modifier.height(32.dp))
-        ServerCard(settings, serverInfo)
-        Spacer(Modifier.height(16.dp))
         Card(
             Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -1443,16 +1573,22 @@ private fun AboutSection(container: AppContainer) {
 }
 
 @Composable
-private fun ServerCard(settings: Settings?, serverInfo: ServerInfo?) {
+private fun ServerCard(
+    state: SettingsViewModel.UiState,
+    serverInfo: ServerInfo?,
+    onClick: () -> Unit,
+) {
     val name = serverInfo?.name?.takeIf { it.isNotBlank() }
-        ?: settings?.serverName?.takeIf { it.isNotBlank() }
+        ?: state.name.takeIf { it.isNotBlank() }
         ?: "未配置"
-    val address = settings?.baseUrl?.takeIf { it.isNotBlank() } ?: "未配置"
+    val address = state.url.takeIf { it.isNotBlank() } ?: "未配置"
     val version = serverInfo?.version?.takeIf { it.isNotBlank() } ?: "未知"
     val connected = ApiClient.config.isConfigured && serverInfo != null
 
     Card(
-        Modifier.fillMaxWidth(),
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
         shape = RoundedCornerShape(16.dp),
         colors = androidx.compose.material3.CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
@@ -1571,6 +1707,9 @@ private fun SettingsNavRow(title: String, icon: ImageVector? = null, onClick: ()
 @Composable
 private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
     var menu by remember { mutableStateOf(false) }
+    var showCustom by remember { mutableStateOf(false) }
+    var customText by remember { mutableStateOf("") }
+    var customError by remember { mutableStateOf(false) }
     Row(
         Modifier
             .fillMaxWidth()
@@ -1585,6 +1724,82 @@ private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
                     DropdownMenuItem(
                         text = { Text(label) },
                         onClick = { onSelect(n); menu = false },
+                    )
+                }
+                DropdownMenuItem(
+                    text = { Text("自定义…") },
+                    onClick = {
+                        menu = false
+                        customText = value.takeIf { it > 0 }?.toString().orEmpty()
+                        customError = false
+                        showCustom = true
+                    },
+                )
+            }
+        }
+    }
+    if (showCustom) {
+        AlertDialog(
+            onDismissRequest = { showCustom = false },
+            title = { Text("自定义离线缓存上限") },
+            text = {
+                OutlinedTextField(
+                    value = customText,
+                    onValueChange = {
+                        customText = it
+                        if (customError) {
+                            customError = it.trim().toIntOrNull()?.let { number -> number > 0 } != true
+                        }
+                    },
+                    label = { Text("缓存上限（GB）") },
+                    supportingText = if (customError) {
+                        { Text("请输入正整数 GB") }
+                    } else {
+                        null
+                    },
+                    isError = customError,
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val customValue = customText.trim().toIntOrNull()?.takeIf { it > 0 }
+                        if (customValue == null) {
+                            customError = true
+                        } else {
+                            onSelect(customValue)
+                            showCustom = false
+                        }
+                    },
+                ) { Text("确定") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showCustom = false }) { Text("取消") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun DownloadConcurrencyRow(value: Int, onSelect: (Int) -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("同时下载数", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Box {
+            TextButton(onClick = { menu = true }) { Text("$value") }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                (1..8).forEach { count ->
+                    DropdownMenuItem(
+                        text = { Text("$count") },
+                        onClick = { onSelect(count); menu = false },
                     )
                 }
             }

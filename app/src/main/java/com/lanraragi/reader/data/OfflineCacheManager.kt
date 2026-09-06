@@ -87,7 +87,8 @@ class OfflineCacheManager(
     /** 启动离线缓存任务：提交到统一下载队列，下载原始文件 + 元数据。 */
     fun startCache(archive: Archive, repository: LanraragiRepository) {
         val arcid = archive.arcid
-        if (arcid.isEmpty()) return
+        // 本地扫描结果从不进入任何服务器资源任务，避免将用户文件带入网络路径。
+        if (arcid.isEmpty() || arcid.startsWith("local_")) return
         val existing = downloadManager.taskFor(DownloadTaskType.OFFLINE_CACHE, arcid)
         if (existing != null && existing.isActive) return
         downloadManager.enqueue(DownloadTaskType.OFFLINE_CACHE, arcid, archive.title) { onProgress ->
@@ -110,11 +111,23 @@ class OfflineCacheManager(
             // 1. 下载封面
             val coverOk = download(ApiClient.thumbnailUrl(arcid), coverFile(arcid))
 
-            // 2. 下载原始文件
-            repository.downloadArchive(arcid, archiveFile(arcid)) { written, total ->
+            // 2. 完成下载前只写入临时文件，阅读器不会把半个压缩包误认为有效离线资源。
+            val archiveFile = archiveFile(arcid)
+            val partialArchiveFile = File(archiveFile.parentFile, "${archiveFile.name}.part")
+            partialArchiveFile.delete()
+            repository.downloadArchive(arcid, partialArchiveFile) { written, total ->
                 val p = if (total != null && total > 0) written.toFloat() / total else null
                 if (p != null) _progress.update { it + (arcid to p) }
                 onProgress(p)
+            }
+            if (!partialArchiveFile.exists() || partialArchiveFile.length() <= 0L) {
+                throw IllegalStateException("离线档案下载不完整")
+            }
+            if (archiveFile.exists() && !archiveFile.delete()) {
+                throw IllegalStateException("无法替换旧的离线档案")
+            }
+            if (!partialArchiveFile.renameTo(archiveFile)) {
+                throw IllegalStateException("无法完成离线档案写入")
             }
 
             // 3. 保存完整元数据
@@ -131,6 +144,7 @@ class OfflineCacheManager(
             addToIndex(cached)
             enforceLimit()
         } finally {
+            File(File(offlineDir, arcid), "original.archive.part").delete()
             _progress.update { it - arcid }
             recomputeUsage()
         }

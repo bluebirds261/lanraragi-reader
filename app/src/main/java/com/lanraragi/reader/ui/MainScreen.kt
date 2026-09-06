@@ -165,15 +165,14 @@ fun MainScreen(
             initialValue = null
         )
 
-    val offlineIndex by container.offlineCache.index
+    val activeDownloadCount by container.downloadManager.activeCount
         .collectAsStateWithLifecycle()
 
     // D2 多选模式下隐藏液态底栏（选择模式激活时由 LibraryScreen 驱动）
     val selectionActive by SelectionModeBus.active
         .collectAsStateWithLifecycle()
 
-    val downloadCount =
-        offlineIndex.items.size
+    val downloadCount = activeDownloadCount
 
     val context =
         LocalContext.current
@@ -211,7 +210,7 @@ fun MainScreen(
                     Toast.makeText(context, "暂无正在阅读的漫画", Toast.LENGTH_SHORT).show()
                 }
                 recents.size == 1 -> {
-                    navController.navigate(Routes.reader(recents.first().arcid, 0))
+                    navController.navigate(Routes.reader(recents.first().arcid))
                 }
                 else -> {
                     recentItems = recents.map { e ->
@@ -691,6 +690,14 @@ fun MainScreen(
                         selectedIndex.toFloat()
                     )
                 }
+
+            val indicatorSelectedIndex =
+                indicatorPosition.value
+                    .roundToInt()
+                    .coerceIn(
+                        0,
+                        3
+                    )
 
             /*
              * ====================================================
@@ -1892,7 +1899,7 @@ fun MainScreen(
                                     ) {
 
                                         val selected =
-                                            selectedTab ==
+                                            indicatorSelectedIndex ==
                                                     index
 
                                         SingleTabItem(
@@ -2656,7 +2663,7 @@ fun MainScreen(
                             mainTabs[3],
 
                         selected =
-                            false,
+                            indicatorSelectedIndex == 3,
 
                         isExpanded =
                             progress > 0.5f,
@@ -2845,7 +2852,7 @@ fun MainScreen(
                                     item = item,
                                     onOpen = {
                                         showRecentList = false
-                                        navController.navigate(Routes.reader(item.arcid, 0))
+                                        navController.navigate(Routes.reader(item.arcid))
                                     },
                                     onRemove = {
                                         recentItems = recentItems.filter { it.arcid != item.arcid }
@@ -2931,8 +2938,7 @@ private fun SingleTabItem(
 
                     if (
                         tab.label == "下载" &&
-                        downloadCount > 0 &&
-                        isExpanded
+                        downloadCount > 0
                     ) {
 
                         Badge(

@@ -8,17 +8,29 @@ import android.os.Environment
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -26,6 +38,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -37,23 +50,30 @@ import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.ChevronLeft
-import androidx.compose.material.icons.filled.ChevronRight
-import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.automirrored.filled.NavigateBefore
+import androidx.compose.material.icons.automirrored.filled.NavigateNext
+import androidx.compose.material.icons.filled.AutoStories
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -63,10 +83,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
@@ -83,14 +105,17 @@ import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -98,9 +123,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import com.lanraragi.reader.data.ArchiveFileReader
+import com.lanraragi.reader.data.AUTO_SCROLL_MAX_SECONDS
+import com.lanraragi.reader.data.AUTO_SCROLL_MIN_SECONDS
 import com.lanraragi.reader.data.DownloadTaskType
+import com.lanraragi.reader.data.autoScrollSeconds
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.TocEntry
+import com.lanraragi.reader.data.normalizeAutoScrollSpeed
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.CoverChangeBus
 import com.lanraragi.reader.ui.ErrorBox
@@ -141,13 +170,6 @@ private fun readerBackgroundColor(mode: String): Color = when (mode) {
     else -> Color.Black
 }
 
-private fun fitModeLabel(mode: String): String = when (mode) {
-    "fitHeight" -> "适应高度"
-    "fitScreen" -> "适应屏幕"
-    "original" -> "原始尺寸"
-    else -> "适应宽度"
-}
-
 private tailrec fun Context.findActivity(): android.app.Activity? = when (this) {
     is android.app.Activity -> this
     is android.content.ContextWrapper -> baseContext.findActivity()
@@ -180,7 +202,7 @@ class ReaderViewModel(
         val autoDoublePageLandscape: Boolean = true,
         val preloadOnlineCount: Int = 3,
         val readingDirection: String = "ltr",
-        val autoScrollSpeed: String = "off",
+        val autoScrollSpeed: String = "3",
         val autoScrolling: Boolean = false,
         val readerFitMode: String = "fitWidth",
         val readerBackground: String = "black",
@@ -418,22 +440,19 @@ class ReaderViewModel(
         }
     }
 
-    fun cycleLayout() {
-        val next = when (_state.value.readerMode) { "single" -> "multi"; "multi" -> "continuous"; else -> "single" }
-        _state.update { it.copy(readerMode = next) }
-        viewModelScope.launch { container.settingsRepository.setReaderMode(next) }
+    fun setReaderMode(mode: String) {
+        _state.update { it.copy(readerMode = mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderMode(mode) }
     }
 
-    fun cycleFitMode() {
-        val next = when (_state.value.readerFitMode) { "fitWidth" -> "fitHeight"; "fitHeight" -> "fitScreen"; "fitScreen" -> "original"; else -> "fitWidth" }
-        _state.update { it.copy(readerFitMode = next) }
-        viewModelScope.launch { container.settingsRepository.setReaderFitMode(next) }
+    fun setReaderFitMode(mode: String) {
+        _state.update { it.copy(readerFitMode = mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderFitMode(mode) }
     }
 
-    fun toggleDirection() {
-        val next = if (_state.value.readingDirection == "rtl") "ltr" else "rtl"
-        _state.update { it.copy(readingDirection = next) }
-        viewModelScope.launch { container.settingsRepository.setReadingDirection(next) }
+    fun setReadingDirection(direction: String) {
+        _state.update { it.copy(readingDirection = direction) }
+        viewModelScope.launch { container.settingsRepository.setReadingDirection(direction) }
     }
 
     fun setReaderBrightness(n: Int) {
@@ -443,12 +462,17 @@ class ReaderViewModel(
     }
 
     fun toggleAutoScroll() {
-        if (_state.value.readerMode == "continuous") _state.update { it.copy(autoScrolling = !it.autoScrolling) }
+        _state.update { it.copy(autoScrolling = !it.autoScrolling) }
+    }
+
+    fun stopAutoScroll() {
+        _state.update { it.copy(autoScrolling = false) }
     }
 
     fun setAutoScrollSpeed(s: String) {
-        _state.update { it.copy(autoScrollSpeed = s) }
-        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(s) }
+        val normalized = normalizeAutoScrollSpeed(s)
+        _state.update { it.copy(autoScrollSpeed = normalized) }
+        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(normalized) }
     }
 
     override fun onCleared() {
@@ -468,6 +492,18 @@ class ReaderViewModel(
 fun ReaderScreen(container: AppContainer, arcid: String, navController: NavController, initialPage: Int? = null) {
     val vm: ReaderViewModel = viewModel { ReaderViewModel(container, arcid, initialPage) }
     val state by vm.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val view = LocalView.current
+
+    DisposableEffect(view) {
+        val window = context.findActivity()?.window
+        val insetsController = window?.let { WindowInsetsControllerCompat(it, view) }
+        insetsController?.hide(WindowInsetsCompat.Type.statusBars())
+        onDispose {
+            insetsController?.show(WindowInsetsCompat.Type.statusBars())
+        }
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -478,17 +514,18 @@ fun ReaderScreen(container: AppContainer, arcid: String, navController: NavContr
             state.loading -> LoadingBox()
             state.error != null -> ErrorBox(state.error!!, onRetry = vm::load)
             state.pageCount <= 0 -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Text("没有可显示的页面", color = Color.White) }
-            else -> ReaderContent(vm, state, navController, arcid)
+            else -> ReaderContent(vm, state, arcid)
         }
     }
 }
 
 @Composable
-private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, navController: NavController, arcid: String) {
-    var showUi by remember { mutableStateOf(true) }
-    var lastInteraction by remember { mutableStateOf(System.currentTimeMillis()) }
+private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, arcid: String) {
+    var showUi by remember { mutableStateOf(false) }
+    var lastInteraction by remember { mutableStateOf(0L) }
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
+    var showAutoPage by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
     var pageMenuIndex by remember { mutableStateOf<Int?>(null) }
@@ -499,10 +536,10 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
 
     fun touch() { showUi = true; lastInteraction = System.currentTimeMillis() }
 
-    LaunchedEffect(showUi, lastInteraction, showToc, showSettings, showHistory, showInfo, pageMenuIndex) {
-        if (showUi && !showToc && !showSettings && !showHistory && !showInfo && pageMenuIndex == null) {
-            delay(5000)
-            if (System.currentTimeMillis() - lastInteraction >= 4800) showUi = false
+    LaunchedEffect(showUi, lastInteraction, showToc, showSettings, showAutoPage, showHistory, showInfo, pageMenuIndex) {
+        if (showUi && !showToc && !showSettings && !showAutoPage && !showHistory && !showInfo && pageMenuIndex == null) {
+            delay(10000)
+            if (System.currentTimeMillis() - lastInteraction >= 9800) showUi = false
         }
     }
 
@@ -520,30 +557,64 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
     val preloadCount = if (state.offline) state.preloadLocalCount else state.preloadOnlineCount
     val screens = ((models.size + pagesPerScreen - 1) / pagesPerScreen).coerceAtLeast(1)
     val startScreen = (state.currentPage / pagesPerScreen).coerceIn(0, screens - 1)
-    val listState = rememberLazyListState(initialFirstVisibleItemIndex = state.currentPage)
-    val pagerState = rememberPagerState(initialPage = startScreen) { screens }
+    val listState = key(state.readerMode) {
+        rememberLazyListState(initialFirstVisibleItemIndex = state.currentPage)
+    }
+    val pagerState = key(state.readerMode, pagesPerScreen) {
+        rememberPagerState(initialPage = startScreen) { screens }
+    }
 
     DisposableEffect(state.keepScreenOn) { view.keepScreenOn = state.keepScreenOn; onDispose { view.keepScreenOn = false } }
     LaunchedEffect(state.readerBrightness) { setWindowBrightness(context, if (state.readerBrightness >= 0) state.readerBrightness / 100f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) }
     DisposableEffect(Unit) { onDispose { setWindowBrightness(context, WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) } }
-    LaunchedEffect(state.autoScrolling, state.autoScrollSpeed, state.readerMode) {
-        if (state.readerMode != "continuous" || !state.autoScrolling || state.autoScrollSpeed == "off") return@LaunchedEffect
-        val pxPerSec = when (state.autoScrollSpeed) { "slow" -> 40f; "medium" -> 80f; "fast" -> 140f; else -> 0f }
-        if (pxPerSec <= 0f) return@LaunchedEffect
-        while (true) {
-            if (!listState.canScrollForward) { vm.toggleAutoScroll(); break }
-            listState.scrollBy(pxPerSec * 0.016f)
-            delay(16)
+    LaunchedEffect(
+        state.autoScrolling,
+        state.autoScrollSpeed,
+        state.readerMode,
+        listState,
+        pagerState,
+        pagesPerScreen,
+    ) {
+        if (!state.autoScrolling) return@LaunchedEffect
+        val secondsPerViewport = autoScrollSeconds(state.autoScrollSpeed)
+        if (state.readerMode == "continuous") {
+            while (true) {
+                if (!listState.canScrollForward) {
+                    vm.stopAutoScroll()
+                    break
+                }
+                val viewportHeight = listState.layoutInfo.run {
+                    (viewportEndOffset - viewportStartOffset).coerceAtLeast(1)
+                }
+                val pxPerSec = viewportHeight / secondsPerViewport
+                listState.scrollBy(pxPerSec * 0.016f)
+                delay(16)
+            }
+        } else {
+            while (true) {
+                delay((secondsPerViewport * 1000).toLong())
+                val currentScreen = pagerState.settledPage
+                if (currentScreen >= pagerState.pageCount - 1) {
+                    vm.stopAutoScroll()
+                    break
+                }
+                pagerState.animateScrollToPage(currentScreen + 1)
+            }
         }
     }
 
-    fun jumpTo(idx: Int) {
+    fun jumpTo(idx: Int, revealUi: Boolean = true) {
         val page = idx.coerceIn(0, (state.pageCount - 1).coerceAtLeast(0))
         scope.launch { if (state.readerMode == "continuous") listState.animateScrollToItem(page) else pagerState.animateScrollToPage(page / pagesPerScreen) }
         vm.reportPage(page)
-        touch()
+        if (revealUi) touch()
     }
-    fun stepScreen(delta: Int) { jumpTo(state.currentPage + delta * if (state.readerMode == "continuous") 1 else pagesPerScreen) }
+    fun stepScreen(delta: Int, revealUi: Boolean = true) {
+        jumpTo(
+            state.currentPage + delta * if (state.readerMode == "continuous") 1 else pagesPerScreen,
+            revealUi,
+        )
+    }
     fun openPageMenu(idx: Int) { touch(); pageMenuIndex = idx }
 
     Box(
@@ -558,22 +629,82 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
             },
     ) {
         if (state.readerMode == "continuous") {
-            VerticalReader(listState, models, fitScale, { vm.reportPage(it); touch() }, { if (showUi) showUi = false else touch() }, ::openPageMenu)
+            ContinuousReader(
+                listState,
+                models,
+                fitScale,
+                vm::reportPage,
+                { if (showUi) showUi = false else touch() },
+                ::openPageMenu,
+            )
+        } else if (state.readingDirection == "ttb") {
+            VerticalPagedReader(
+                pagerState,
+                models,
+                pagesPerScreen,
+                preloadCount,
+                fitScale,
+                state.tapZonesEnabled,
+                vm::reportPage,
+                { if (showUi) showUi = false else touch() },
+                ::openPageMenu,
+            )
         } else {
-            HorizontalReader(pagerState, models, reverse, pagesPerScreen, preloadCount, fitScale, state.tapZonesEnabled, { vm.reportPage(it); touch() }, { if (showUi) showUi = false else touch() }, ::openPageMenu)
+            HorizontalReader(
+                pagerState,
+                models,
+                reverse,
+                pagesPerScreen,
+                preloadCount,
+                fitScale,
+                state.tapZonesEnabled,
+                vm::reportPage,
+                { if (showUi) showUi = false else touch() },
+                ::openPageMenu,
+            )
         }
 
-        AnimatedVisibility(visible = showUi, modifier = Modifier.align(Alignment.TopCenter)) {
-            ReaderTopBar(state.title, state.currentPage + 1, state.pageCount, state.readerMode == "continuous", state.autoScrolling,
-                { navController.popBackStack() }, { touch(); showHistory = true }, { touch(); showSettings = true }, { vm.toggleAutoScroll(); touch() })
-        }
-        AnimatedVisibility(visible = showUi, modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding()) {
-            ReaderTimeline(state.currentPage, state.pageCount, models, ::jumpTo, { stepScreen(-1) }, { stepScreen(1) }, ::touch, ::openPageMenu)
+        AnimatedVisibility(
+            visible = showUi,
+            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding(),
+            enter = slideInVertically(
+                initialOffsetY = { it },
+                animationSpec = tween(durationMillis = 140),
+            ) + fadeIn(animationSpec = tween(durationMillis = 100)),
+            exit = slideOutVertically(
+                targetOffsetY = { it },
+                animationSpec = tween(durationMillis = 120),
+            ) + fadeOut(animationSpec = tween(durationMillis = 100)),
+        ) {
+            ReaderTimeline(
+                currentPage = state.currentPage,
+                total = state.pageCount,
+                models = models,
+                onJump = ::jumpTo,
+                onPrev = { stepScreen(-1) },
+                onNext = { stepScreen(1) },
+                onTouch = ::touch,
+                onLongPress = ::openPageMenu,
+                onOpenToc = { touch(); showToc = true },
+                onOpenHistory = { touch(); showHistory = true },
+                onOpenFunctions = { touch(); showSettings = true },
+                onOpenAutoPage = { touch(); showAutoPage = true },
+            )
         }
     }
 
-    if (showToc) TocSheet(state.toc, state.currentPage, state.offline, { jumpTo(it - 1); showToc = false }, { vm.addToc(it); showToc = false }, vm::deleteToc) { showToc = false }
-    if (showSettings) ReaderSettingsSheet(state, vm, { showSettings = false; showToc = true; touch() }, { showSettings = false; touch() }, ::touch)
+    if (showToc) TocSheet(
+        state.toc,
+        state.currentPage,
+        state.offline,
+        { jumpTo(it - 1); showToc = false },
+        { vm.addToc(it); showToc = false; touch() },
+        { vm.deleteToc(it); touch() },
+    ) { showToc = false; touch() }
+    if (showSettings) ReaderSettingsSheet(state, vm, { showSettings = false; touch() }, ::touch)
+    if (showAutoPage) {
+        AutoPageSheet(state, vm, { showAutoPage = false; touch() }, ::touch)
+    }
     if (showHistory) {
         AlertDialog(onDismissRequest = { showHistory = false; touch() }, title = { Text("阅读进度") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -617,9 +748,70 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
 }
 
 @Composable
-private fun VerticalReader(listState: LazyListState, models: List<Any>, fitScale: ContentScale, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
+private fun ContinuousReader(listState: LazyListState, models: List<Any>, fitScale: ContentScale, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
     LaunchedEffect(listState) { snapshotFlow { listState.firstVisibleItemIndex }.distinctUntilChanged().collect { onPage(it) } }
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) { itemsIndexed(models) { index, model -> ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, { _ -> onToggleUi() }) { onPageLongPress(index) } } }
+}
+
+@Composable
+private fun VerticalPagedReader(
+    pagerState: PagerState,
+    models: List<Any>,
+    pagesPerScreen: Int,
+    preloadCount: Int,
+    fitScale: ContentScale,
+    tapZonesEnabled: Boolean,
+    onPage: (Int) -> Unit,
+    onToggleUi: () -> Unit,
+    onPageLongPress: (Int) -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(pagerState, pagesPerScreen) {
+        snapshotFlow { pagerState.settledPage }
+            .distinctUntilChanged()
+            .collect { onPage(it * pagesPerScreen) }
+    }
+    VerticalPager(
+        state = pagerState,
+        beyondViewportPageCount = preloadCount,
+        modifier = Modifier.fillMaxSize(),
+    ) { screen ->
+        val start = screen * pagesPerScreen
+        Row(Modifier.fillMaxSize()) {
+            repeat(pagesPerScreen) { i ->
+                val idx = start + i
+                if (idx < models.size) {
+                    Box(Modifier.weight(1f).fillMaxSize()) {
+                        ZoomablePage(
+                            models[idx],
+                            Modifier.fillMaxSize(),
+                            fitScale,
+                            tapZonesEnabled,
+                            verticalTapZones = true,
+                            onTapRegion = { region ->
+                                when (region) {
+                                    TapRegion.CENTER -> onToggleUi()
+                                    TapRegion.LEFT -> scope.launch {
+                                        pagerState.animateScrollToPage(
+                                            (pagerState.currentPage - 1).coerceIn(0, pagerState.pageCount - 1),
+                                        )
+                                    }
+                                    TapRegion.RIGHT -> scope.launch {
+                                        pagerState.animateScrollToPage(
+                                            (pagerState.currentPage + 1).coerceIn(0, pagerState.pageCount - 1),
+                                        )
+                                    }
+                                }
+                            },
+                            onLongPress = { onPageLongPress(idx) },
+                        )
+                    }
+                } else {
+                    Spacer(Modifier.weight(1f))
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -638,7 +830,7 @@ private fun HorizontalReader(pagerState: PagerState, models: List<Any>, reverse:
                             TapRegion.LEFT -> scope.launch { pagerState.animateScrollToPage((pagerState.currentPage - 1).coerceIn(0, pagerState.pageCount - 1)) }
                             TapRegion.RIGHT -> scope.launch { pagerState.animateScrollToPage((pagerState.currentPage + 1).coerceIn(0, pagerState.pageCount - 1)) }
                         }
-                    }, { onPageLongPress(idx) })
+                    }, onLongPress = { onPageLongPress(idx) })
                 } else Spacer(Modifier.weight(1f))
             }
         }
@@ -646,78 +838,236 @@ private fun HorizontalReader(pagerState: PagerState, models: List<Any>, reverse:
 }
 
 @Composable
-private fun ZoomablePage(model: Any, modifier: Modifier, fitScale: ContentScale, tapZonesEnabled: Boolean, onTapRegion: (TapRegion) -> Unit, onLongPress: (() -> Unit)? = null) {
-    var scale by remember { mutableFloatStateOf(1f) }
-    var offset by remember { mutableStateOf(Offset.Zero) }
+private fun ZoomablePage(
+    model: Any,
+    modifier: Modifier,
+    fitScale: ContentScale,
+    tapZonesEnabled: Boolean,
+    onTapRegion: (TapRegion) -> Unit,
+    verticalTapZones: Boolean = false,
+    onLongPress: (() -> Unit)? = null,
+) {
+    val scale = remember(model) { mutableFloatStateOf(1f) }
+    val offset = remember(model) { mutableStateOf(Offset.Zero) }
+    val tapZonesEnabledState = rememberUpdatedState(tapZonesEnabled)
+    val verticalTapZonesState = rememberUpdatedState(verticalTapZones)
+    val onTapRegionState = rememberUpdatedState(onTapRegion)
+    val onLongPressState = rememberUpdatedState(onLongPress)
     var loading by remember(model) { mutableStateOf(true) }
-    LaunchedEffect(model) { scale = 1f; offset = Offset.Zero }
-    Box(modifier.clipToBounds().pointerInput(scale > 1f) {
-        if (scale > 1f) detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); offset += pan }
-    }.pointerInput(Unit) {
+    Box(modifier.clipToBounds().pointerInput(model) {
         detectTapGestures(onTap = { tapOffset ->
-            if (scale <= 1f) {
-                if (!tapZonesEnabled) onTapRegion(TapRegion.CENTER) else {
-                    val w = size.width.toFloat()
-                    onTapRegion(when { tapOffset.x < w / 3f -> TapRegion.LEFT; tapOffset.x > w * 2f / 3f -> TapRegion.RIGHT; else -> TapRegion.CENTER })
+            if (scale.floatValue <= 1f) {
+                if (!tapZonesEnabledState.value) onTapRegionState.value(TapRegion.CENTER) else {
+                    val position = if (verticalTapZonesState.value) tapOffset.y else tapOffset.x
+                    val extent = if (verticalTapZonesState.value) size.height.toFloat() else size.width.toFloat()
+                    onTapRegionState.value(
+                        when {
+                            position < extent / 3f -> TapRegion.LEFT
+                            position > extent * 2f / 3f -> TapRegion.RIGHT
+                            else -> TapRegion.CENTER
+                        },
+                    )
                 }
             }
-        }, onDoubleTap = { if (scale > 1f) { scale = 1f; offset = Offset.Zero } else scale = 2f }, onLongPress = { if (scale <= 1f) onLongPress?.invoke() })
+        }, onDoubleTap = {
+            if (scale.floatValue > 1f) {
+                scale.floatValue = 1f
+                offset.value = Offset.Zero
+            } else {
+                scale.floatValue = 2f
+                offset.value = Offset.Zero
+            }
+        }, onLongPress = { if (scale.floatValue <= 1f) onLongPressState.value?.invoke() })
+    }.pointerInput(model) {
+        awaitEachGesture {
+            awaitFirstDown(requireUnconsumed = false)
+            var ownsGesture = scale.floatValue > 1f
+            do {
+                val event = awaitPointerEvent()
+                val pressedPointers = event.changes.count { it.pressed }
+                if (pressedPointers >= 2) ownsGesture = true
+
+                if (ownsGesture) {
+                    val oldScale = scale.floatValue
+                    val newScale = (oldScale * event.calculateZoom()).coerceIn(1f, 5f)
+                    if (newScale <= 1f) {
+                        scale.floatValue = 1f
+                        offset.value = Offset.Zero
+                    } else {
+                        val scaleRatio = newScale / oldScale
+                        val center = Offset(size.width / 2f, size.height / 2f)
+                        val centroidFromCenter = event.calculateCentroid(useCurrent = true) - center
+                        val transformedOffset = offset.value * scaleRatio +
+                            centroidFromCenter * (1f - scaleRatio) +
+                            event.calculatePan()
+                        val maxOffsetX = size.width * (newScale - 1f) / 2f
+                        val maxOffsetY = size.height * (newScale - 1f) / 2f
+                        scale.floatValue = newScale
+                        offset.value = Offset(
+                            transformedOffset.x.coerceIn(-maxOffsetX, maxOffsetX),
+                            transformedOffset.y.coerceIn(-maxOffsetY, maxOffsetY),
+                        )
+                    }
+                    event.changes.forEach { change ->
+                        if (change.positionChanged()) change.consume()
+                    }
+                }
+            } while (event.changes.any { it.pressed })
+        }
     }, contentAlignment = Alignment.Center) {
-        AsyncImage(model = model, contentDescription = null, contentScale = fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y })
+        AsyncImage(model = model, contentDescription = null, contentScale = fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale.floatValue; scaleY = scale.floatValue; translationX = offset.value.x; translationY = offset.value.y })
         if (loading) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp, color = Color.White) }
     }
 }
 
 @Composable
-private fun ReaderTopBar(title: String, current: Int, total: Int, continuous: Boolean, autoScrolling: Boolean, onBack: () -> Unit, onHistory: () -> Unit, onSettings: () -> Unit, onToggleAutoScroll: () -> Unit) {
-    Row(Modifier.fillMaxWidth().background(Color(0xCC000000)).padding(horizontal = 10.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回", tint = Color.White) }
-        Column(Modifier.weight(1f)) {
-            Text(title.ifBlank { "阅读" }, color = Color.White, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text("$current / $total", color = Color.White.copy(alpha = 0.65f), style = MaterialTheme.typography.labelSmall)
-        }
-        if (continuous) IconButton(onClick = onToggleAutoScroll) { Icon(if (autoScrolling) Icons.Filled.Pause else Icons.Filled.PlayArrow, if (autoScrolling) "暂停滚动" else "自动滚动", tint = Color.White) }
-        IconButton(onClick = onHistory) { Icon(Icons.Filled.History, "阅读进度", tint = Color.White) }
-        IconButton(onClick = onSettings) { Icon(Icons.Filled.Settings, "阅读设置", tint = Color.White) }
-    }
-}
-
-@Composable
-private fun ReaderTimeline(currentPage: Int, total: Int, models: List<Any>, onJump: (Int) -> Unit, onPrev: () -> Unit, onNext: () -> Unit, onTouch: () -> Unit, onLongPress: (Int) -> Unit) {
+private fun ReaderTimeline(
+    currentPage: Int,
+    total: Int,
+    models: List<Any>,
+    onJump: (Int) -> Unit,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onTouch: () -> Unit,
+    onLongPress: (Int) -> Unit,
+    onOpenToc: () -> Unit,
+    onOpenHistory: () -> Unit,
+    onOpenFunctions: () -> Unit,
+    onOpenAutoPage: () -> Unit,
+) {
     var sliderValue by remember(currentPage) { mutableFloatStateOf(currentPage.toFloat()) }
     var dragging by remember { mutableStateOf(false) }
-    LaunchedEffect(currentPage, dragging) { if (!dragging) sliderValue = currentPage.toFloat() }
-
-    val start = when {
-        total <= 5 -> 0
-        currentPage <= 2 -> 0
-        currentPage >= total - 3 -> total - 5
-        else -> currentPage - 2
+    var previewPage by remember(currentPage) { mutableStateOf(currentPage) }
+    val thumbnailListState = rememberLazyListState(
+        initialFirstVisibleItemIndex = (currentPage - 2).coerceAtLeast(0),
+    )
+    LaunchedEffect(currentPage, dragging) {
+        if (!dragging) {
+            sliderValue = currentPage.toFloat()
+            previewPage = currentPage
+        }
     }
-    val visiblePages = (start until (start + 5).coerceAtMost(total)).toList()
-    val screenWidth = LocalConfiguration.current.screenWidthDp.dp
-    val thumbWidth = ((screenWidth - 48.dp) / 5f).coerceIn(48.dp, 190.dp)
+    LaunchedEffect(previewPage, models.size) {
+        if (models.isEmpty() || thumbnailListState.isScrollInProgress) return@LaunchedEffect
+        val targetPage = previewPage.coerceIn(models.indices)
+        thumbnailListState.animateScrollToItem((targetPage - 2).coerceAtLeast(0))
+    }
 
-    Column(Modifier.fillMaxWidth().background(Color(0xE9000000)).padding(horizontal = 10.dp, vertical = 8.dp)) {
-        LazyRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.Top, userScrollEnabled = false) {
-            itemsIndexed(visiblePages) { _, index ->
-                val selected = index == currentPage
-                Column(Modifier.width(thumbWidth).clickable { onJump(index); onTouch() }, horizontalAlignment = Alignment.CenterHorizontally) {
-                    Box(Modifier.fillMaxWidth().aspectRatio(0.69f).clip(RoundedCornerShape(8.dp)).background(Color(0xFF202020)).then(if (selected) Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(8.dp)) else Modifier).pointerInput(index) { detectTapGestures(onLongPress = { onLongPress(index) }) }) {
-                        AsyncImage(model = models[index], contentDescription = "第 ${index + 1} 页", contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+    Column(Modifier.fillMaxWidth().background(Color(0xE9000000)).padding(vertical = 8.dp)) {
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val thumbnailPadding = 2.dp
+            val thumbnailSpacing = 4.dp
+            val thumbnailWidth = ((maxWidth - thumbnailPadding * 2 - thumbnailSpacing * 4) / 4.7f)
+                .coerceAtLeast(44.dp)
+            LazyRow(
+                state = thumbnailListState,
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = thumbnailPadding),
+                horizontalArrangement = Arrangement.spacedBy(thumbnailSpacing),
+                verticalAlignment = Alignment.Top,
+            ) {
+                items(models.size, key = { it }) { page ->
+                    val selected = page == previewPage
+                    Column(
+                        Modifier
+                            .width(thumbnailWidth)
+                            .pointerInput(page) {
+                                detectTapGestures(
+                                    onTap = { onJump(page); onTouch() },
+                                    onLongPress = { onLongPress(page) },
+                                )
+                            },
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        Box(
+                            Modifier
+                                .fillMaxWidth()
+                                .aspectRatio(0.69f)
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color(0xFF202020)),
+                        ) {
+                            AsyncImage(
+                                model = models[page],
+                                contentDescription = "第 ${page + 1} 页",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize().graphicsLayer {
+                                    alpha = if (selected) 1f else 0.88f
+                                },
+                            )
+                        }
+                        Spacer(Modifier.height(3.dp))
+                        Text(
+                            "${page + 1}",
+                            color = if (selected) MaterialTheme.colorScheme.primary else Color.White,
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                        )
                     }
-                    Spacer(Modifier.height(4.dp))
-                    Text("${index + 1}", color = if (selected) MaterialTheme.colorScheme.primary else Color.White, style = MaterialTheme.typography.labelMedium)
                 }
             }
         }
         Spacer(Modifier.height(4.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { onPrev(); onTouch() }, enabled = currentPage > 0) { Text("‹", color = Color.White, style = MaterialTheme.typography.titleLarge) }
-            Text("${currentPage + 1}", color = Color.White, style = MaterialTheme.typography.bodyMedium)
-            Slider(value = sliderValue, onValueChange = { dragging = true; sliderValue = it; onJump(it.toInt().coerceIn(0, total - 1)); onTouch() }, onValueChangeFinished = { dragging = false; onTouch() }, valueRange = 0f..(total - 1).coerceAtLeast(1).toFloat(), enabled = total > 1, modifier = Modifier.weight(1f))
-            Text("$total", color = Color.White, style = MaterialTheme.typography.bodyMedium)
-            TextButton(onClick = { onNext(); onTouch() }, enabled = currentPage < total - 1) { Text("›", color = Color.White, style = MaterialTheme.typography.titleLarge) }
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                onClick = { onPrev(); onTouch() },
+                enabled = currentPage > 0,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.NavigateBefore, contentDescription = "上一页", tint = Color.White)
+            }
+            Slider(
+                value = sliderValue,
+                onValueChange = {
+                    dragging = true
+                    sliderValue = it
+                    previewPage = it.toInt().coerceIn(0, total - 1)
+                    onJump(previewPage)
+                    onTouch()
+                },
+                onValueChangeFinished = { dragging = false; onTouch() },
+                valueRange = 0f..(total - 1).coerceAtLeast(1).toFloat(),
+                enabled = total > 1,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                "${previewPage + 1} / $total",
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                maxLines = 1,
+                modifier = Modifier.padding(horizontal = 6.dp),
+            )
+            IconButton(
+                onClick = { onNext(); onTouch() },
+                enabled = currentPage < total - 1,
+                modifier = Modifier.size(40.dp),
+            ) {
+                Icon(Icons.AutoMirrored.Filled.NavigateNext, contentDescription = "下一页", tint = Color.White)
+            }
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 10.dp),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onOpenAutoPage) {
+                Icon(
+                    Icons.Filled.PlayArrow,
+                    contentDescription = "自动翻页设置",
+                    tint = Color.White,
+                )
+            }
+            IconButton(onClick = onOpenToc) {
+                Icon(Icons.Filled.AutoStories, contentDescription = "打开目录", tint = Color.White)
+            }
+            IconButton(onClick = onOpenHistory) {
+                Icon(Icons.Filled.Timeline, contentDescription = "查看阅读进度", tint = Color.White)
+            }
+            IconButton(onClick = onOpenFunctions) {
+                Icon(Icons.Filled.Settings, contentDescription = "打开阅读设置", tint = Color.White)
+            }
         }
     }
 }
@@ -745,23 +1095,197 @@ private fun TocSheet(toc: List<TocEntry>, currentPage: Int, offline: Boolean, on
     if (showAdd) AlertDialog(onDismissRequest = { showAdd = false }, title = { Text("添加目录") }, text = { Column { Text("页码：${currentPage + 1}", color = MaterialTheme.colorScheme.onSurfaceVariant); Spacer(Modifier.height(8.dp)); TextField(value = addTitle, onValueChange = { addTitle = it }, singleLine = true, placeholder = { Text("章节名称") }) } }, confirmButton = { TextButton(enabled = addTitle.isNotBlank(), onClick = { onAdd(addTitle); showAdd = false }) { Text("添加") } }, dismissButton = { TextButton(onClick = { showAdd = false }) { Text("取消") } })
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun ReaderSettingsSheet(state: ReaderViewModel.UiState, vm: ReaderViewModel, onOpenToc: () -> Unit, onDismiss: () -> Unit, onTouch: () -> Unit) {
-    var showBrightness by remember { mutableStateOf(false) }
-    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState()) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
-            Text("阅读设置", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onOpenToc, modifier = Modifier.fillMaxWidth()) { Text("目录") }
-            TextButton(onClick = { vm.cycleLayout(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("布局：${when (state.readerMode) { "multi" -> "多页"; "continuous" -> "连续"; else -> "单页" }}") }
-            TextButton(onClick = { vm.toggleDirection(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("方向：${if (state.readingDirection == "rtl") "右→左" else "左→右"}") }
-            TextButton(onClick = { vm.cycleFitMode(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("图片适应：${fitModeLabel(state.readerFitMode)}") }
-            TextButton(onClick = { showBrightness = true }, modifier = Modifier.fillMaxWidth()) { Text("亮度：${if (state.readerBrightness < 0) "跟随系统" else "${state.readerBrightness}%"}") }
-            TextButton(onClick = { vm.setAutoScrollSpeed(when (state.autoScrollSpeed) { "off" -> "slow"; "slow" -> "medium"; "medium" -> "fast"; else -> "off" }); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("自动滚动速度：${when (state.autoScrollSpeed) { "slow" -> "慢"; "medium" -> "中"; "fast" -> "快"; else -> "关闭" }}") }
+private fun AutoPageSheet(
+    state: ReaderViewModel.UiState,
+    vm: ReaderViewModel,
+    onDismiss: () -> Unit,
+    onTouch: () -> Unit,
+) {
+    var speedInput by remember { mutableStateOf(state.autoScrollSpeed) }
+    val speedSeconds = autoScrollSeconds(state.autoScrollSpeed)
+    val inputSeconds = speedInput.toFloatOrNull()
+    val speedInputValid = inputSeconds != null &&
+        inputSeconds in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS
+
+    LaunchedEffect(state.autoScrollSpeed) {
+        val localValue = speedInput.toFloatOrNull()
+        if (
+            localValue == null ||
+            localValue !in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS ||
+            normalizeAutoScrollSpeed(localValue.toString()) != state.autoScrollSpeed
+        ) {
+            speedInput = state.autoScrollSpeed
         }
     }
-    if (showBrightness) AlertDialog(onDismissRequest = { showBrightness = false }, title = { Text("阅读亮度") }, text = { Column { Slider(value = if (state.readerBrightness < 0) 50f else state.readerBrightness.toFloat(), onValueChange = { vm.setReaderBrightness(it.toInt()); onTouch() }, valueRange = 0f..100f); TextButton(onClick = { vm.setReaderBrightness(-1); onTouch() }) { Text("跟随系统") } } }, confirmButton = { TextButton(onClick = { showBrightness = false }) { Text("关闭") } })
+
+    fun updateSpeed(seconds: Float) {
+        val normalized = normalizeAutoScrollSpeed(seconds.toString())
+        speedInput = normalized
+        vm.setAutoScrollSpeed(normalized)
+        onTouch()
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text("自动翻页", style = MaterialTheme.typography.titleMedium)
+            ReaderSettingsLabel("播放状态")
+            FilterChip(
+                selected = state.autoScrolling,
+                onClick = { vm.toggleAutoScroll(); onTouch() },
+                leadingIcon = {
+                    Icon(
+                        if (state.autoScrolling) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = if (state.autoScrolling) "暂停自动翻页" else "开始自动翻页",
+                        modifier = Modifier.size(18.dp),
+                    )
+                },
+                label = { Text(if (state.autoScrolling) "暂停" else "开始") },
+            )
+
+            ReaderSettingsLabel("翻页速度")
+            Text(
+                "当前：${normalizeAutoScrollSpeed(speedSeconds.toString())} 秒/屏",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(1.5f, 3f, 6f).forEach { seconds ->
+                    val normalized = normalizeAutoScrollSpeed(seconds.toString())
+                    FilterChip(
+                        selected = state.autoScrollSpeed == normalized,
+                        onClick = { updateSpeed(seconds) },
+                        label = { Text("$normalized 秒") },
+                    )
+                }
+            }
+            Slider(
+                value = speedSeconds,
+                onValueChange = ::updateSpeed,
+                valueRange = AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS,
+                steps = 58,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            OutlinedTextField(
+                value = speedInput,
+                onValueChange = { value ->
+                    speedInput = value
+                    onTouch()
+                    value.toFloatOrNull()
+                        ?.takeIf { it in AUTO_SCROLL_MIN_SECONDS..AUTO_SCROLL_MAX_SECONDS }
+                        ?.let { vm.setAutoScrollSpeed(it.toString()) }
+                },
+                label = { Text("秒/屏") },
+                supportingText = { Text("可输入 0.5–30 秒") },
+                isError = speedInput.isNotEmpty() && !speedInputValid,
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+private fun ReaderSettingsSheet(
+    state: ReaderViewModel.UiState,
+    vm: ReaderViewModel,
+    onDismiss: () -> Unit,
+    onTouch: () -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = rememberModalBottomSheetState(),
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text("阅读设置", style = MaterialTheme.typography.titleMedium)
+
+            ReaderSettingsLabel("阅读布局")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("single" to "单页", "multi" to "多页", "continuous" to "连续").forEach { (mode, label) ->
+                    FilterChip(
+                        selected = state.readerMode == mode,
+                        onClick = { vm.setReaderMode(mode); onTouch() },
+                        label = { Text(label) },
+                    )
+                }
+            }
+
+            ReaderSettingsLabel("阅读方向")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("ltr" to "左→右", "rtl" to "右→左", "ttb" to "上→下").forEach { (direction, label) ->
+                    FilterChip(
+                        selected = state.readingDirection == direction,
+                        onClick = { vm.setReadingDirection(direction); onTouch() },
+                        label = { Text(label) },
+                    )
+                }
+            }
+
+            ReaderSettingsLabel("图片适应")
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf(
+                    "fitWidth" to "适应宽度",
+                    "fitHeight" to "适应高度",
+                    "fitScreen" to "适应屏幕",
+                    "original" to "原始尺寸",
+                ).forEach { (mode, label) ->
+                    FilterChip(
+                        selected = state.readerFitMode == mode,
+                        onClick = { vm.setReaderFitMode(mode); onTouch() },
+                        label = { Text(label) },
+                    )
+                }
+            }
+
+            ReaderSettingsLabel("阅读亮度")
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (state.readerBrightness < 0) "跟随系统" else "${state.readerBrightness}%",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                )
+                FilterChip(
+                    selected = state.readerBrightness < 0,
+                    onClick = { vm.setReaderBrightness(-1); onTouch() },
+                    label = { Text("跟随系统") },
+                )
+            }
+            Slider(
+                value = if (state.readerBrightness < 0) 50f else state.readerBrightness.toFloat(),
+                onValueChange = { vm.setReaderBrightness(it.toInt()); onTouch() },
+                valueRange = 0f..100f,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReaderSettingsLabel(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(top = 16.dp, bottom = 4.dp),
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

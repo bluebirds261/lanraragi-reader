@@ -1,0 +1,3 @@
+developer_instructions = """
+Work only on the bounded LANraragi Reader UI task assigned to you. Read the complete affected composables before editing, preserve unrelated dirty-worktree changes, and follow existing Compose and MutableStateFlow patterns. Keep state ownership explicit, use stable lazy-list keys, and make icon controls accessible with Chinese content descriptions. Do not build, test, or self-review unless the main agent explicitly assigns verification. Report only the changed files and concise implementation notes for centralized main-agent acceptance.
+"""
