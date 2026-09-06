@@ -50,19 +50,24 @@ val DownloadTask.isActive: Boolean
 typealias DownloadWork = suspend (onProgress: (Float?) -> Unit) -> Unit
 
 /**
- * 统一下载任务管理器：把离线缓存、原档下载、收藏单页收拢成同一个队列，
- * 2 个并发槽位、失败自动重试一次、支持暂停/恢复/重试/移除；
- * 任务表持久化到 filesDir/download_manager/tasks.json，进程重启后恢复队列展示。
+ * 统一下载任务管理器：把离线缓存、原档下载、收藏单页收拢成同一个队列。
+ * 并发数通过构造参数注入，默认仍为 2；UI 可以直接订阅 [activeCount]，
+ * 并使用 pauseAll/resumeAll/clearFinished 进行批量控制。
  */
 class DownloadManager(
     private val scope: CoroutineScope,
     private val context: Context,
+    maxConcurrent: Int = 2,
 ) {
 
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
 
-    private val semaphore = Semaphore(2)
+    private val _activeCount = MutableStateFlow(0)
+    /** 活动任务数量：WAITING/RUNNING/PAUSED 均计入徽标。 */
+    val activeCount: StateFlow<Int> = _activeCount.asStateFlow()
+
+    private val semaphore = Semaphore(maxConcurrent.coerceAtLeast(1))
     private val jobs = ConcurrentHashMap<String, Job>()
     private val works = ConcurrentHashMap<String, DownloadWork>()
     private val retriedIds = ConcurrentHashMap.newKeySet<String>()
@@ -73,6 +78,7 @@ class DownloadManager(
 
     init {
         loadPersisted()
+        refreshActiveCount()
     }
 
     /** 入队一个新任务并返回任务 id；work 由队列调度后在 [scope] 中执行。 */
@@ -80,6 +86,7 @@ class DownloadManager(
         val id = UUID.randomUUID().toString()
         works[id] = work
         _tasks.update { it + DownloadTask(id = id, type = type, arcid = arcid, title = title) }
+        refreshActiveCount()
         persist()
         startWorker(id)
         syncService()
@@ -118,6 +125,53 @@ class DownloadManager(
         syncService()
     }
 
+    /** 批量暂停所有等待/进行中的任务。 */
+    fun pauseAll() {
+        val targets = _tasks.value.filter {
+            it.state == TaskState.WAITING || it.state == TaskState.RUNNING
+        }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            update(task.id) { it.copy(state = TaskState.PAUSED) }
+            jobs[task.id]?.cancel()
+            jobs.remove(task.id)
+        }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
+    /** 批量恢复所有暂停任务。 */
+    fun resumeAll() {
+        val targets = _tasks.value.filter { it.state == TaskState.PAUSED }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            retriedIds.remove(task.id)
+            update(task.id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
+            startWorker(task.id)
+        }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
+    /** 清理已完成和失败任务，不影响仍在队列中的任务。 */
+    fun clearFinished() {
+        val targets = _tasks.value.filter {
+            it.state == TaskState.DONE || it.state == TaskState.FAILED
+        }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            works.remove(task.id)
+            jobs.remove(task.id)
+            retriedIds.remove(task.id)
+        }
+        _tasks.update { list -> list.filterNot { it.state == TaskState.DONE || it.state == TaskState.FAILED } }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
     /** 移除任务；运行中则先取消协程。 */
     fun remove(id: String) {
         jobs[id]?.cancel()
@@ -125,6 +179,7 @@ class DownloadManager(
         works.remove(id)
         retriedIds.remove(id)
         _tasks.update { list -> list.filterNot { it.id == id } }
+        refreshActiveCount()
         persist()
         syncService()
     }
@@ -141,6 +196,7 @@ class DownloadManager(
         }
         val ids = targets.map { it.id }.toSet()
         _tasks.update { list -> list.filterNot { it.id in ids } }
+        refreshActiveCount()
         persist()
         syncService()
     }
@@ -217,7 +273,7 @@ class DownloadManager(
     }
 
     private fun markDone(id: String) {
-        update(id) { it.copy(state = TaskState.DONE, error = null) }
+        update(id) { it.copy(state = TaskState.DONE, error = null, progress = 1f) }
         persist()
         syncService()
         works.remove(id)
@@ -235,6 +291,11 @@ class DownloadManager(
 
     private fun update(id: String, transform: (DownloadTask) -> DownloadTask) {
         _tasks.update { list -> list.map { if (it.id == id) transform(it) else it } }
+        refreshActiveCount()
+    }
+
+    private fun refreshActiveCount() {
+        _activeCount.value = _tasks.value.count { it.isActive }
     }
 
     private fun persistThrottled() {
