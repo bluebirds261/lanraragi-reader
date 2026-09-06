@@ -28,15 +28,11 @@ class HistoryRepository(private val context: Context) {
     private val _entries = MutableStateFlow<List<HistoryEntry>>(emptyList())
     val entries = _entries.asStateFlow()
 
-    init {
-        load()
-    }
+    init { load() }
 
     fun load() {
         runCatching {
-            if (file.exists()) {
-                _entries.value = ApiClient.json.decodeFromString(file.readText())
-            }
+            if (file.exists()) _entries.value = ApiClient.json.decodeFromString(file.readText())
         }
     }
 
@@ -47,23 +43,21 @@ class HistoryRepository(private val context: Context) {
         val todayStart = LocalDate.now()
             .atStartOfDay(java.time.ZoneId.systemDefault())
             .toInstant().toEpochMilli()
-        // 一天内打开同一档案：合并为一条，只更新最新时间和阅读位置。
         val todayEntry = _entries.value.firstOrNull { it.arcid == arcid && it.timestamp >= todayStart }
         _entries.value = if (todayEntry != null) {
             _entries.value.map {
                 if (it === todayEntry) {
                     HistoryEntry(arcid, title, now, safePage, if (safeCount > 0) safeCount else it.pageCount)
-                } else {
-                    it
-                }
+                } else it
             }
         } else {
-            (listOf(HistoryEntry(arcid, title, now, safePage, safeCount)) + _entries.value).take(500)
+            (listOf(HistoryEntry(arcid, title, now, safePage, safeCount)) + _entries.value)
         }
+        trimToRecentThree()
         persist()
     }
 
-    /** 只更新阅读位置，不改变时间戳，避免长时间阅读把历史顺序抖动。 */
+    /** 只更新阅读位置，不改变时间戳。 */
     suspend fun recordProgress(arcid: String, page: Int, pageCount: Int = 0, title: String? = null) {
         val safePage = page.coerceAtLeast(0)
         val safeCount = pageCount.coerceAtLeast(0)
@@ -79,10 +73,9 @@ class HistoryRepository(private val context: Context) {
                     pageCount = if (safeCount > 0) safeCount else entry.pageCount,
                     title = title?.takeIf { it.isNotBlank() } ?: entry.title,
                 )
-            } else {
-                entry
-            }
+            } else entry
         }
+        trimToRecentThree()
         persist()
     }
 
@@ -96,13 +89,21 @@ class HistoryRepository(private val context: Context) {
         persist()
     }
 
-    /** 最近阅读去重列表：按时间倒序取 n 个不同 arcid。 */
+    /** 最近阅读去重列表：最多返回最近三个不同档案。 */
     fun recentDeduped(n: Int): List<HistoryEntry> {
         val seen = mutableSetOf<String>()
         return _entries.value
             .sortedByDescending { it.timestamp }
             .filter { seen.add(it.arcid) }
-            .take(n)
+            .take(minOf(n.coerceAtLeast(0), 3))
+    }
+
+    private fun trimToRecentThree() {
+        val seen = mutableSetOf<String>()
+        _entries.value = _entries.value
+            .sortedByDescending { it.timestamp }
+            .filter { seen.add(it.arcid) }
+            .take(3)
     }
 
     private fun persist() {
@@ -115,83 +116,33 @@ class HistoryRepository(private val context: Context) {
 
 /** 每日使用时长：记录每天使用 App 的时长（毫秒），持久化到 filesDir/usage.json。 */
 class UsageRepository(private val context: Context) {
-
     private val file = File(context.filesDir, "usage.json")
-
     private val _usage = MutableStateFlow<Map<String, Long>>(emptyMap())
     val usage = _usage.asStateFlow()
-
-    init {
-        load()
-    }
-
-    fun load() {
-        runCatching {
-            if (file.exists()) {
-                _usage.value = ApiClient.json.decodeFromString(file.readText())
-            }
-        }
-    }
-
+    init { load() }
+    fun load() { runCatching { if (file.exists()) _usage.value = ApiClient.json.decodeFromString(file.readText()) } }
     fun addUsage(startTime: Long) {
         val day = LocalDate.now().toString()
         val delta = (System.currentTimeMillis() - startTime).coerceAtLeast(0)
         _usage.value = _usage.value + (day to (_usage.value[day] ?: 0L) + delta)
         persist()
     }
-
-    fun clear() {
-        _usage.value = emptyMap()
-        runCatching { file.delete() }
-    }
-
-    private fun persist() {
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(ApiClient.json.encodeToString(_usage.value))
-        }
-    }
+    fun clear() { _usage.value = emptyMap(); runCatching { file.delete() } }
+    private fun persist() { runCatching { file.parentFile?.mkdirs(); file.writeText(ApiClient.json.encodeToString(_usage.value)) } }
 }
 
 /** 每日打卡：记录打卡日期（yyyy-MM-dd），持久化到 filesDir/checkin.json。 */
 class CheckinRepository(private val context: Context) {
-
     private val file = File(context.filesDir, "checkin.json")
-
     private val _dates = MutableStateFlow<List<String>>(emptyList())
     val dates = _dates.asStateFlow()
-
-    init {
-        load()
-    }
-
-    fun load() {
-        runCatching {
-            if (file.exists()) {
-                _dates.value = ApiClient.json.decodeFromString(file.readText())
-            }
-        }
-    }
-
+    init { load() }
+    fun load() { runCatching { if (file.exists()) _dates.value = ApiClient.json.decodeFromString(file.readText()) } }
     fun isCheckedToday(): Boolean = LocalDate.now().toString() in _dates.value
-
     suspend fun checkin() {
         val today = LocalDate.now().toString()
-        if (today !in _dates.value) {
-            _dates.value = _dates.value + today
-            persist()
-        }
+        if (today !in _dates.value) { _dates.value = _dates.value + today; persist() }
     }
-
-    fun clear() {
-        _dates.value = emptyList()
-        runCatching { file.delete() }
-    }
-
-    private fun persist() {
-        runCatching {
-            file.parentFile?.mkdirs()
-            file.writeText(ApiClient.json.encodeToString(_dates.value))
-        }
-    }
+    fun clear() { _dates.value = emptyList(); runCatching { file.delete() } }
+    private fun persist() { runCatching { file.parentFile?.mkdirs(); file.writeText(ApiClient.json.encodeToString(_dates.value)) } }
 }
