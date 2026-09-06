@@ -48,15 +48,19 @@ class AppContainer(val context: Context) {
         // 启动时加载本地缓存的标签翻译数据。
         tagTranslationRepository.load()
 
-        // 把持久化的自定义标签颜色同步到全局可观察状态，供着色组件实时读取。
+        // 标签颜色只依赖 tagColors；这里只处理该状态，不再触发本地文件扫描。
         applicationScope.launch {
-            settingsRepository.settings.collect { s ->
-                TagColorStore.overrides.value = s.tagColors.mapNotNull { (ns, hex) ->
-                    parseHexColor(hex)?.let { ns to it }
-                }.toMap()
-                localScanManager.scan(s.extraScanDirUris)
-            }
+            settingsRepository.settings
+                .map { it.tagColors }
+                .distinctUntilChanged()
+                .collect { tagColors ->
+                    TagColorStore.overrides.value = tagColors.mapNotNull { (ns, hex) ->
+                        parseHexColor(hex)?.let { ns to it }
+                    }.toMap()
+                }
         }
+
+        // 本地图库只在扫描根目录集合发生变化时重新扫描。
         applicationScope.launch {
             settingsRepository.settings
                 .map { it.extraScanDirUris }
@@ -65,6 +69,7 @@ class AppContainer(val context: Context) {
                     localScanManager.scan(uris)
                 }
         }
+
         // B4: App 启动时补推一次离线期间积压的进度回写。
         applicationScope.launch {
             pendingProgress.flush(repository)
