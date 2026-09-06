@@ -28,11 +28,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
@@ -417,7 +414,7 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
 
 @Composable
 private fun VerticalReader(listState: LazyListState, models: List<Any>, fitScale: ContentScale, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
-    LaunchedEffect(listState) { snapshotFlow { listState.firstVisibleItemIndex }.distinctUntilChanged().collect(onPage) }
+    LaunchedEffect(listState) { snapshotFlow { listState.firstVisibleItemIndex }.distinctUntilChanged().collect { onPage(it) } }
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) { itemsIndexed(models) { index, model -> ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, onToggleUi) { onPageLongPress(index) } } }
 }
 
@@ -443,7 +440,7 @@ private fun ZoomablePage(model: Any, modifier: Modifier, fitScale: ContentScale,
     var loading by remember(model) { mutableStateOf(true) }
     LaunchedEffect(model) { scale = 1f; offset = Offset.Zero }
     Box(modifier.clipToBounds().pointerInput(scale > 1f) { if (scale > 1f) detectTransformGestures { _, pan, zoom, _ -> scale = (scale * zoom).coerceIn(1f, 5f); offset += pan } }.pointerInput(Unit) { detectTapGestures(onTap = { tapOffset -> if (scale <= 1f) { if (!tapZonesEnabled) onTapRegion(TapRegion.CENTER) else { val w = size.width.toFloat(); onTapRegion(when { tapOffset.x < w / 3f -> TapRegion.LEFT; tapOffset.x > w * 2f / 3f -> TapRegion.RIGHT; else -> TapRegion.CENTER }) } } }, onDoubleTap = { if (scale > 1f) { scale = 1f; offset = Offset.Zero } else scale = 2f }, onLongPress = { if (scale <= 1f) onLongPress?.invoke() }) }, contentAlignment = Alignment.Center) {
-        AsyncImage(model = model, contentDescription = null, contentScale = fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y })
+        AsyncImage(model, null, fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y })
         if (loading) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp, color = Color.White) }
     }
 }
