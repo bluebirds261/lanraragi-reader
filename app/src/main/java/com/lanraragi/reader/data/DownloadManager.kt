@@ -42,27 +42,29 @@ data class DownloadTask(
     val error: String? = null,
 )
 
-/** 非终态（等待/进行/暂停）都算“进行中”。 */
+/** 真正占用下载队列/并发槽位的活动任务：等待或执行中。暂停任务不算活动。 */
 val DownloadTask.isActive: Boolean
-    get() = state == TaskState.WAITING || state == TaskState.RUNNING || state == TaskState.PAUSED
+    get() = state == TaskState.WAITING || state == TaskState.RUNNING
 
-/** 一段可执行的下载工作：onProgress 上报 0..1 进度（未知时为 null）。 */
 typealias DownloadWork = suspend (onProgress: (Float?) -> Unit) -> Unit
 
 /**
- * 统一下载任务管理器：把离线缓存、原档下载、收藏单页收拢成同一个队列，
- * 2 个并发槽位、失败自动重试一次、支持暂停/恢复/重试/移除；
- * 任务表持久化到 filesDir/download_manager/tasks.json，进程重启后恢复队列展示。
+ * 统一下载任务管理器：把离线缓存、原档下载、收藏单页收拢成同一个队列。
+ * 并发数通过构造参数注入，默认 2；UI 可以订阅 [activeCount] 做真实的活动任务徽标。
  */
 class DownloadManager(
     private val scope: CoroutineScope,
     private val context: Context,
+    maxConcurrent: Int = 2,
 ) {
-
     private val _tasks = MutableStateFlow<List<DownloadTask>>(emptyList())
     val tasks: StateFlow<List<DownloadTask>> = _tasks.asStateFlow()
 
-    private val semaphore = Semaphore(2)
+    private val _activeCount = MutableStateFlow(0)
+    /** 活动任务数量：WAITING/RUNNING。PAUSED 不计入。 */
+    val activeCount: StateFlow<Int> = _activeCount.asStateFlow()
+
+    private val semaphore = Semaphore(maxConcurrent.coerceAtLeast(1))
     private val jobs = ConcurrentHashMap<String, Job>()
     private val works = ConcurrentHashMap<String, DownloadWork>()
     private val retriedIds = ConcurrentHashMap.newKeySet<String>()
@@ -73,20 +75,20 @@ class DownloadManager(
 
     init {
         loadPersisted()
+        refreshActiveCount()
     }
 
-    /** 入队一个新任务并返回任务 id；work 由队列调度后在 [scope] 中执行。 */
     fun enqueue(type: DownloadTaskType, arcid: String, title: String, work: DownloadWork): String {
         val id = UUID.randomUUID().toString()
         works[id] = work
         _tasks.update { it + DownloadTask(id = id, type = type, arcid = arcid, title = title) }
+        refreshActiveCount()
         persist()
         startWorker(id)
         syncService()
         return id
     }
 
-    /** 暂停任务：取消正在执行的协程并把状态置为 PAUSED。 */
     fun pause(id: String) {
         val task = find(id) ?: return
         if (task.state != TaskState.RUNNING && task.state != TaskState.WAITING) return
@@ -96,7 +98,6 @@ class DownloadManager(
         syncService()
     }
 
-    /** 恢复暂停的任务，重新入队。 */
     fun resume(id: String) {
         val task = find(id) ?: return
         if (task.state != TaskState.PAUSED) return
@@ -107,7 +108,6 @@ class DownloadManager(
         syncService()
     }
 
-    /** 失败任务手动重试，重新入队（重置自动重试计数）。 */
     fun retry(id: String) {
         val task = find(id) ?: return
         if (task.state != TaskState.FAILED) return
@@ -118,18 +118,59 @@ class DownloadManager(
         syncService()
     }
 
-    /** 移除任务；运行中则先取消协程。 */
+    fun pauseAll() {
+        val targets = _tasks.value.filter {
+            it.state == TaskState.WAITING || it.state == TaskState.RUNNING
+        }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            update(task.id) { it.copy(state = TaskState.PAUSED) }
+            jobs[task.id]?.cancel()
+            jobs.remove(task.id)
+        }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
+    fun resumeAll() {
+        val targets = _tasks.value.filter { it.state == TaskState.PAUSED }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            retriedIds.remove(task.id)
+            update(task.id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
+            startWorker(task.id)
+        }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
+    fun clearFinished() {
+        val targets = _tasks.value.filter { it.state == TaskState.DONE || it.state == TaskState.FAILED }
+        if (targets.isEmpty()) return
+        targets.forEach { task ->
+            works.remove(task.id)
+            jobs.remove(task.id)
+            retriedIds.remove(task.id)
+        }
+        _tasks.update { list -> list.filterNot { it.state == TaskState.DONE || it.state == TaskState.FAILED } }
+        refreshActiveCount()
+        persist()
+        syncService()
+    }
+
     fun remove(id: String) {
         jobs[id]?.cancel()
         jobs.remove(id)
         works.remove(id)
         retriedIds.remove(id)
         _tasks.update { list -> list.filterNot { it.id == id } }
+        refreshActiveCount()
         persist()
         syncService()
     }
 
-    /** 取消并移除匹配的任务；arcid 为 null 时匹配该类型所有任务。 */
     fun cancelTasks(type: DownloadTaskType, arcid: String?) {
         val targets = _tasks.value.filter { it.type == type && (arcid == null || it.arcid == arcid) }
         if (targets.isEmpty()) return
@@ -141,17 +182,16 @@ class DownloadManager(
         }
         val ids = targets.map { it.id }.toSet()
         _tasks.update { list -> list.filterNot { it.id in ids } }
+        refreshActiveCount()
         persist()
         syncService()
     }
 
-    /** 查询某类型 + arcid 的最新任务（供去重与 UI 派生状态）。 */
     fun taskFor(type: DownloadTaskType, arcid: String): DownloadTask? =
         _tasks.value.lastOrNull { it.type == type && it.arcid == arcid }
 
     private fun serviceIntent() = Intent(context, DownloadForegroundService::class.java)
 
-    /** 有活动任务时拉起前台服务，保持后台下载与通知进度。 */
     private fun maybeStartService() {
         if (_tasks.value.any { it.isActive }) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -162,14 +202,10 @@ class DownloadManager(
         }
     }
 
-    /** 无活动任务时停止前台服务（状态唯一源仍是本 manager，服务不另存状态）。 */
     private fun maybeStopService() {
-        if (_tasks.value.none { it.isActive }) {
-            context.stopService(serviceIntent())
-        }
+        if (_tasks.value.none { it.isActive }) context.stopService(serviceIntent())
     }
 
-    /** 状态变化后同步前台服务生命周期。 */
     private fun syncService() {
         maybeStartService()
         maybeStopService()
@@ -195,7 +231,6 @@ class DownloadManager(
                 } catch (e: Exception) {
                     val msg = e.message ?: "下载失败"
                     if (retriedIds.add(id)) {
-                        // 失败自动重试一次：放回等待队列，重新抢占并发槽位。
                         update(id) { it.copy(state = TaskState.WAITING, error = null, progress = null) }
                         persist()
                         startWorker(id)
@@ -217,7 +252,7 @@ class DownloadManager(
     }
 
     private fun markDone(id: String) {
-        update(id) { it.copy(state = TaskState.DONE, error = null) }
+        update(id) { it.copy(state = TaskState.DONE, error = null, progress = 1f) }
         persist()
         syncService()
         works.remove(id)
@@ -235,6 +270,11 @@ class DownloadManager(
 
     private fun update(id: String, transform: (DownloadTask) -> DownloadTask) {
         _tasks.update { list -> list.map { if (it.id == id) transform(it) else it } }
+        refreshActiveCount()
+    }
+
+    private fun refreshActiveCount() {
+        _activeCount.value = _tasks.value.count { it.isActive }
     }
 
     private fun persistThrottled() {
@@ -260,7 +300,6 @@ class DownloadManager(
             val list = ApiClient.json.decodeFromString<List<DownloadTask>>(persistFile.readText())
             _tasks.value = list.map { task ->
                 when (task.state) {
-                    // 上次进程中断时处于等待/进行中的任务，恢复到等待队列展示（实际下载需重新发起）。
                     TaskState.RUNNING, TaskState.WAITING ->
                         task.copy(state = TaskState.WAITING, error = null, progress = null)
                     else -> task
