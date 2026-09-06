@@ -264,14 +264,15 @@ class ReaderViewModel(
                         }
                     } else if (cached != null && cached.pageCount > 0) {
                         val cachedProgress = savedPage.takeIf { it > 0 }
-                            ?: cached.metadata.progress.minus(1).coerceAtLeast(0)
+                            ?: cached.metadata?.progress?.minus(1)?.coerceAtLeast(0)
+                            ?: 0
                         _state.update {
                             it.copy(
                                 offline = true,
                                 pageCount = cached.pageCount,
                                 title = cached.title,
-                                tags = cached.metadata.tags,
-                                toc = cached.metadata.toc,
+                                tags = cached.metadata?.tags ?: "",
+                                toc = cached.metadata?.toc ?: emptyList(),
                                 currentPage = cachedProgress.coerceIn(0, cached.pageCount - 1),
                                 loading = false,
                             )
@@ -489,6 +490,7 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
     var showToc by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showHistory by remember { mutableStateOf(false) }
+    var showInfo by remember { mutableStateOf(false) }
     var pageMenuIndex by remember { mutableStateOf<Int?>(null) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -497,8 +499,8 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
 
     fun touch() { showUi = true; lastInteraction = System.currentTimeMillis() }
 
-    LaunchedEffect(showUi, lastInteraction, showToc, showSettings, showHistory, pageMenuIndex) {
-        if (showUi && !showToc && !showSettings && !showHistory && pageMenuIndex == null) {
+    LaunchedEffect(showUi, lastInteraction, showToc, showSettings, showHistory, showInfo, pageMenuIndex) {
+        if (showUi && !showToc && !showSettings && !showHistory && !showInfo && pageMenuIndex == null) {
             delay(5000)
             if (System.currentTimeMillis() - lastInteraction >= 4800) showUi = false
         }
@@ -581,6 +583,21 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
             } },
             confirmButton = { TextButton(onClick = { showHistory = false; touch() }) { Text("关闭") } })
     }
+    if (showInfo) {
+        AlertDialog(
+            onDismissRequest = { showInfo = false; touch() },
+            title = { Text(state.title.ifBlank { "原档信息" }) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("共 ${state.pageCount} 页")
+                    if (state.tags.isNotBlank()) {
+                        Text("标签：${state.tags}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = { showInfo = false; touch() }) { Text("关闭") } },
+        )
+    }
     pageMenuIndex?.let { menuIdx ->
         PageMenuSheet(menuIdx + 1, state.offline,
             { vm.downloadCurrentPage(context, menuIdx); pageMenuIndex = null; touch() },
@@ -593,7 +610,7 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
                 pageMenuIndex = null; touch()
             },
             { vm.setCoverFromPage(menuIdx + 1); pageMenuIndex = null; touch() },
-            { pageMenuIndex = null; showHistory = true; touch() },
+            { pageMenuIndex = null; showInfo = true; touch() },
             { pageMenuIndex = null; touch() })
     }
     LaunchedEffect(Unit, showUi) { focusRequester.requestFocus() }
@@ -602,7 +619,7 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, n
 @Composable
 private fun VerticalReader(listState: LazyListState, models: List<Any>, fitScale: ContentScale, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
     LaunchedEffect(listState) { snapshotFlow { listState.firstVisibleItemIndex }.distinctUntilChanged().collect { onPage(it) } }
-    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) { itemsIndexed(models) { index, model -> ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, onToggleUi) { onPageLongPress(index) } } }
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) { itemsIndexed(models) { index, model -> ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, { _ -> onToggleUi() }) { onPageLongPress(index) } } }
 }
 
 @Composable
@@ -736,12 +753,12 @@ private fun ReaderSettingsSheet(state: ReaderViewModel.UiState, vm: ReaderViewMo
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
             Text("阅读设置", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onOpenToc, Modifier.fillMaxWidth()) { Text("目录") }
-            TextButton(onClick = { vm.cycleLayout(); onTouch() }, Modifier.fillMaxWidth()) { Text("布局：${when (state.readerMode) { "multi" -> "多页"; "continuous" -> "连续"; else -> "单页" }}") }
-            TextButton(onClick = { vm.toggleDirection(); onTouch() }, Modifier.fillMaxWidth()) { Text("方向：${if (state.readingDirection == "rtl") "右→左" else "左→右"}") }
-            TextButton(onClick = { vm.cycleFitMode(); onTouch() }, Modifier.fillMaxWidth()) { Text("图片适应：${fitModeLabel(state.readerFitMode)}") }
-            TextButton(onClick = { showBrightness = true }, Modifier.fillMaxWidth()) { Text("亮度：${if (state.readerBrightness < 0) "跟随系统" else "${state.readerBrightness}%"}") }
-            TextButton(onClick = { vm.setAutoScrollSpeed(when (state.autoScrollSpeed) { "off" -> "slow"; "slow" -> "medium"; "medium" -> "fast"; else -> "off" }); onTouch() }, Modifier.fillMaxWidth()) { Text("自动滚动速度：${when (state.autoScrollSpeed) { "slow" -> "慢"; "medium" -> "中"; "fast" -> "快"; else -> "关闭" }}") }
+            TextButton(onClick = onOpenToc, modifier = Modifier.fillMaxWidth()) { Text("目录") }
+            TextButton(onClick = { vm.cycleLayout(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("布局：${when (state.readerMode) { "multi" -> "多页"; "continuous" -> "连续"; else -> "单页" }}") }
+            TextButton(onClick = { vm.toggleDirection(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("方向：${if (state.readingDirection == "rtl") "右→左" else "左→右"}") }
+            TextButton(onClick = { vm.cycleFitMode(); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("图片适应：${fitModeLabel(state.readerFitMode)}") }
+            TextButton(onClick = { showBrightness = true }, modifier = Modifier.fillMaxWidth()) { Text("亮度：${if (state.readerBrightness < 0) "跟随系统" else "${state.readerBrightness}%"}") }
+            TextButton(onClick = { vm.setAutoScrollSpeed(when (state.autoScrollSpeed) { "off" -> "slow"; "slow" -> "medium"; "medium" -> "fast"; else -> "off" }); onTouch() }, modifier = Modifier.fillMaxWidth()) { Text("自动滚动速度：${when (state.autoScrollSpeed) { "slow" -> "慢"; "medium" -> "中"; "fast" -> "快"; else -> "关闭" }}") }
         }
     }
     if (showBrightness) AlertDialog(onDismissRequest = { showBrightness = false }, title = { Text("阅读亮度") }, text = { Column { Slider(value = if (state.readerBrightness < 0) 50f else state.readerBrightness.toFloat(), onValueChange = { vm.setReaderBrightness(it.toInt()); onTouch() }, valueRange = 0f..100f); TextButton(onClick = { vm.setReaderBrightness(-1); onTouch() }) { Text("跟随系统") } } }, confirmButton = { TextButton(onClick = { showBrightness = false }) { Text("关闭") } })
@@ -754,10 +771,10 @@ private fun PageMenuSheet(pageNumber: Int, offline: Boolean, onSave: () -> Unit,
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 24.dp)) {
             Text("第 $pageNumber 页", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.height(8.dp))
-            TextButton(onClick = onSave, Modifier.fillMaxWidth()) { Text("保存此页到收藏") }
-            TextButton(onClick = onCopyLink, enabled = !offline, Modifier.fillMaxWidth()) { Text("复制本页链接") }
-            if (!offline) TextButton(onClick = onSetCover, Modifier.fillMaxWidth()) { Text("设为档案封面") }
-            TextButton(onClick = onShowInfo, Modifier.fillMaxWidth()) { Text("查看信息") }
+            TextButton(onClick = onSave, modifier = Modifier.fillMaxWidth()) { Text("保存此页到收藏") }
+            TextButton(onClick = onCopyLink, enabled = !offline, modifier = Modifier.fillMaxWidth()) { Text("复制本页链接") }
+            if (!offline) TextButton(onClick = onSetCover, modifier = Modifier.fillMaxWidth()) { Text("设为档案封面") }
+            TextButton(onClick = onShowInfo, modifier = Modifier.fillMaxWidth()) { Text("查看信息") }
         }
     }
 }
