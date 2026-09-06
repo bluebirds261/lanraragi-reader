@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
@@ -19,6 +20,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -53,12 +55,17 @@ import com.lanraragi.reader.ui.TagRules
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.rememberTagText
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
+@OptIn(FlowPreview::class)
 class SearchViewModel(private val container: AppContainer) : ViewModel() {
 
     data class UiState(
@@ -66,10 +73,14 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         val tags: List<TagStat> = emptyList(),
         val tagsLoading: Boolean = false,
         val history: List<String> = emptyList(),
+        val suggestions: List<TagStat> = emptyList(),
     )
 
     private val _state = MutableStateFlow(UiState())
     val state = _state.asStateFlow()
+
+    /** 输入框内容（驱动防抖补全，与 query 同步更新）。 */
+    private val queryInput = MutableStateFlow("")
 
     init {
         viewModelScope.launch {
@@ -77,9 +88,48 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
                 _state.update { it.copy(history = h) }
             }
         }
+        viewModelScope.launch {
+            queryInput
+                .drop(1)
+                .debounce(250)
+                .distinctUntilChanged()
+                .collect { q -> updateSuggestions(q) }
+        }
     }
 
-    fun onQueryChange(v: String) = _state.update { it.copy(query = v) }
+    /** 防抖后按输入内容对本地标签做前缀匹配补全（最多 10 条）。 */
+    private fun updateSuggestions(q: String) {
+        val query = q.trim()
+        if (query.isEmpty()) {
+            _state.update { it.copy(suggestions = emptyList()) }
+            return
+        }
+        val lower = query.lowercase()
+        val ranked = _state.value.tags.mapNotNull { tag ->
+            val rank = when {
+                // 0 = 标签值前缀命中，1 = 命名空间前缀命中，2 = 完整标签前缀命中
+                tag.text.lowercase().startsWith(lower) -> 0
+                (tag.namespace ?: "").lowercase().startsWith(lower) -> 1
+                tag.full.lowercase().startsWith(lower) -> 2
+                else -> null
+            } ?: return@mapNotNull null
+            rank to tag
+        }
+        val suggestions = ranked
+            .sortedWith(
+                compareBy<Pair<Int, TagStat>> { it.first }
+                    .thenByDescending { it.second.weight }
+                    .thenBy { it.second.full.lowercase() },
+            )
+            .take(10)
+            .map { it.second }
+        _state.update { it.copy(suggestions = suggestions) }
+    }
+
+    fun onQueryChange(v: String) {
+        _state.update { it.copy(query = v) }
+        queryInput.value = v
+    }
 
     fun loadTags() {
         if (_state.value.tags.isNotEmpty() || _state.value.tagsLoading) return
@@ -98,6 +148,10 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
             container.searchHistoryRepository.add(q)
             SearchBus.query.value = q
         }
+    }
+
+    fun removeHistory(query: String) {
+        viewModelScope.launch { container.searchHistoryRepository.remove(query) }
     }
 
     fun clearHistory() {
@@ -174,16 +228,24 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                                 Text("搜索历史", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
                                 TextButton(onClick = vm::clearHistory) { Text("清除") }
                             }
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                 state.history.forEach { h ->
-                                    SuggestionChip(
-                                        onClick = {
-                                            vm.onQueryChange(h)
-                                            vm.submit(h)
-                                            navController.popBackStack()
-                                        },
-                                        label = { Text(h) },
-                                    )
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        SuggestionChip(
+                                            onClick = {
+                                                vm.onQueryChange(h)
+                                                vm.submit(h)
+                                                navController.popBackStack()
+                                            },
+                                            label = { Text(h) },
+                                        )
+                                        IconButton(
+                                            onClick = { vm.removeHistory(h) },
+                                            modifier = Modifier.size(28.dp),
+                                        ) {
+                                            Icon(Icons.Filled.Close, contentDescription = "删除", modifier = Modifier.size(16.dp))
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -252,24 +314,8 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                     }
                 }
             } else {
-                // 联想
-                val suggestions = remember(state.tags, q) {
-                    val lower = q.lowercase()
-                    state.tags.filter { it.full.contains(lower, ignoreCase = true) }
-                        .sortedWith(
-                            compareBy<TagStat> {
-                                // 0 = 标签值前缀匹配，1 = 命名空间前缀匹配，2 = 其余子串匹配
-                                when {
-                                    it.text.lowercase().startsWith(lower) -> 0
-                                    (it.namespace?.lowercase() ?: "").startsWith(lower) -> 1
-                                    else -> 2
-                                }
-                            }
-                                .thenByDescending { it.weight }
-                                .thenBy { it.full.lowercase() },
-                        )
-                        .take(20)
-                }
+                // 联想（由 ViewModel 防抖前缀补全生成）
+                val suggestions = state.suggestions
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
                     Text(
                         "联想（点击搜索）",

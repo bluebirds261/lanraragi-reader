@@ -5,6 +5,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
@@ -20,6 +21,8 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.lanraragi.reader.LanraragiApplication
 import com.lanraragi.reader.di.AppContainer
+import kotlinx.coroutines.flow.collect
+import com.lanraragi.reader.ui.screens.CategoryBrowseScreen
 import com.lanraragi.reader.ui.screens.CheckinScreen
 import com.lanraragi.reader.ui.screens.DetailScreen
 import com.lanraragi.reader.ui.screens.FavoritesScreen
@@ -31,6 +34,8 @@ import com.lanraragi.reader.ui.screens.SearchScreen
 import com.lanraragi.reader.ui.screens.ServerSetupScreen
 import com.lanraragi.reader.ui.screens.StatisticsScreen
 import com.lanraragi.reader.ui.screens.StatsScreen
+import com.lanraragi.reader.ui.screens.TankoubonBrowseScreen
+import com.lanraragi.reader.ui.screens.TankReaderScreen
 
 object Routes {
     const val SETUP = "setup"
@@ -45,10 +50,16 @@ object Routes {
     const val CHECKIN = "checkin"
     const val STATISTICS = "statistics"
     const val NAVIGATION = "navigation"
+    const val CATEGORY = "category"
+    const val TANKOUBONS = "tankoubons"
+    const val TANK_READER = "tank_reader"
 
     fun detail(arcid: String) = "$DETAIL/$arcid"
     fun reader(arcid: String) = "$READER/$arcid"
     fun reader(arcid: String, page: Int) = "$READER/$arcid?page=$page"
+    fun category(id: String) = "$CATEGORY/$id"
+    fun tankoubon(id: String) = "$TANKOUBONS/$id"
+    fun tankReader(id: String) = "$TANK_READER/$id"
 }
 
 /** 辅助函数：统一处理按返回键/滑动返回时回退到主界面的逻辑 */
@@ -87,6 +98,16 @@ fun AppRoot() {
     val navController = rememberNavController()
     val start = if (s.baseUrl.isBlank()) Routes.SETUP else Routes.MAIN
     var mainTab by rememberSaveable { mutableIntStateOf(0) }
+
+    // E7 深链/分享：消费 DeepLinkBus 中的 arcid，跳转到详情页
+    LaunchedEffect(Unit) {
+        com.lanraragi.reader.ui.screens.DeepLinkBus.arcid.collect { arcid ->
+            if (!arcid.isNullOrBlank()) {
+                com.lanraragi.reader.ui.screens.DeepLinkBus.arcid.value = null
+                navController.navigate(Routes.detail(arcid))
+            }
+        }
+    }
 
     NavHost(navController = navController, startDestination = start) {
         composable(Routes.SETUP) {
@@ -132,6 +153,21 @@ fun AppRoot() {
         }
         composable(Routes.STATS) {
             StatsScreen(container, navController)
+        }
+        composable(Routes.CATEGORY) {
+            CategoryBrowseScreen(container, navController, null)
+        }
+        composable("${Routes.CATEGORY}/{id}") { entry ->
+            CategoryBrowseScreen(container, navController, entry.arguments?.getString("id"))
+        }
+        composable(Routes.TANKOUBONS) {
+            TankoubonBrowseScreen(container, navController, null)
+        }
+        composable("${Routes.TANKOUBONS}/{id}") { entry ->
+            TankoubonBrowseScreen(container, navController, entry.arguments?.getString("id"))
+        }
+        composable("${Routes.TANK_READER}/{id}") { entry ->
+            TankReaderScreen(container, entry.arguments?.getString("id").orEmpty(), navController)
         }
         composable(Routes.FAVORITES) {
             FavoritesScreen(container, navController)

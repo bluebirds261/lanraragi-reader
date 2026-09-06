@@ -3,6 +3,10 @@ package com.lanraragi.reader.data
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
+import com.lanraragi.reader.data.model.MinionJob
+import com.lanraragi.reader.data.model.PluginInfo
+import com.lanraragi.reader.data.model.ServerInfo
+import com.lanraragi.reader.data.model.Tankoubon
 import com.lanraragi.reader.data.model.TagStat
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.JsonArray
@@ -79,6 +83,68 @@ object JsonHelpers {
                 (p as? JsonPrimitive)?.takeIf { it.isString }?.content
             }
             is JsonObject -> el.keys.toList()
+            else -> emptyList()
+        }
+    }
+
+    /** 解析 `/api/search/random`：兼容单对象 / 数组 / 包在 data|archives 键下的三种形态。 */
+    fun parseRandomArchives(body: String): List<Archive> {
+        val el = json.parseToJsonElement(body)
+        val arr = when (el) {
+            is JsonArray -> el
+            is JsonObject -> (el["data"] as? JsonArray)
+                ?: (el["archives"] as? JsonArray)
+                ?: if (el["arcid"] != null || el["title"] != null) buildList { add(el) } else null
+            else -> null
+        } ?: return emptyList()
+        return arr.mapNotNull { runCatching { json.decodeFromJsonElement<Archive>(it) }.getOrNull() }
+    }
+
+    fun parseServerInfo(body: String): ServerInfo =
+        runCatching { json.decodeFromString<ServerInfo>(body) }.getOrDefault(ServerInfo())
+
+    /** 插件列表：数组或对象含 data 键。 */
+    fun parsePluginList(body: String): List<PluginInfo> {
+        val el = json.parseToJsonElement(body)
+        val arr = when (el) {
+            is JsonArray -> el
+            is JsonObject -> el["data"] as? JsonArray ?: el["plugins"] as? JsonArray
+            else -> null
+        } ?: return emptyList()
+        return arr.mapNotNull { runCatching { json.decodeFromJsonElement<PluginInfo>(it) }.getOrNull() }
+    }
+
+    fun parseMinionJob(body: String): MinionJob = runCatching {
+        val el = json.parseToJsonElement(body)
+        val job = if (el is JsonObject && el["job"] != null) el["job"] else el
+        json.decodeFromJsonElement<MinionJob>(job ?: el)
+    }.getOrDefault(MinionJob())
+
+    /** 单行本列表：兼容纯数组 / `{ result: [...] }`(0.9.81) / `{ data: [...] }` / `{ tankoubons: [...] }`。 */
+    fun parseTankoubons(body: String): List<Tankoubon> {
+        val el = json.parseToJsonElement(body)
+        val arr = when (el) {
+            is JsonArray -> el
+            is JsonObject ->
+                (el["result"] as? JsonArray)
+                    ?: (el["data"] as? JsonArray)
+                    ?: (el["tankoubons"] as? JsonArray)
+            else -> null
+        } ?: return emptyList()
+        return arr.mapNotNull { runCatching { json.decodeFromJsonElement<Tankoubon>(it) }.getOrNull() }
+    }
+
+    /** 档案所属分类(对象数组,匹配 name)。返回数组原始列表。 */
+    fun parseCategoryArray(body: String): List<Category> {
+        val el = json.parseToJsonElement(body)
+        return when (el) {
+            is JsonArray -> el.mapNotNull { runCatching { json.decodeFromJsonElement<Category>(it) }.getOrNull() }
+            is JsonObject -> {
+                val arr = el["categories"] as? JsonArray ?: el["data"] as? JsonArray
+                if (arr != null) {
+                    arr.mapNotNull { runCatching { json.decodeFromJsonElement<Category>(it) }.getOrNull() }
+                } else emptyList()
+            }
             else -> emptyList()
         }
     }

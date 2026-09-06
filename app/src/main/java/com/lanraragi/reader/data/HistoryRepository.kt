@@ -58,6 +58,20 @@ class HistoryRepository(private val context: Context) {
         runCatching { file.delete() }
     }
 
+    suspend fun remove(arcid: String) {
+        _entries.value = _entries.value.filter { it.arcid != arcid }
+        persist()
+    }
+
+    /** 最近阅读去重列表：按时间倒序取 n 个不同 arcid（title 可能过时，UI 层再补 metadata）。 */
+    fun recentDeduped(n: Int): List<HistoryEntry> {
+        val seen = mutableSetOf<String>()
+        return _entries.value
+            .sortedByDescending { it.timestamp }
+            .filter { seen.add(it.arcid) }
+            .take(n)
+    }
+
     private fun persist() {
         runCatching {
             file.parentFile?.mkdirs()

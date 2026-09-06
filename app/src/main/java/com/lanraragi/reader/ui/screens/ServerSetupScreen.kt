@@ -35,6 +35,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.normalizeBaseUrl
+import com.lanraragi.reader.data.refreshServerInfo
 import com.lanraragi.reader.di.AppContainer
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -75,6 +76,7 @@ class ServerSetupViewModel(private val container: AppContainer) : ViewModel() {
             ApiClient.config.apiKey = _state.value.key.trim()
             try {
                 val stats = container.repository.testConnection()
+                refreshServerInfo(container.repository)
                 _state.update {
                     it.copy(
                         testing = false,
@@ -83,6 +85,7 @@ class ServerSetupViewModel(private val container: AppContainer) : ViewModel() {
                     )
                 }
             } catch (e: Exception) {
+                ApiClient.config.serverInfo.value = null
                 _state.update { it.copy(testing = false, message = e.message ?: "连接失败") }
             }
         }
@@ -92,6 +95,7 @@ class ServerSetupViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             _state.update { it.copy(saving = true) }
             container.settingsRepository.saveServer(_state.value.url, _state.value.key, _state.value.name)
+            refreshServerInfo(container.repository)
             _state.update { it.copy(saving = false) }
             onSaved()
         }

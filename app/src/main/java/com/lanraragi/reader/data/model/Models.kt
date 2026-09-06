@@ -18,6 +18,7 @@ data class Archive(
     val summary: String = "",
     val category: String = "",
     val pages: List<String> = emptyList(),
+    val toc: List<TocEntry> = emptyList(),
 ) {
     val tagList: List<String>
         get() = tags.split(',').map { it.trim() }.filter { it.isNotEmpty() }
@@ -51,6 +52,7 @@ data class CachedArchive(
     val metadata: Archive? = null, // 存储完整元数据
     val isLocal: Boolean = false,   // 是否为外部导入的本地文件
     val localUri: String? = null,   // 本地文件路径/URI
+    val lastAccess: Long = 0,       // 最后访问时间戳（毫秒），LRU 淘汰依据
 )
 
 @Serializable
@@ -75,6 +77,15 @@ data class Category(
     val name: String = "",
     val search: String = "",
     val pinned: Int = 0,
+    val archives: List<String> = emptyList(),
+)
+
+/** E4 服务器配置 profile：多服务器切换。 */
+@Serializable
+data class ServerProfile(
+    val name: String = "",
+    val url: String = "",
+    val apiKey: String = "",
 )
 
 /** 保存的筛选预设。 */
@@ -88,4 +99,64 @@ data class FilterPreset(
     val categoryId: String = "",
     val newOnly: Boolean = false,
     val untaggedOnly: Boolean = false,
+)
+
+/** `/api/info` 返回的服务器信息(字段以默认值兜底,未知字段忽略)。 */
+@Serializable
+data class ServerInfo(
+    val name: String = "",
+    val motd: String = "",
+    val version: String = "",
+    val version_name: String = "",
+    val version_desc: String = "",
+    val has_password: Boolean = false,
+    val debug_mode: Boolean = false,
+    val nofun_mode: Boolean = false,
+    val archives_per_page: Int = 0,
+    val server_resizes_images: Boolean = false,
+    val server_tracks_progress: Boolean = false,
+    val authenticated_progress: Boolean = false,
+    val total_pages_read: Int = 0,
+    val total_archives: Int = 0,
+    val cache_last_cleared: Int = 0,
+    val excluded_namespaces: List<String> = emptyList(),
+)
+
+/** Minion 任务基础状态(`/api/minion/{jobid}`)。 */
+@Serializable
+data class MinionJob(
+    val id: String = "",
+    val state: String = "",
+    val task: String = "",
+    val retries: Int = 0,
+    val note: String = "",
+    val result: String = "",
+)
+
+/** 服务器插件信息(`/api/plugins/{type}`)。 */
+@Serializable
+data class PluginInfo(
+    val namespace: String = "",
+    val type: String = "",
+    val version: String = "",
+    val name: String = "",
+)
+
+/** 单行本/卷(`/api/tankoubons*`)。字段与 openapi 的 TankoubonMetadataJson / /full result 对齐。 */
+@Serializable
+data class Tankoubon(
+    val id: String = "",                          // TANK_xxxxxxxxxx
+    val name: String = "",
+    val summary: String = "",
+    val tags: String = "",
+    val archives: List<String> = emptyList(),     // 卷内档案 arcid（有序）
+    val progress: Int = 0,                        // 全局页进度(1起)
+    val full_data: List<Archive> = emptyList(),   // 仅 /full 返回的成员档案元数据
+)
+
+/** 档案目录项(长本分章 TOC)。字段与 openapi 的 toc 元素一致：{ name, page }。 */
+@Serializable
+data class TocEntry(
+    val name: String = "",
+    val page: Int = 0,
 )

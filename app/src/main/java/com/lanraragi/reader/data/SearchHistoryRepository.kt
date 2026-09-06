@@ -36,6 +36,14 @@ class SearchHistoryRepository(private val context: Context) {
         dataStore.edit { it[KEY] = ApiClient.json.encodeToString(updated) }
     }
 
+    /** 从历史中移除一条（不存在则保持不变，幂等）。 */
+    suspend fun remove(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        val updated = history.first().filter { it != q }
+        dataStore.edit { it[KEY] = ApiClient.json.encodeToString(updated) }
+    }
+
     suspend fun clear() {
         dataStore.edit { it[KEY] = "[]" }
     }

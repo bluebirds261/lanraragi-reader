@@ -1,5 +1,8 @@
 package com.lanraragi.reader
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.view.WindowManager
@@ -24,6 +27,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,6 +37,7 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.lanraragi.reader.ui.AppRoot
+import com.lanraragi.reader.ui.screens.DeepLinkBus
 import com.lanraragi.reader.ui.theme.LanraragiReaderTheme
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
@@ -49,6 +54,9 @@ class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Android 13+ 动态申请通知权限，保证后台下载进度通知可见
+        requestNotificationPermission()
 
         val container = (application as LanraragiApplication).container
 
@@ -93,9 +101,23 @@ class MainActivity : FragmentActivity() {
                 val needsAuth = authEnabled || biometricEnabled
 
                 when {
-                    // 设置尚未加载：先显示纯色背景，避免主界面内容闪现
+                    // 设置尚未加载：显示 logo 淡入 splash
                     settings == null -> {
-                        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background))
+                        var visible by remember { mutableStateOf(false) }
+                        LaunchedEffect(Unit) { visible = true }
+                        Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background), contentAlignment = Alignment.Center) {
+                            androidx.compose.animation.AnimatedVisibility(
+                                visible = visible,
+                                enter = androidx.compose.animation.fadeIn(animationSpec = androidx.compose.animation.core.tween(600))
+                            ) {
+                                Icon(
+                                    painter = androidx.compose.ui.res.painterResource(id = R.drawable.ic_app_logo),
+                                    contentDescription = "LANraragi Reader",
+                                    modifier = Modifier.size(96.dp),
+                                    tint = androidx.compose.ui.graphics.Color.Unspecified,
+                                )
+                            }
+                        }
                     }
 
                     // 需要认证且本次会话未解锁：显示锁屏占位并弹出系统认证
@@ -133,7 +155,14 @@ class MainActivity : FragmentActivity() {
                         }
                     }
 
-                    else -> AppRoot()
+                    else -> {
+                    // E7 深链/分享：解析 intent 中的 archive URL
+                    LaunchedEffect(Unit) {
+                        val arcid = extractArcIdFromIntent(intent)
+                        if (arcid != null) DeepLinkBus.arcid.value = arcid
+                    }
+                    AppRoot()
+                }
                 }
             }
         }
@@ -209,6 +238,15 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    /** Android 13+（API 33）动态申请通知权限，保证后台下载进度通知可见。 */
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQUEST_POST_NOTIFICATIONS)
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         resumeTick++
@@ -218,5 +256,27 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         // 离开应用时立即重新锁定，确保下次切回时第一时间隐藏内容
         isUnlocked.value = false
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        DeepLinkBus.arcid.value = extractArcIdFromIntent(intent)
+    }
+
+    private companion object {
+        const val REQUEST_POST_NOTIFICATIONS = 2001
+    }
+
+    /** E7：从 intent 中提取档案 arcid（URL 路径 /api/archives/<sha1> 或文本中的链接） */
+    private fun extractArcIdFromIntent(intent: Intent?): String? {
+        if (intent == null) return null
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+            ?: intent.dataString
+            ?: intent.data?.toString()
+            ?: return null
+        // 匹配 40 位 hex arcid（/archives/<arcid> 或 /api/archives/<arcid>）
+        val re = Regex("archives/([0-9a-fA-F]{40})")
+        return re.find(text)?.groupValues?.getOrNull(1)
     }
 }

@@ -2,6 +2,8 @@ package com.lanraragi.reader.ui.screens
 
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -26,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.AutoStories
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Link
@@ -76,9 +79,14 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.imageLoader
 import com.lanraragi.reader.R
+import com.lanraragi.reader.data.FeatureFlags
+import com.lanraragi.reader.data.OfflineUsage
+import com.lanraragi.reader.data.Settings
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.model.ServerInfo
 import com.lanraragi.reader.data.model.ServerStats
 import com.lanraragi.reader.data.normalizeBaseUrl
+import com.lanraragi.reader.data.refreshServerInfo
 import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
@@ -90,12 +98,16 @@ import com.lanraragi.reader.ui.parseHexColor
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.toHexString
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import java.io.IOException
 
 private fun themeLabel(t: String) = when (t) { "dark" -> "深色"; "light" -> "浅色"; else -> "跟随系统" }
 private fun viewModeLabel(v: String) = when (v) {
@@ -104,11 +116,29 @@ private fun viewModeLabel(v: String) = when (v) {
     else -> "松散网格"
 }
 private fun readerModeLabel(m: String) = when (m) { "multi" -> "多页"; "continuous" -> "连续"; else -> "单页" }
+private fun autoScrollLabel(s: String) = when (s) { "slow" -> "慢"; "medium" -> "中"; "fast" -> "快"; else -> "关闭" }
 private fun directionLabel(d: String) = if (d == "rtl") "右→左" else "左→右"
 private fun fitModeLabel(f: String) = when (f) {
     "fitHeight" -> "适应高度"; "fitScreen" -> "适应屏幕"; "original" -> "原始尺寸"; else -> "适应宽度"
 }
-private fun backgroundLabel(b: String) = when (b) { "dark" -> "深灰"; "gray" -> "灰"; "white" -> "白"; else -> "黑" }
+private fun backgroundLabel(b: String) = when (b) {
+    "auto" -> "自动"
+    "dark" -> "深灰"
+    "gray" -> "灰"
+    "white" -> "白"
+    else -> "黑"
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes <= 0) return "0 MB"
+    val mb = bytes.toDouble() / (1024.0 * 1024.0)
+    val gb = mb / 1024.0
+    return if (gb >= 1.0) {
+        String.format(java.util.Locale.getDefault(), "%.1f GB", gb)
+    } else {
+        String.format(java.util.Locale.getDefault(), "%.1f MB", mb)
+    }
+}
 
 private enum class SettingsSection(val title: String, val icon: ImageVector) {
     MAIN("设置", Icons.Filled.Settings),
@@ -117,6 +147,7 @@ private enum class SettingsSection(val title: String, val icon: ImageVector) {
     INTERFACE("外观", Icons.Filled.Palette),
     STORAGE("下载", Icons.Filled.Folder),
     SECURITY("安全", Icons.Filled.Lock),
+    LABS("实验室", Icons.Filled.Build),
     ABOUT("关于", Icons.Filled.Info),
 }
 
@@ -128,9 +159,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val name: String = "",
         val readerMode: String = "single",
         val multiPageCount: Int = 2,
+        val autoDoublePageLandscape: Boolean = true,
         val preloadOnlineCount: Int = 3,
         val preloadLocalCount: Int = 5,
         val readingDirection: String = "ltr",
+        val autoScrollSpeed: String = "off",
         val downloadDirUri: String? = null,
         val galleryColumns: Int = 3,
         val previewColumns: Int = 4,
@@ -142,6 +175,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val tapZonesEnabled: Boolean = true,
         val keepScreenOn: Boolean = true,
         val volumeKeysEnabled: Boolean = true,
+        val clearNewOnOpen: Boolean = true,
         val galleryViewMode: String = "grid",
         val tagColors: Map<String, String> = emptyMap(),
         val galleryTitle: String = "图库",
@@ -156,10 +190,18 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val hideInGallery: Boolean = false,
         val blurInRecents: Boolean = false,
         val extraScanDirUris: Set<String> = emptySet(),
+        val featureFlags: Map<String, Boolean> = emptyMap(),
+        val offlineCacheLimitGb: Int = 0,
+        val offlineUsage: OfflineUsage = OfflineUsage(),
         val isScanning: Boolean = false,
         val translationUpdating: Boolean = false,
         val testing: Boolean = false,
         val saving: Boolean = false,
+        val shinobuLoading: Boolean = false,
+        val shinobuAlive: Boolean? = null,
+        val regenThumbsLoading: Boolean = false,
+        val backupLoading: Boolean = false,
+        val restoreLoading: Boolean = false,
         val message: String? = null,
         val success: Boolean = false,
     )
@@ -174,6 +216,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             }
         }
         viewModelScope.launch {
+            container.offlineCache.usage.collect { u ->
+                _state.update { it.copy(offlineUsage = u) }
+            }
+        }
+        viewModelScope.launch {
             val s = container.settingsRepository.settings.first()
             _state.update {
                 it.copy(
@@ -182,9 +229,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     name = s.serverName,
                     readerMode = s.readerMode,
                     multiPageCount = s.multiPageCount,
+                    autoDoublePageLandscape = s.autoDoublePageLandscape,
                     preloadOnlineCount = s.preloadOnlineCount,
                     preloadLocalCount = s.preloadLocalCount,
                     readingDirection = s.readingDirection,
+                    autoScrollSpeed = s.autoScrollSpeed,
                     downloadDirUri = s.downloadDirUri,
                     galleryColumns = s.galleryColumns,
                     previewColumns = s.previewColumns,
@@ -196,6 +245,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     tapZonesEnabled = s.tapZonesEnabled,
                     keepScreenOn = s.keepScreenOn,
                     volumeKeysEnabled = s.volumeKeysEnabled,
+                    clearNewOnOpen = s.clearNewOnOpen,
                     galleryViewMode = s.galleryViewMode,
                     tagColors = s.tagColors,
                     galleryTitle = s.galleryTitle,
@@ -210,6 +260,8 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     hideInGallery = s.hideInGallery,
                     blurInRecents = s.blurInRecents,
                     extraScanDirUris = s.extraScanDirUris,
+                    featureFlags = s.featureFlags,
+                    offlineCacheLimitGb = s.offlineCacheLimitGb,
                 )
             }
         }
@@ -224,9 +276,19 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch { container.settingsRepository.setReaderMode(mode) }
     }
 
+    fun setAutoScrollSpeed(s: String) {
+        _state.update { it.copy(autoScrollSpeed = s) }
+        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(s) }
+    }
+
     fun setMultiPageCount(n: Int) {
         _state.update { it.copy(multiPageCount = n) }
         viewModelScope.launch { container.settingsRepository.setMultiPageCount(n) }
+    }
+
+    fun setAutoDoublePageLandscape(enabled: Boolean) {
+        _state.update { it.copy(autoDoublePageLandscape = enabled) }
+        viewModelScope.launch { container.settingsRepository.setAutoDoublePageLandscape(enabled) }
     }
 
     fun setPreloadOnlineCount(n: Int) {
@@ -297,6 +359,11 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     fun setVolumeKeysEnabled(enabled: Boolean) {
         _state.update { it.copy(volumeKeysEnabled = enabled) }
         viewModelScope.launch { container.settingsRepository.setVolumeKeysEnabled(enabled) }
+    }
+
+    fun setClearNewOnOpen(enabled: Boolean) {
+        _state.update { it.copy(clearNewOnOpen = enabled) }
+        viewModelScope.launch { container.settingsRepository.setClearNewOnOpen(enabled) }
     }
 
     fun setGalleryViewMode(mode: String) {
@@ -373,6 +440,16 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch { container.settingsRepository.setBlurInRecents(enabled) }
     }
 
+    fun setFeatureFlag(key: String, enabled: Boolean) {
+        _state.update { it.copy(featureFlags = it.featureFlags + (key to enabled)) }
+        viewModelScope.launch { container.settingsRepository.setFeatureFlag(key, enabled) }
+    }
+
+    fun setOfflineCacheLimitGb(n: Int) {
+        _state.update { it.copy(offlineCacheLimitGb = n) }
+        viewModelScope.launch { container.settingsRepository.setOfflineCacheLimitGb(n) }
+    }
+
     fun addExtraScanDirUri(uri: String) {
         viewModelScope.launch {
             container.settingsRepository.addExtraScanDirUri(uri)
@@ -411,10 +488,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
             ApiClient.config.apiKey = _state.value.key.trim()
             try {
                 val stats = container.repository.testConnection()
+                refreshServerInfo(container.repository)
                 _state.update {
                     it.copy(testing = false, success = true, message = "连接成功：共 ${stats.total_archives} 个档案")
                 }
             } catch (e: Exception) {
+                ApiClient.config.serverInfo.value = null
                 _state.update { it.copy(testing = false, message = e.message ?: "连接失败") }
             }
         }
@@ -424,7 +503,48 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch {
             _state.update { it.copy(saving = true) }
             container.settingsRepository.saveServer(_state.value.url, _state.value.key, _state.value.name)
+            refreshServerInfo(container.repository)
             _state.update { it.copy(saving = false, success = true, message = "已保存") }
+        }
+    }
+
+    fun loadShinobuStatus() {
+        if (_state.value.shinobuLoading) return
+        viewModelScope.launch {
+            _state.update { it.copy(shinobuLoading = true) }
+            val alive = try {
+                val el = ApiClient.json.parseToJsonElement(container.repository.getShinobuStatus())
+                val p = (el as? JsonObject)?.get("is_alive") as? JsonPrimitive
+                when (p?.content?.toIntOrNull()) {
+                    1 -> true
+                    0 -> false
+                    else -> null
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+            _state.update { it.copy(shinobuLoading = false, shinobuAlive = alive) }
+        }
+    }
+
+    fun rescanShinobu() {
+        if (_state.value.shinobuLoading) return
+        viewModelScope.launch {
+            _state.update { it.copy(shinobuLoading = true) }
+            try {
+                container.repository.shinobuRescan()
+                _state.update {
+                    it.copy(message = "已触发服务器重扫，稍后下拉刷新图库即可", success = true)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "重扫失败", success = false) }
+            } finally {
+                _state.update { it.copy(shinobuLoading = false) }
+            }
         }
     }
 
@@ -440,6 +560,75 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     fun clearOfflineCache() {
         container.offlineCache.clearAll()
         _state.update { it.copy(message = "离线缓存已清空", success = true) }
+    }
+
+    fun regenAllThumbnails() {
+        if (_state.value.regenThumbsLoading) return
+        viewModelScope.launch {
+            _state.update { it.copy(regenThumbsLoading = true) }
+            try {
+                container.repository.regenAllThumbnails()
+                _state.update { it.copy(message = "已提交重建全部缩略图任务", success = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "重建全部缩略图失败", success = false) }
+            } finally {
+                _state.update { it.copy(regenThumbsLoading = false) }
+            }
+        }
+    }
+
+    fun backupDatabase(context: Context, treeUri: Uri) {
+        if (_state.value.backupLoading) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.update { it.copy(backupLoading = true) }
+            try {
+                val jobid = container.repository.queueBackup()
+                container.repository.pollJobUntilDone(jobid)
+                val json = container.repository.downloadBackup(jobid)
+                val docId = DocumentsContract.getTreeDocumentId(treeUri)
+                val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                val name = "lanraragi-backup-" +
+                    java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.getDefault())
+                        .format(java.util.Date()) + ".json"
+                val fileUri = DocumentsContract.createDocument(
+                    context.contentResolver, parentUri, "application/json", name,
+                ) ?: throw IOException("写入所选目录失败")
+                val out = context.contentResolver.openOutputStream(fileUri)
+                    ?: throw IOException("写入所选目录失败")
+                out.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                _state.update { it.copy(message = "备份已保存", success = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "备份失败", success = false) }
+            } finally {
+                _state.update { it.copy(backupLoading = false) }
+            }
+        }
+    }
+
+    fun restoreFromBackup(context: Context, uri: Uri) {
+        if (_state.value.restoreLoading) return
+        viewModelScope.launch(Dispatchers.IO) {
+            _state.update { it.copy(restoreLoading = true) }
+            try {
+                val json = context.contentResolver.openInputStream(uri)
+                    ?.bufferedReader()?.use { it.readText() }
+                    ?: throw IOException("无法读取备份文件")
+                container.repository.restoreBackup(json)
+                container.offlineCache.clearAll()
+                LibraryRefreshBus.tick.value++
+                _state.update { it.copy(message = "恢复成功，已重置整库", success = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "恢复失败", success = false) }
+            } finally {
+                _state.update { it.copy(restoreLoading = false) }
+            }
+        }
     }
 
     fun clearMessage() = _state.update { it.copy(message = null) }
@@ -507,7 +696,8 @@ fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpen
                     downloadDirLauncher.launch(null)
                 }
                 SettingsSection.SECURITY -> SecuritySection(state, vm)
-                SettingsSection.ABOUT -> AboutSection()
+                SettingsSection.LABS -> LabsSection(state, vm)
+                SettingsSection.ABOUT -> AboutSection(container)
             }
         }
     }
@@ -527,6 +717,7 @@ private fun SettingsMainList(onNavigate: (SettingsSection) -> Unit) {
             SettingsSection.INTERFACE,
             SettingsSection.STORAGE,
             SettingsSection.SECURITY,
+            SettingsSection.LABS,
             SettingsSection.ABOUT,
         ).forEach { section ->
             SettingsNavRow(section.title, section.icon) { onNavigate(section) }
@@ -768,7 +959,13 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
             listOf("single" to "单页", "multi" to "多页", "continuous" to "连续"),
             vm::setReaderMode,
         )
+        DropdownRow(
+            "连续滚动速度", autoScrollLabel(state.autoScrollSpeed),
+            listOf("off" to "关闭", "slow" to "慢", "medium" to "中", "fast" to "快"),
+            vm::setAutoScrollSpeed,
+        )
         IntDropdownRow("每屏页数", state.multiPageCount, (2..8).toList(), vm::setMultiPageCount)
+        SwitchRow("横屏自动双页", state.autoDoublePageLandscape, vm::setAutoDoublePageLandscape)
         DropdownRow(
             "阅读方向", directionLabel(state.readingDirection),
             listOf("ltr" to "左→右", "rtl" to "右→左"),
@@ -781,12 +978,13 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
         )
         DropdownRow(
             "阅读器背景", backgroundLabel(state.readerBackground),
-            listOf("black" to "黑", "dark" to "深灰", "gray" to "灰", "white" to "白"),
+            listOf("auto" to "自动", "black" to "黑", "dark" to "深灰", "gray" to "灰", "white" to "白"),
             vm::setReaderBackground,
         )
         SwitchRow("点击左右区域翻页", state.tapZonesEnabled, vm::setTapZonesEnabled)
         SwitchRow("阅读时屏幕常亮", state.keepScreenOn, vm::setKeepScreenOn)
         SwitchRow("音量键翻页", state.volumeKeysEnabled, vm::setVolumeKeysEnabled)
+        SwitchRow("打开详情即清除新标记", state.clearNewOnOpen, vm::setClearNewOnOpen)
         CountRow("在线预载页数", state.preloadOnlineCount, vm::setPreloadOnlineCount)
         CountRow("本地预载页数", state.preloadLocalCount, vm::setPreloadLocalCount)
         Spacer(Modifier.height(96.dp))
@@ -795,6 +993,7 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
 
 @Composable
 private fun ServerSection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
+    LaunchedEffect(Unit) { vm.loadShinobuStatus() }
     Column(
         Modifier
             .fillMaxSize()
@@ -842,6 +1041,35 @@ private fun ServerSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
                 Text(if (state.saving) "保存中…" else "保存")
             }
         }
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Shinobu 文件监控", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        when (state.shinobuAlive) {
+                            true -> "Shinobu 状态：运行中"
+                            false -> "Shinobu 状态：已停止"
+                            null -> "Shinobu 状态：未知"
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (state.shinobuAlive == true) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = vm::loadShinobuStatus) { Text("刷新状态") }
+                }
+                Button(
+                    onClick = vm::rescanShinobu,
+                    enabled = !state.shinobuLoading,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    if (state.shinobuLoading) {
+                        CircularProgressIndicator(Modifier.width(18.dp).height(18.dp), strokeWidth = 2.dp)
+                    } else {
+                        Text("立即重扫服务器文件夹")
+                    }
+                }
+            }
+        }
         if (state.message != null && state.success) {
             Text(state.message!!, color = Color(0xFF4CAF50), style = MaterialTheme.typography.bodyMedium)
         }
@@ -865,6 +1093,31 @@ private fun StorageSection(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
             vm.addExtraScanDirUri(uri.toString())
+        }
+    }
+
+    var showRegenDialog by remember { mutableStateOf(false) }
+    var showRestoreDialog by remember { mutableStateOf(false) }
+    var pendingRestoreUri by remember { mutableStateOf<Uri?>(null) }
+
+    val backupDirLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            context.contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+            )
+            vm.backupDatabase(context, uri)
+        }
+    }
+
+    val restoreFileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            pendingRestoreUri = uri
+            showRestoreDialog = true
         }
     }
 
@@ -939,6 +1192,15 @@ private fun StorageSection(
         }
 
         Spacer(Modifier.height(16.dp))
+        OfflineLimitRow(state.offlineCacheLimitGb, vm::setOfflineCacheLimitGb)
+        Text(
+            "已用 ${formatBytes(state.offlineUsage.totalBytes)} / ${if (state.offlineCacheLimitGb == 0) "不限" else "${state.offlineCacheLimitGb} GB"}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
+        )
+
+        Spacer(Modifier.height(16.dp))
         Text(
             "维护",
             style = MaterialTheme.typography.titleSmall,
@@ -966,7 +1228,102 @@ private fun StorageSection(
             Text("清空离线缓存", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
         }
 
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !state.backupLoading) { backupDirLauncher.launch(null) }
+                .padding(horizontal = 24.dp, vertical = 18.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("备份服务器数据库", style = MaterialTheme.typography.bodyLarge)
+            if (state.backupLoading) {
+                Spacer(Modifier.width(8.dp))
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+            }
+        }
+
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !state.restoreLoading) {
+                    restoreFileLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                }
+                .padding(horizontal = 24.dp, vertical = 18.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("从备份恢复", style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.error)
+            if (state.restoreLoading) {
+                Spacer(Modifier.width(8.dp))
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+            }
+        }
+
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !state.regenThumbsLoading) { showRegenDialog = true }
+                .padding(horizontal = 24.dp, vertical = 18.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("重建全部缩略图", style = MaterialTheme.typography.bodyLarge)
+            if (state.regenThumbsLoading) {
+                Spacer(Modifier.width(8.dp))
+                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+            }
+        }
+
         Spacer(Modifier.height(80.dp))
+    }
+
+    if (showRegenDialog) {
+        AlertDialog(
+            onDismissRequest = { showRegenDialog = false },
+            title = { Text("重建全部缩略图") },
+            text = { Text("确定要重建全部缩略图吗？可能耗时较长。") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showRegenDialog = false
+                    vm.regenAllThumbnails()
+                }) {
+                    Text("确定")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRegenDialog = false }) { Text("取消") }
+            },
+        )
+    }
+
+    if (showRestoreDialog && pendingRestoreUri != null) {
+        AlertDialog(
+            onDismissRequest = {
+                showRestoreDialog = false
+                pendingRestoreUri = null
+            },
+            title = { Text("恢复服务器数据库") },
+            text = {
+                Text(
+                    "将从备份文件恢复整个服务器数据库，此操作会覆盖当前数据，且不可撤销！",
+                    color = MaterialTheme.colorScheme.error,
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val uri = pendingRestoreUri
+                    showRestoreDialog = false
+                    pendingRestoreUri = null
+                    if (uri != null) vm.restoreFromBackup(context, uri)
+                }) {
+                    Text("确认恢复", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showRestoreDialog = false
+                    pendingRestoreUri = null
+                }) { Text("取消") }
+            },
+        )
     }
 }
 
@@ -1017,7 +1374,16 @@ private fun StatCard(label: String, value: String) {
 }
 
 @Composable
-private fun AboutSection() {
+private fun AboutSection(container: AppContainer) {
+    val settings by container.settingsRepository.settings.collectAsStateWithLifecycle(initialValue = null)
+    val serverInfo by ApiClient.config.serverInfo.collectAsState()
+    // 重启后内存缓存丢失：已配置但缓存为空时惰性拉取一次，避免关于页误显示“未连接/未知”。
+    LaunchedEffect(settings?.baseUrl) {
+        val url = settings?.baseUrl
+        if (!url.isNullOrBlank() && ApiClient.config.serverInfo.value == null) {
+            refreshServerInfo(container.repository)
+        }
+    }
     Column(
         Modifier
             .fillMaxSize()
@@ -1045,6 +1411,8 @@ private fun AboutSection() {
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(Modifier.height(32.dp))
+        ServerCard(settings, serverInfo)
+        Spacer(Modifier.height(16.dp))
         Card(
             Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
@@ -1075,6 +1443,58 @@ private fun AboutSection() {
 }
 
 @Composable
+private fun ServerCard(settings: Settings?, serverInfo: ServerInfo?) {
+    val name = serverInfo?.name?.takeIf { it.isNotBlank() }
+        ?: settings?.serverName?.takeIf { it.isNotBlank() }
+        ?: "未配置"
+    val address = settings?.baseUrl?.takeIf { it.isNotBlank() } ?: "未配置"
+    val version = serverInfo?.version?.takeIf { it.isNotBlank() } ?: "未知"
+    val connected = ApiClient.config.isConfigured && serverInfo != null
+
+    Card(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = androidx.compose.material3.CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+        )
+    ) {
+        Column(Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                "服务器",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            ServerInfoLine("名称", name)
+            ServerInfoLine("地址", address)
+            ServerInfoLine("版本", version)
+            ServerInfoLine(
+                "连接状态",
+                if (connected) "已连接" else "未连接",
+                if (connected) Color(0xFF4CAF50) else MaterialTheme.colorScheme.error,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ServerInfoLine(label: String, value: String, valueColor: Color = MaterialTheme.colorScheme.onSurface) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.Top) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(72.dp),
+        )
+        Text(
+            value,
+            style = MaterialTheme.typography.bodyMedium,
+            color = valueColor,
+            modifier = Modifier.weight(1f),
+        )
+    }
+}
+
+@Composable
 private fun SettingsGroupHeader(title: String) {
     Text(
         title,
@@ -1096,6 +1516,28 @@ private fun SecuritySection(state: SettingsViewModel.UiState, vm: SettingsViewMo
         SwitchRow("生物认证", state.biometricEnabled, vm::setBiometricEnabled)
         SwitchRow("在相册中隐藏下载的图片", state.hideInGallery, vm::setHideInGallery)
         SwitchRow("在任务栏中隐藏应用", state.blurInRecents, vm::setBlurInRecents)
+        Spacer(Modifier.height(96.dp))
+    }
+}
+
+@Composable
+private fun LabsSection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(vertical = 12.dp)
+    ) {
+        SettingsGroupHeader("实验室")
+        Text(
+            "以下功能为实验性开关，默认关闭。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
+        )
+        FeatureFlags.allFlags.forEach { (key, label) ->
+            SwitchRow(label, state.featureFlags[key] == true) { vm.setFeatureFlag(key, it) }
+        }
         Spacer(Modifier.height(96.dp))
     }
 }
@@ -1123,6 +1565,30 @@ private fun SettingsNavRow(title: String, icon: ImageVector? = null, onClick: ()
             style = MaterialTheme.typography.titleMedium,
             color = MaterialTheme.colorScheme.onSurface
         )
+    }
+}
+
+@Composable
+private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
+    var menu by remember { mutableStateOf(false) }
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("离线缓存上限", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+        Box {
+            TextButton(onClick = { menu = true }) { Text(if (value == 0) "不限" else "$value GB") }
+            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                listOf(0 to "不限", 2 to "2 GB", 5 to "5 GB", 10 to "10 GB").forEach { (n, label) ->
+                    DropdownMenuItem(
+                        text = { Text(label) },
+                        onClick = { onSelect(n); menu = false },
+                    )
+                }
+            }
+        }
     }
 }
 

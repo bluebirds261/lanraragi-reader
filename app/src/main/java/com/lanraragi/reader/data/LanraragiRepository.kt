@@ -2,17 +2,30 @@ package com.lanraragi.reader.data
 
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.api.LanraragiApi
+import com.lanraragi.reader.data.api.toUserMessage
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
+import com.lanraragi.reader.data.model.MinionJob
+import com.lanraragi.reader.data.model.PluginInfo
+import com.lanraragi.reader.data.model.ServerInfo
 import com.lanraragi.reader.data.model.ServerStats
 import com.lanraragi.reader.data.model.TagStat
+import com.lanraragi.reader.data.model.Tankoubon
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.Request
+import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.ResponseBody
 import retrofit2.Response
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.io.InputStream
+import java.net.URLEncoder
 import kotlinx.coroutines.delay
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.decodeFromJsonElement
 
 class ApiException(message: String) : Exception(message)
 
@@ -30,7 +43,7 @@ class LanraragiRepository(
     } catch (e: ApiException) {
         throw e
     } catch (e: IOException) {
-        throw ApiException("无法连接到服务器，请检查地址与网络：${e.message}")
+        throw ApiException(toUserMessage(e))
     }
 
     suspend fun getArchives(
@@ -159,12 +172,12 @@ class LanraragiRepository(
                 }
 
                 val req = reqBuilder.build()
-                ApiClient.okHttpClient.newCall(req).execute().use { resp ->
+                ApiClient.downloadClient.newCall(req).execute().use { resp ->
                     if (!resp.isSuccessful && resp.code != 206) {
                         if (resp.code == 416) { // Range 不满足，可能已下载完
                             return@network dest
                         }
-                        throw ApiException("下载失败：HTTP ${resp.code}")
+                        throw ApiException(toUserMessage(resp.code))
                     }
 
                     val body = resp.body ?: throw ApiException("下载失败：空响应")
@@ -197,14 +210,398 @@ class LanraragiRepository(
                 }
             }
         }
-        throw ApiException("下载失败（尝试 $maxRetries 次）：${lastException?.message}")
+        throw ApiException("下载失败（尝试 $maxRetries 次）：${lastException?.let { toUserMessage(it) } ?: "未知错误"}")
     }
 
     private fun ensureSuccess(resp: Response<ResponseBody>, body: String?) {
         if (resp.isSuccessful) return
-        if (resp.code() == 401 || resp.code() == 403) {
-            throw ApiException("API Key 错误或未授权（HTTP ${resp.code()}）")
+        // ServerInterceptor 合成的配置错误（尚未配置 / 地址格式无效）直透原文，避免误报"服务器错误"。
+        val msg = resp.message()
+        if (msg.contains("尚未配置") || msg.contains("格式无效")) {
+            throw ApiException(msg)
         }
-        throw ApiException("服务器返回错误 HTTP ${resp.code()} ${resp.message()}")
+        throw ApiException(toUserMessage(resp.code()))
+    }
+
+    // ============ A 系列 ============
+
+    /** A1 更新档案元数据(title/tags 以逗号分隔)。 */
+    suspend fun updateArchiveMetadata(arcid: String, title: String, tags: String, summary: String? = null) {
+        network {
+            val resp = api.updateMetadata(arcid, title, tags, summary)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A2 档案所属分类(可能只有 name 无 id,按 name 匹配 UI 层)。 */
+    suspend fun getArchiveCategories(arcid: String): List<Category> = network {
+        val resp = api.getArchiveCategories(arcid)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parseCategoryArray(body ?: "[]")
+    }
+
+    suspend fun createCategory(name: String) {
+        network {
+            val resp = api.createCategory(name)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun renameCategory(id: String, name: String) {
+        network {
+            val resp = api.renameCategory(id, name)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun deleteCategory(id: String) {
+        network {
+            val resp = api.deleteCategory(id)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun addArchiveToCategory(categoryId: String, arcid: String) {
+        network {
+            val resp = api.addArchiveToCategory(categoryId, arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun removeArchiveFromCategory(categoryId: String, arcid: String) {
+        network {
+            val resp = api.removeArchiveFromCategory(categoryId, arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A4 后台任务状态。 */
+    suspend fun getMinionJob(jobid: String): MinionJob = network {
+        val resp = api.getMinionJob(jobid)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parseMinionJob(body ?: "{}")
+    }
+
+    /** A4 轮询任务直至完成/失败(默认最长 120s)。终态 state: finished|failed|inactive。 */
+    suspend fun pollJobUntilDone(
+        jobid: String,
+        maxMillis: Long = 120_000L,
+        pollMillis: Long = 2_000L,
+    ): MinionJob? {
+        val deadline = System.currentTimeMillis() + maxMillis
+        while (System.currentTimeMillis() < deadline) {
+            val job = runCatching { getMinionJob(jobid) }.getOrNull()
+            if (job == null) return null
+            val s = job.state.lowercase()
+            if (s.contains("finish") || s.contains("done") || s.contains("fail") || s.contains("error") ||
+                s.contains("inactive") || s == "dead" || s.isBlank()
+            ) {
+                return job
+            }
+            delay(pollMillis)
+        }
+        return null
+    }
+
+    /** A5 生成页码缩略图 / 重建全库缩略 / 以指定页作封面。 */
+    suspend fun queuePageThumbnails(arcid: String, force: Boolean = false) {
+        network {
+            val resp = api.queuePageThumbnails(arcid, if (force) "true" else null)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun regenAllThumbnails() {
+        network {
+            val resp = api.regenThumbnails(force = null)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun setThumbnailFromPage(arcid: String, page: Int) {
+        network {
+            val resp = api.setThumbnailFromPage(arcid, page.coerceAtLeast(1))
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A6 随机档案(可限制在指定分类或过滤内,空则取第一本)。 */
+    suspend fun getRandomArchive(categoryId: String? = null): Archive? = network {
+        val resp = api.getRandomArchives(category = categoryId, count = 1)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parseRandomArchives(body ?: "[]").firstOrNull()?.takeIf { it.arcid.isNotBlank() }
+            ?: runCatching {
+                // 兜底:服务器形态差异导致空解析时,从图库列表取样
+                val (items, _) = getArchives(page = 0, categoryId = categoryId)
+                items.firstOrNull { it.arcid.isNotBlank() }
+            }.getOrNull()
+    }
+
+    /** A7 新标记管理。 */
+    suspend fun clearArchiveNew(arcid: String) {
+        network {
+            val resp = api.clearArchiveNew(arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun setArchiveNew(arcid: String) {
+        network {
+            val resp = api.setArchiveNew(arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A9 插件列表(type: metadata / download)。 */
+    suspend fun listPlugins(type: String = "metadata"): List<PluginInfo> = network {
+        val resp = api.getPlugins(type)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parsePluginList(body ?: "[]")
+    }
+
+    /** A9 对档案执行插件(同步)。 */
+    suspend fun usePlugin(arcid: String, pluginNamespace: String, arg: String? = null): String = network {
+        val resp = api.usePlugin(arcid, pluginNamespace, arg)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        body ?: ""
+    }
+
+    /** A9 异步执行插件(排队 Minion 任务,返回 jobid)。 */
+    suspend fun usePluginAsync(arcid: String, pluginNamespace: String, arg: String? = null): String = network {
+        val resp = api.usePluginAsync(arcid, pluginNamespace, arg, null)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        val jobid = runCatching {
+            val el = ApiClient.json.parseToJsonElement(body ?: "") as? kotlinx.serialization.json.JsonObject
+            (el?.get("job") as? kotlinx.serialization.json.JsonPrimitive)?.content
+        }.getOrNull()?.takeIf { it.isNotBlank() }
+        jobid ?: throw ApiException("未获得插件任务 ID")
+    }
+
+    /** A10 Shinobu 状态(原始文本,通常为 JSON)。 */
+    suspend fun getShinobuStatus(): String = network {
+        val resp = api.getShinobuStatus()
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        body ?: ""
+    }
+
+    suspend fun shinobuRescan() {
+        network {
+            val resp = api.shinobuRescan()
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A12 服务器信息。 */
+    suspend fun getServerInfo(): ServerInfo = network {
+        val resp = api.getServerInfo()
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parseServerInfo(body ?: "{}")
+    }
+
+    /** A13 目录(长本分章)。 */
+    suspend fun addTocEntry(arcid: String, page: Int, title: String) {
+        network {
+            val resp = api.addTocEntry(arcid, page.coerceAtLeast(1), title)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun deleteTocEntry(arcid: String, page: Int) {
+        network {
+            val resp = api.deleteTocEntry(arcid, page.coerceAtLeast(1))
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    // ============ A11 单行本 ============
+
+    suspend fun getTankoubons(): List<Tankoubon> = network {
+        val resp = api.getTankoubons()
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        JsonHelpers.parseTankoubons(body ?: "[]")
+    }
+
+    suspend fun getTankoubon(id: String): Tankoubon = network {
+        val resp = api.getTankoubon(id)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        runCatching { ApiClient.json.decodeFromString<Tankoubon>(body ?: "{}") }
+            .getOrDefault(Tankoubon(id = id))
+    }
+
+    /** A11 档案所属单行本 ID 列表。 */
+    suspend fun getArchiveTankoubons(arcid: String): List<String> = network {
+        val resp = api.getArchiveTankoubons(arcid)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        val el = ApiClient.json.parseToJsonElement(body ?: "{}") as? kotlinx.serialization.json.JsonObject
+        val arr = el?.get("tankoubons") as? kotlinx.serialization.json.JsonArray
+        arr?.mapNotNull { (it as? kotlinx.serialization.json.JsonPrimitive)?.content } ?: emptyList()
+    }
+
+    /** A11 单行本详情（含成员档案元数据）。`/full` 返回 `{ result: {...}, total, filtered }`。 */
+    suspend fun getTankoubonFull(id: String): Tankoubon = network {
+        val resp = api.getTankoubonFull(id)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        val el = ApiClient.json.parseToJsonElement(body ?: "{}")
+        val result = (el as? kotlinx.serialization.json.JsonObject)?.get("result") ?: el
+        runCatching { ApiClient.json.decodeFromJsonElement<Tankoubon>(result) }
+            .getOrDefault(Tankoubon(id = id))
+    }
+
+    /** A11 更新单行本全局阅读进度（page 为跨档案全局 1 起页号）。 */
+    suspend fun updateTankoubonProgress(id: String, page: Int) {
+        network {
+            val resp = api.updateTankoubonProgress(id, page.coerceAtLeast(1))
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun createTankoubon(name: String) {
+        network {
+            val resp = api.createTankoubon(name)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /** A11 重命名单行本（PUT /tankoubons/{id}，仅传 name）。 */
+    suspend fun renameTankoubon(id: String, name: String) {
+        network {
+            val resp = api.updateTankoubon(id, name, null)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun deleteTankoubon(id: String) {
+        network {
+            val resp = api.deleteTankoubon(id)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun addArchiveToTankoubon(id: String, arcid: String) {
+        network {
+            val resp = api.addArchiveToTankoubon(id, arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    suspend fun removeArchiveFromTankoubon(id: String, arcid: String) {
+        network {
+            val resp = api.removeArchiveFromTankoubon(id, arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    // ============ A3/A8 需要流式/多部分的操作(手写 okhttp,复用拦截器鉴权) ============
+
+    /**
+     * A3 上传本地档案(zip/cbz…)。input 由调用方从 SAF/文件打开。
+     */
+    suspend fun uploadArchive(
+        fileName: String,
+        input: InputStream,
+        title: String? = null,
+        tags: String? = null,
+    ): String = network {
+        val bodyStream = object : RequestBody() {
+            override fun contentType() = "application/octet-stream".toMediaType()
+            override fun writeTo(sink: okio.BufferedSink) {
+                input.use { it.copyTo(sink.outputStream()) }
+            }
+        }
+        val mb = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart("file", fileName, bodyStream)
+            .apply {
+                title?.let { addFormDataPart("title", it) }
+                tags?.let { addFormDataPart("tags", it) }
+            }
+            .build()
+        val url = ApiClient.toAbsoluteUrl("/api/archives/upload")
+        ApiClient.okHttpClient.newCall(
+            Request.Builder().url(url).put(mb).build()
+        ).execute().use { resp ->
+            val body = resp.body?.string()
+            if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
+                ?: toUserMessage(resp.code))
+            body ?: ""
+        }
+    }
+
+    /**
+     * A3 让服务器从 URL 下载档案入库(catid 可选,加入指定分类)。
+     */
+    suspend fun downloadFromUrl(url: String, catid: String? = null) {
+        network {
+            var abs = ApiClient.toAbsoluteUrl("/api/download_url")
+            val encoded = URLEncoder.encode(url, "UTF-8")
+            abs = if (catid.isNullOrBlank()) "$abs?url=$encoded" else "$abs?url=$encoded&catid=${URLEncoder.encode(catid, "UTF-8")}"
+            ApiClient.okHttpClient.newCall(
+                Request.Builder().url(abs).post("".toRequestBody(null)).build()
+            ).execute().use { resp ->
+                val body = resp.body?.string()
+                if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
+                    ?: toUserMessage(resp.code))
+            }
+        }
+    }
+
+    /**
+     * A8 排队生成服务器备份(JSON),返回 jobid;用 [getMinionJob] 轮询直至完成,
+     * 再调用 [downloadBackup] 取回 JSON。
+     */
+    suspend fun queueBackup(): String = network {
+        ApiClient.okHttpClient.newCall(
+            Request.Builder().url(ApiClient.toAbsoluteUrl("/api/database/backup")).post("".toRequestBody(null)).build()
+        ).execute().use { resp ->
+            val body = resp.body?.string()
+            if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
+                ?: toUserMessage(resp.code))
+            val jobid = runCatching {
+                val el = ApiClient.json.parseToJsonElement(body ?: "") as? kotlinx.serialization.json.JsonObject
+                val p = (el?.get("job") ?: el?.get("id") ?: el?.get("jobid")) as? kotlinx.serialization.json.JsonPrimitive
+                p?.content
+            }.getOrNull()?.takeIf { it.isNotBlank() }
+            jobid ?: throw ApiException("未获得备份任务 ID")
+        }
+    }
+
+    /** A8 下载已完成备份的 JSON 内容。 */
+    suspend fun downloadBackup(jobid: String): String = network {
+        ApiClient.okHttpClient.newCall(
+            Request.Builder().url(ApiClient.toAbsoluteUrl("/api/database/backup/$jobid")).get().build()
+        ).execute().use { resp ->
+            val body = resp.body?.string()
+            if (!resp.isSuccessful) throw ApiException(toUserMessage(resp.code))
+            body ?: ""
+        }
+    }
+
+    /** A8 上传备份 JSON 触发恢复(重操作,UI 需强确认)。 */
+    suspend fun restoreBackup(jsonText: String) {
+        network {
+            val bodyBytes = jsonText.toByteArray()
+            val bodyStream = bodyBytes.toRequestBody("application/json".toMediaType())
+            val mb = MultipartBody.Builder().setType(MultipartBody.FORM)
+                .addFormDataPart("file", "backup.json", bodyStream)
+                .build()
+            ApiClient.okHttpClient.newCall(
+                Request.Builder().url(ApiClient.toAbsoluteUrl("/api/database/restore")).post(mb).build()
+            ).execute().use { resp ->
+                val body = resp.body?.string()
+                if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
+                    ?: toUserMessage(resp.code))
+            }
+        }
     }
 }

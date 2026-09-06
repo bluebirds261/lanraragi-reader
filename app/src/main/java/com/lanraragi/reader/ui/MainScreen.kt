@@ -3,15 +3,31 @@ package com.lanraragi.reader.ui
 import android.app.Activity
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
@@ -59,9 +75,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -88,10 +104,17 @@ import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.shapes.Capsule
+import com.lanraragi.reader.data.HistoryEntry
+import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.screens.DownloadScreen
 import com.lanraragi.reader.ui.screens.LibraryScreen
+import com.lanraragi.reader.ui.screens.MainTabBus
+import com.lanraragi.reader.ui.screens.SelectionModeBus
 import com.lanraragi.reader.ui.screens.SettingsScreen
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -121,6 +144,13 @@ private val mainTabs = listOf(
     )
 )
 
+private data class RecentItem(
+    val arcid: String,
+    val title: String,
+    val page: Int = 0,
+    val pagecount: Int = 0,
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -138,36 +168,66 @@ fun MainScreen(
     val offlineIndex by container.offlineCache.index
         .collectAsStateWithLifecycle()
 
+    // D2 多选模式下隐藏液态底栏（选择模式激活时由 LibraryScreen 驱动）
+    val selectionActive by SelectionModeBus.active
+        .collectAsStateWithLifecycle()
+
     val downloadCount =
         offlineIndex.items.size
 
-    val historyEntries by container.historyRepository.entries
-        .collectAsStateWithLifecycle()
-
     val context =
         LocalContext.current
-
-    // 继续阅读：优先使用上次阅读的画廊 ID，其次回退到阅读历史
-    val openRecent = {
-        val recentId = settings?.lastReadArcId
-        if (!recentId.isNullOrEmpty()) {
-            navController.navigate(Routes.reader(recentId))
-        } else {
-            val recent = historyEntries.firstOrNull()
-            if (recent != null && recent.arcid.isNotEmpty()) {
-                navController.navigate(Routes.reader(recent.arcid, 0))
-            } else {
-                Toast.makeText(context, "暂无正在阅读的漫画", Toast.LENGTH_SHORT).show()
-            }
-        }
-    }
 
     var showExitConfirm by remember {
         mutableStateOf(false)
     }
 
+    var showRecentList by remember {
+        mutableStateOf(false)
+    }
+
+    var recentItems by remember {
+        mutableStateOf<List<RecentItem>>(emptyList())
+    }
+
     val scope =
         rememberCoroutineScope()
+
+    /*
+     * ============================================================
+     * 正在阅读：最近阅读列表
+     * ============================================================
+     */
+    val openRecent: () -> Unit = {
+        scope.launch {
+            val s = container.settingsRepository.settings.first()
+            val recents = container.historyRepository.recentDeduped(10).toMutableList()
+            val lastId = s.lastReadArcId
+            if (lastId.isNotBlank() && recents.none { it.arcid == lastId }) {
+                recents.add(0, HistoryEntry(lastId, "", System.currentTimeMillis()))
+            }
+            when {
+                recents.isEmpty() -> {
+                    Toast.makeText(context, "暂无正在阅读的漫画", Toast.LENGTH_SHORT).show()
+                }
+                recents.size == 1 -> {
+                    navController.navigate(Routes.reader(recents.first().arcid, 0))
+                }
+                else -> {
+                    recentItems = recents.map { e ->
+                        val cached = container.offlineCache.cached(e.arcid)?.metadata
+                        RecentItem(
+                            arcid = e.arcid,
+                            title = e.title.ifBlank { cached?.displayTitle ?: e.arcid },
+                            page = cached?.progress ?: 0,
+                            pagecount = cached?.pagecount ?: 0,
+                        )
+                    }
+                    showRecentList = true
+                }
+            }
+        }
+    }
 
     /*
      * ============================================================
@@ -320,6 +380,23 @@ fun MainScreen(
 
     /*
      * ============================================================
+     * D5 空态入口：图库空态点「扫描本地文件」→ 切到下载 Tab
+     * ============================================================
+     */
+    LaunchedEffect(Unit) {
+
+        MainTabBus.target.collect { t ->
+
+            if (t != null) {
+
+                onTabChange(t)
+                MainTabBus.target.value = null
+            }
+        }
+    }
+
+    /*
+     * ============================================================
      * Usage session
      * ============================================================
      */
@@ -366,41 +443,144 @@ fun MainScreen(
                     )
         ) {
 
-            when (selectedTab) {
+            /*
+             * ====================================================
+             * 页面横向切换动画
+             *
+             * 页面顺序：
+             *
+             * 首页 → 下载 → 设置
+             *
+             * 向右切换：
+             * 新页面从右侧进入
+             * 旧页面向左退出
+             *
+             * 向左切换：
+             * 新页面从左侧进入
+             * 旧页面向右退出
+             *
+             * 注意：
+             * 这里仅控制页面进入/退出动画。
+             * 底部导航栏的动画逻辑完全不参与修改。
+             * ====================================================
+             */
+            AnimatedContent(
 
-                0 -> {
+                targetState =
+                    selectedTab.coerceIn(
+                        0,
+                        2
+                    ),
 
-                    LibraryScreen(
-                        container = container,
-                        navController = navController,
-                        onOpenDrawer = {
-                            navController.navigate(
-                                Routes.NAVIGATION
-                            )
-                        }
-                    )
-                }
+                transitionSpec = {
 
-                1 -> {
+                    if (
+                        targetState >
+                        initialState
+                    ) {
 
-                    DownloadScreen(
-                        container = container,
-                        navController = navController,
-                        onBackToHome = {
-                            onTabChange(0)
-                        }
-                    )
-                }
+                        slideInHorizontally(
 
-                else -> {
+                            initialOffsetX = {
+                                    width ->
+                                width
+                            },
 
-                    SettingsScreen(
-                        container = container,
-                        onBack = null,
-                        onOpenDrawer = {
-                            navController.navigate(Routes.NAVIGATION)
-                        }
-                    )
+                            animationSpec =
+                                tween(
+                                    durationMillis = 300,
+                                    easing =
+                                        FastOutSlowInEasing
+                                )
+                        ) togetherWith
+
+                                slideOutHorizontally(
+
+                                    targetOffsetX = {
+                                            width ->
+                                        -width
+                                    },
+
+                                    animationSpec =
+                                        tween(
+                                            durationMillis = 300,
+                                            easing =
+                                                FastOutSlowInEasing
+                                        )
+                                )
+
+                    } else {
+
+                        slideInHorizontally(
+
+                            initialOffsetX = {
+                                    width ->
+                                -width
+                            },
+
+                            animationSpec =
+                                tween(
+                                    durationMillis = 300,
+                                    easing =
+                                        FastOutSlowInEasing
+                                )
+                        ) togetherWith
+
+                                slideOutHorizontally(
+
+                                    targetOffsetX = {
+                                            width ->
+                                        width
+                                    },
+
+                                    animationSpec =
+                                        tween(
+                                            durationMillis = 300,
+                                            easing =
+                                                FastOutSlowInEasing
+                                        )
+                                )
+                    }
+                },
+
+                label =
+                    "mainPageTransition"
+
+            ) { tab ->
+
+                when (tab) {
+
+                    0 -> {
+
+                        LibraryScreen(
+                            container = container,
+                            navController = navController,
+                            onOpenDrawer = {
+                                navController.navigate(
+                                    Routes.NAVIGATION
+                                )
+                            }
+                        )
+                    }
+
+                    1 -> {
+
+                        DownloadScreen(
+                            container = container,
+                            navController = navController,
+                            onBackToHome = {
+                                onTabChange(0)
+                            }
+                        )
+                    }
+
+                    2 -> {
+
+                        SettingsScreen(
+                            container = container,
+                            onBack = null
+                        )
+                    }
                 }
             }
         }
@@ -412,7 +592,7 @@ fun MainScreen(
          */
         AnimatedVisibility(
 
-            visible = true,
+            visible = !selectionActive,
 
             enter =
                 slideInVertically(
@@ -752,7 +932,8 @@ fun MainScreen(
                             with(density) {
                                 28.dp.toPx()
                             }
-
+                val readingDragTabWidthPx =
+                    fullTabWidthPx
                 /*
                  * =================================================
                  * Liquid Bottom Bar
@@ -1067,6 +1248,7 @@ fun MainScreen(
                                                 path.addRoundRect(
                                                     androidx.compose.ui.geometry
                                                         .RoundRect(
+
                                                             left =
                                                                 cutoutLeft +
                                                                         (
@@ -1313,6 +1495,29 @@ fun MainScreen(
                         /*
                          * =================================================
                          * 普通三个 Tab
+                         *
+                         * 这里不使用 detectHorizontalDragGestures。
+                         *
+                         * Down 时立即移动滑块，
+                         * 但只有超过 touch-slop 后才消费事件。
+                         *
+                         * 因此：
+                         *
+                         * 按下
+                         *     ↓
+                         * 滑块立即移动
+                         *
+                         * 只是点击
+                         *     ↓
+                         * 不消费事件
+                         *     ↓
+                         * SingleTabItem.clickable 正常响应
+                         *
+                         * 按住并横向拖动
+                         *     ↓
+                         * 超过 touch-slop
+                         *     ↓
+                         * 开始跟手拖动
                          * =================================================
                          */
                         Row(
@@ -1344,60 +1549,327 @@ fun MainScreen(
                                                         index
                                                     ) {
 
+                                                        var dragPosition =
+                                                            index.toFloat()
+
+                                                        var lastX =
+                                                            0f
+
+                                                        var totalDrag =
+                                                            0f
+
+                                                        var isDragging =
+                                                            false
+
                                                         awaitPointerEventScope {
 
                                                             while (true) {
 
-                                                                val event =
+                                                                val downEvent =
                                                                     awaitPointerEvent(
                                                                         PointerEventPass.Initial
                                                                     )
 
-                                                                event.changes.forEach {
-                                                                        change ->
+                                                                val downChange =
+                                                                    downEvent
+                                                                        .changes
+                                                                        .firstOrNull()
+                                                                        ?: continue
 
-                                                                    if (
-                                                                        change.changedToDown()
-                                                                    ) {
+                                                                if (
+                                                                    downChange.changedToDown()
+                                                                ) {
 
-                                                                        isTabTouched =
-                                                                            true
+                                                                    dragPosition =
+                                                                        index.toFloat()
 
-                                                                        isIndicatorMoving =
-                                                                            true
+                                                                    lastX =
+                                                                        downChange
+                                                                            .position
+                                                                            .x
 
-                                                                        scope.launch {
+                                                                    totalDrag =
+                                                                        0f
 
-                                                                            try {
+                                                                    isDragging =
+                                                                        false
 
-                                                                                indicatorPosition.animateTo(
+                                                                    isTabTouched =
+                                                                        true
 
-                                                                                    targetValue =
-                                                                                        index.toFloat(),
+                                                                    isIndicatorMoving =
+                                                                        true
 
-                                                                                    animationSpec =
-                                                                                        spring(
-                                                                                            dampingRatio =
-                                                                                                0.78f,
+                                                                    scope.launch {
 
-                                                                                            stiffness =
-                                                                                                500f
-                                                                                        )
-                                                                                )
+                                                                        indicatorPosition.stop()
 
-                                                                            } finally {
+                                                                        launch {
+
+                                                                            indicatorPosition.animateTo(
+
+                                                                                targetValue =
+                                                                                    index.toFloat(),
+
+                                                                                animationSpec =
+                                                                                    spring(
+                                                                                        dampingRatio =
+                                                                                            0.78f,
+
+                                                                                        stiffness =
+                                                                                            500f
+                                                                                    )
+                                                                            )
+                                                                        }
+                                                                    }
+
+                                                                    while (true) {
+
+                                                                        val event =
+                                                                            awaitPointerEvent(
+                                                                                PointerEventPass.Initial
+                                                                            )
+
+                                                                        val change =
+                                                                            event
+                                                                                .changes
+                                                                                .firstOrNull()
+                                                                                ?: break
+
+                                                                        if (
+                                                                            change.changedToUpIgnoreConsumed()
+                                                                        ) {
+
+                                                                            isTabTouched =
+                                                                                false
+
+                                                                            if (
+                                                                                !isDragging
+                                                                            ) {
 
                                                                                 isIndicatorMoving =
                                                                                     false
+                                                                            }
+
+                                                                            break
+                                                                        }
+
+                                                                        if (
+                                                                            !change.pressed
+                                                                        ) {
+
+                                                                            break
+                                                                        }
+
+                                                                        val currentX =
+                                                                            change
+                                                                                .position
+                                                                                .x
+
+                                                                        val deltaX =
+                                                                            currentX -
+                                                                                    lastX
+
+                                                                        lastX =
+                                                                            currentX
+
+                                                                        if (
+                                                                            deltaX == 0f
+                                                                        ) {
+
+                                                                            continue
+                                                                        }
+
+                                                                        totalDrag +=
+                                                                            kotlin.math.abs(
+                                                                                deltaX
+                                                                            )
+
+                                                                        val touchSlop =
+                                                                            viewConfiguration.touchSlop
+
+                                                                        if (
+                                                                            !isDragging &&
+                                                                            totalDrag >
+                                                                            touchSlop
+                                                                        ) {
+
+                                                                            isDragging =
+                                                                                true
+
+                                                                            isIndicatorMoving =
+                                                                                true
+
+                                                                            dragPosition =
+                                                                                indicatorPosition.value
+
+                                                                            scope.launch {
+                                                                                indicatorPosition.stop()
+                                                                            }
+                                                                        }
+
+                                                                        if (
+                                                                            isDragging &&
+                                                                            tabWidthPx >
+                                                                            0f
+                                                                        ) {
+
+                                                                            change.consume()
+
+                                                                            dragPosition =
+                                                                                (
+                                                                                        dragPosition +
+                                                                                                deltaX /
+                                                                                                tabWidthPx
+                                                                                        ).coerceIn(
+                                                                                        0f,
+                                                                                        3f
+                                                                                    )
+
+                                                                            val stretch =
+                                                                                (
+                                                                                        kotlin.math.abs(
+                                                                                            deltaX
+                                                                                        ) /
+                                                                                                tabWidthPx *
+                                                                                                2.5f
+                                                                                        ).coerceIn(
+                                                                                        0f,
+                                                                                        0.28f
+                                                                                    )
+
+                                                                            scope.launch {
+
+                                                                                indicatorPosition.snapTo(
+                                                                                    dragPosition
+                                                                                )
+
+                                                                                if (
+                                                                                    deltaX >
+                                                                                    0f
+                                                                                ) {
+
+                                                                                    horizontalStretch.snapTo(
+                                                                                        stretch
+                                                                                    )
+
+                                                                                    verticalStretch.snapTo(
+                                                                                        0f
+                                                                                    )
+
+                                                                                } else if (
+                                                                                    deltaX <
+                                                                                    0f
+                                                                                ) {
+
+                                                                                    verticalStretch.snapTo(
+                                                                                        stretch
+                                                                                    )
+
+                                                                                    horizontalStretch.snapTo(
+                                                                                        0f
+                                                                                    )
+                                                                                }
                                                                             }
                                                                         }
                                                                     }
 
                                                                     if (
-                                                                        change.changedToUpIgnoreConsumed()
+                                                                        isDragging
                                                                     ) {
 
+                                                                        val targetIndex =
+                                                                            dragPosition
+                                                                                .roundToInt()
+                                                                                .coerceIn(
+                                                                                    0,
+                                                                                    3
+                                                                                )
+
+                                                                        scope.launch {
+
+                                                                            indicatorPosition.animateTo(
+
+                                                                                targetValue =
+                                                                                    targetIndex
+                                                                                        .toFloat(),
+
+                                                                                animationSpec =
+                                                                                    spring(
+                                                                                        dampingRatio =
+                                                                                            0.78f,
+
+                                                                                        stiffness =
+                                                                                            500f
+                                                                                    )
+                                                                            )
+
+                                                                            launch {
+
+                                                                                horizontalStretch.animateTo(
+
+                                                                                    targetValue =
+                                                                                        0f,
+
+                                                                                    animationSpec =
+                                                                                        spring(
+                                                                                            dampingRatio =
+                                                                                                0.55f,
+
+                                                                                            stiffness =
+                                                                                                700f
+                                                                                        )
+                                                                                )
+                                                                            }
+
+                                                                            launch {
+
+                                                                                verticalStretch.animateTo(
+
+                                                                                    targetValue =
+                                                                                        0f,
+
+                                                                                    animationSpec =
+                                                                                        spring(
+                                                                                            dampingRatio =
+                                                                                                0.55f,
+
+                                                                                            stiffness =
+                                                                                                700f
+                                                                                        )
+                                                                                )
+                                                                            }
+
+                                                                            isIndicatorMoving =
+                                                                                false
+
+                                                                            isTabTouched =
+                                                                                false
+
+                                                                            if (
+                                                                                targetIndex ==
+                                                                                3
+                                                                            ) {
+
+                                                                                openRecent()
+
+                                                                            } else if (
+                                                                                targetIndex !=
+                                                                                selectedIndex
+                                                                            ) {
+
+                                                                                onTabChange(
+                                                                                    targetIndex
+                                                                                )
+                                                                            }
+                                                                        }
+
+                                                                    } else {
+
                                                                         isTabTouched =
+                                                                            false
+
+                                                                        isIndicatorMoving =
                                                                             false
                                                                     }
                                                                 }
@@ -1445,8 +1917,11 @@ fun MainScreen(
 
                                             interactionSource =
                                                 if (selected) {
+
                                                     selectedIndicatorInteractionSource
+
                                                 } else {
+
                                                     null
                                                 },
 
@@ -1572,15 +2047,6 @@ fun MainScreen(
                                                                 )
                                                         )
 
-                                                        /*
-                                                         * 根据拖动方向和速度产生形变
-                                                         *
-                                                         * 向右：
-                                                         * 横向拉伸
-                                                         *
-                                                         * 向左：
-                                                         * 纵向拉伸
-                                                         */
                                                         val stretch =
                                                             (
                                                                     kotlin.math.abs(
@@ -1630,6 +2096,8 @@ fun MainScreen(
                                                 true
 
                                             scope.launch {
+
+                                                indicatorPosition.stop()
 
                                                 horizontalStretch.snapTo(
                                                     0f
@@ -1737,6 +2205,28 @@ fun MainScreen(
                 /*
                  * =====================================================
                  * 正在阅读
+                 *
+                 * 这里增加与普通 Tab 相同的 pointerInput。
+                 *
+                 * 目的：
+                 *
+                 * 手指按下 tab3
+                 *       ↓
+                 * 滑块保持/移动到 3
+                 *       ↓
+                 * 超过 touch-slop
+                 *       ↓
+                 * tab3 开始继续接管横向拖动
+                 *       ↓
+                 * indicatorPosition 可以从 3f
+                 * 向 2f、1f、0f 跟手移动
+                 *
+                 * 未超过 touch-slop：
+                 *       ↓
+                 * 不消费事件
+                 *       ↓
+                 * SingleTabItem.clickable
+                 * 仍然保持原来的点击行为
                  * =====================================================
                  */
                 Box(
@@ -1757,7 +2247,404 @@ fun MainScreen(
                             .size(
                                 width = 56.dp,
                                 height = 64.dp
-                            ),
+                            )
+                            .pointerInput(Unit) {
+
+                                var dragPosition =
+                                    3f
+
+                                var lastX =
+                                    0f
+
+                                var totalDrag =
+                                    0f
+
+                                var isDragging =
+                                    false
+
+                                awaitPointerEventScope {
+
+                                    while (true) {
+
+                                        val downEvent =
+                                            awaitPointerEvent(
+                                                PointerEventPass.Initial
+                                            )
+
+                                        val downChange =
+                                            downEvent
+                                                .changes
+                                                .firstOrNull()
+                                                ?: continue
+
+                                        if (
+                                            downChange.changedToDown()
+                                        ) {
+
+                                            /*
+                                             * =============================================
+                                             * tab3 按下瞬间：
+                                             *
+                                             * 直接把滑块定位到 3。
+                                             * =============================================
+                                             */
+                                            dragPosition =
+                                                3f
+
+                                            lastX =
+                                                downChange
+                                                    .position
+                                                    .x
+
+                                            totalDrag =
+                                                0f
+
+                                            isDragging =
+                                                false
+
+                                            isTabTouched =
+                                                true
+
+                                            isIndicatorMoving =
+                                                true
+
+                                            scope.launch {
+
+                                                indicatorPosition.stop()
+
+                                                indicatorPosition.animateTo(
+
+                                                    targetValue =
+                                                        3f,
+
+                                                    animationSpec =
+                                                        spring(
+                                                            dampingRatio =
+                                                                0.78f,
+
+                                                            stiffness =
+                                                                500f
+                                                        )
+                                                )
+                                            }
+
+                                            /*
+                                             * =============================================
+                                             * 继续监听 tab3 上的手指。
+                                             * =============================================
+                                             */
+                                            while (true) {
+
+                                                val event =
+                                                    awaitPointerEvent(
+                                                        PointerEventPass.Initial
+                                                    )
+
+                                                val change =
+                                                    event
+                                                        .changes
+                                                        .firstOrNull()
+                                                        ?: break
+
+                                                /*
+                                                 * =========================================
+                                                 * 手指抬起
+                                                 * =========================================
+                                                 */
+                                                if (
+                                                    change.changedToUpIgnoreConsumed()
+                                                ) {
+
+                                                    isTabTouched =
+                                                        false
+
+                                                    /*
+                                                     * 如果只是点击：
+                                                     * 不进行任何导航处理。
+                                                     *
+                                                     * SingleTabItem.clickable
+                                                     * 会继续处理点击。
+                                                     */
+                                                    if (
+                                                        !isDragging
+                                                    ) {
+
+                                                        isIndicatorMoving =
+                                                            false
+                                                    }
+
+                                                    break
+                                                }
+
+                                                if (
+                                                    !change.pressed
+                                                ) {
+
+                                                    break
+                                                }
+
+                                                val currentX =
+                                                    change
+                                                        .position
+                                                        .x
+
+                                                val deltaX =
+                                                    currentX -
+                                                            lastX
+
+                                                lastX =
+                                                    currentX
+
+                                                if (
+                                                    deltaX == 0f
+                                                ) {
+
+                                                    continue
+                                                }
+
+                                                totalDrag +=
+                                                    kotlin.math.abs(
+                                                        deltaX
+                                                    )
+
+                                                /*
+                                                 * =========================================
+                                                 * touch-slop
+                                                 *
+                                                 * 未超过阈值：
+                                                 * 不消费事件。
+                                                 *
+                                                 * 超过阈值：
+                                                 * 正式开始拖动。
+                                                 * =========================================
+                                                 */
+                                                val touchSlop =
+                                                    viewConfiguration.touchSlop
+
+                                                if (
+                                                    !isDragging &&
+                                                    totalDrag >
+                                                    touchSlop
+                                                ) {
+
+                                                    isDragging =
+                                                        true
+
+                                                    isIndicatorMoving =
+                                                        true
+
+                                                    dragPosition =
+                                                        indicatorPosition.value
+
+                                                    scope.launch {
+                                                        indicatorPosition.stop()
+                                                    }
+                                                }
+
+                                                /*
+                                                 * =========================================
+                                                 * 真正跟手拖动
+                                                 *
+                                                 * 关键：
+                                                 *
+                                                 * coerceIn(0f, 3f)
+                                                 *
+                                                 * 因此从 tab3 向左可以：
+                                                 *
+                                                 * 3.0 → 2.9 → 2.8 → ...
+                                                 * → 2.0 → 1.0 → 0.0
+                                                 * =========================================
+                                                 */
+                                                if (
+                                                    isDragging &&
+                                                    readingDragTabWidthPx > 0f
+                                                ) {
+
+                                                    change.consume()
+
+                                                    dragPosition =
+                                                        (
+                                                                dragPosition +
+                                                                        deltaX /
+                                                                        readingDragTabWidthPx
+                                                                ).coerceIn(
+                                                                0f,
+                                                                3f
+                                                            )
+
+                                                    val stretch =
+                                                        (
+                                                                kotlin.math.abs(deltaX) /
+                                                                        (readingDragTabWidthPx * 2.5f)
+                                                                ).coerceIn(
+                                                                0f,
+                                                                0.28f
+                                                            )
+
+                                                    scope.launch {
+
+                                                        indicatorPosition.snapTo(
+                                                            dragPosition
+                                                        )
+
+                                                        if (
+                                                            deltaX >
+                                                            0f
+                                                        ) {
+
+                                                            horizontalStretch.snapTo(
+                                                                stretch
+                                                            )
+
+                                                            verticalStretch.snapTo(
+                                                                0f
+                                                            )
+
+                                                        } else if (
+                                                            deltaX <
+                                                            0f
+                                                        ) {
+
+                                                            verticalStretch.snapTo(
+                                                                stretch
+                                                            )
+
+                                                            horizontalStretch.snapTo(
+                                                                0f
+                                                            )
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            /*
+                                             * =============================================
+                                             * 真正拖动后：
+                                             * 松手吸附到最近 Tab。
+                                             *
+                                             * 注意：
+                                             * 这里仍然保留原来的 tab3 行为。
+                                             * =============================================
+                                             */
+                                            if (
+                                                isDragging
+                                            ) {
+
+                                                val targetIndex =
+                                                    dragPosition
+                                                        .roundToInt()
+                                                        .coerceIn(
+                                                            0,
+                                                            3
+                                                        )
+
+                                                scope.launch {
+
+                                                    indicatorPosition.animateTo(
+
+                                                        targetValue =
+                                                            targetIndex
+                                                                .toFloat(),
+
+                                                        animationSpec =
+                                                            spring(
+                                                                dampingRatio =
+                                                                    0.78f,
+
+                                                                stiffness =
+                                                                    500f
+                                                            )
+                                                    )
+
+                                                    launch {
+
+                                                        horizontalStretch.animateTo(
+
+                                                            targetValue =
+                                                                0f,
+
+                                                            animationSpec =
+                                                                spring(
+                                                                    dampingRatio =
+                                                                        0.55f,
+
+                                                                    stiffness =
+                                                                        700f
+                                                                )
+                                                        )
+                                                    }
+
+                                                    launch {
+
+                                                        verticalStretch.animateTo(
+
+                                                            targetValue =
+                                                                0f,
+
+                                                            animationSpec =
+                                                                spring(
+                                                                    dampingRatio =
+                                                                        0.55f,
+
+                                                                    stiffness =
+                                                                        700f
+                                                                )
+                                                        )
+                                                    }
+
+                                                    isIndicatorMoving =
+                                                        false
+
+                                                    isTabTouched =
+                                                        false
+
+                                                    /*
+                                                     * =========================================
+                                                     * 最终落在 tab3：
+                                                     *
+                                                     * 进入正在阅读。
+                                                     * =========================================
+                                                     */
+                                                    if (
+                                                        targetIndex ==
+                                                        3
+                                                    ) {
+
+                                                        openRecent()
+
+                                                    } else if (
+                                                        targetIndex !=
+                                                        selectedIndex
+                                                    ) {
+
+                                                        onTabChange(
+                                                            targetIndex
+                                                        )
+                                                    }
+                                                }
+
+                                            } else {
+
+                                                /*
+                                                 * =============================================
+                                                 * 普通点击：
+                                                 *
+                                                 * 不处理导航。
+                                                 *
+                                                 * SingleTabItem.clickable
+                                                 * 保持原来的点击行为。
+                                                 * =============================================
+                                                 */
+                                                isTabTouched =
+                                                    false
+
+                                                isIndicatorMoving =
+                                                    false
+                                            }
+                                        }
+                                    }
+                                }
+                            },
 
                     contentAlignment =
                         Alignment.Center
@@ -1897,6 +2784,82 @@ fun MainScreen(
                 }
             )
         }
+
+        LaunchedEffect(showRecentList) {
+            if (!showRecentList) return@LaunchedEffect
+            val arcs = recentItems.map { it.arcid }
+            for (arcid in arcs) {
+                val meta = try {
+                    container.repository.getMetadata(arcid)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+                if (meta != null) {
+                    recentItems = recentItems.map {
+                        if (it.arcid == arcid) {
+                            RecentItem(
+                                arcid = it.arcid,
+                                title = meta.displayTitle.ifBlank { it.title },
+                                page = meta.progress,
+                                pagecount = meta.pagecount,
+                            )
+                        } else {
+                            it
+                        }
+                    }
+                }
+            }
+        }
+
+        if (showRecentList) {
+            ModalBottomSheet(
+                onDismissRequest = { showRecentList = false },
+                sheetState = rememberModalBottomSheetState(),
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .padding(bottom = 24.dp),
+                ) {
+                    Text(
+                        text = "正在阅读",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                    if (recentItems.isEmpty()) {
+                        Text(
+                            text = "暂无正在阅读的漫画",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(16.dp),
+                        )
+                    } else {
+                        LazyRow(
+                            contentPadding = PaddingValues(horizontal = 16.dp),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            items(recentItems, key = { it.arcid }) { item ->
+                                RecentCard(
+                                    item = item,
+                                    onOpen = {
+                                        showRecentList = false
+                                        navController.navigate(Routes.reader(item.arcid, 0))
+                                    },
+                                    onRemove = {
+                                        recentItems = recentItems.filter { it.arcid != item.arcid }
+                                        scope.launch {
+                                            container.historyRepository.remove(item.arcid)
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1948,10 +2911,14 @@ private fun SingleTabItem(
                         CircleShape
                     )
                     .clickable(
+
                         indication = null,
+
                         interactionSource =
                             actualInteractionSource,
-                        onClick = onClick
+
+                        onClick =
+                            onClick
                     ),
 
             contentAlignment =
@@ -1983,8 +2950,11 @@ private fun SingleTabItem(
                                     if (
                                         downloadCount > 99
                                     ) {
+
                                         "99+"
+
                                     } else {
+
                                         downloadCount
                                             .toString()
                                     },
@@ -2011,12 +2981,75 @@ private fun SingleTabItem(
 
                     tint =
                         if (selected) {
+
                             activeColor
+
                         } else {
+
                             inactiveColor
                         }
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun RecentCard(
+    item: RecentItem,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(120.dp)
+            .clickable(onClick = onOpen),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.72f)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            LoadingImage(
+                model = ApiClient.thumbnailUrl(item.arcid),
+                contentDescription = item.title,
+                modifier = Modifier.fillMaxSize(),
+            )
+            Box(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .size(22.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.5f))
+                    .clickable(onClick = onRemove),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "移除",
+                    tint = Color.White,
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = item.title.ifBlank { item.arcid },
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 2,
+            minLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        if (item.pagecount > 0 && item.page > 0) {
+            Text(
+                text = "第 ${item.page}/${item.pagecount} 页",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1,
+            )
         }
     }
 }

@@ -1,14 +1,21 @@
 package com.lanraragi.reader.ui.screens
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.net.Uri
 import android.os.Environment
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,11 +25,15 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.pager.HorizontalPager
@@ -30,17 +41,22 @@ import androidx.compose.foundation.pager.PagerState
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronLeft
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -68,6 +84,7 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.ViewModel
@@ -77,12 +94,13 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
 import com.lanraragi.reader.data.ArchiveFileReader
+import com.lanraragi.reader.data.DownloadTaskType
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.model.TocEntry
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.LoadingBox
 import com.lanraragi.reader.ui.edgeSwipeBack
-import com.lanraragi.reader.ui.LoadingImage
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -110,11 +128,13 @@ private fun fitContentScale(mode: String): ContentScale = when (mode) {
     else -> ContentScale.FillWidth
 }
 
-/** 阅读器背景色。 */
+/** 阅读器背景色；"auto" 按系统深浅色映射到黑/深灰。 */
+@Composable
 private fun readerBackgroundColor(mode: String): Color = when (mode) {
     "dark" -> Color(0xFF1A1A1A)
     "gray" -> Color(0xFF2E2E2E)
     "white" -> Color.White
+    "auto" -> if (isSystemInDarkTheme()) Color(0xFF1A1A1A) else Color.Black
     else -> Color.Black
 }
 
@@ -123,6 +143,20 @@ private fun fitModeLabel(mode: String): String = when (mode) {
     "fitScreen" -> "适应屏"
     "original" -> "原始"
     else -> "适应宽"
+}
+
+/** 沿 Context 链找到所属 Activity（LocalContext.current 可能是 ContextWrapper）。 */
+private tailrec fun Context.findActivity(): android.app.Activity? = when (this) {
+    is android.app.Activity -> this
+    is android.content.ContextWrapper -> baseContext.findActivity()
+    else -> null
+}
+
+/** 设置阅读窗口亮度；value 为 -1f（BRIGHTNESS_OVERRIDE_NONE，跟随系统）或 0f~1f。 */
+private fun setWindowBrightness(context: Context, value: Float) {
+    context.findActivity()?.window?.let { w ->
+        w.attributes = w.attributes.apply { screenBrightness = value }
+    }
 }
 
 data class ArchivePageModel(
@@ -149,15 +183,20 @@ class ReaderViewModel(
         val currentPage: Int = 0,
         val readerMode: String = "single",
         val multiPageCount: Int = 2,
+        val autoDoublePageLandscape: Boolean = true,
         val preloadOnlineCount: Int = 3,
         val readingDirection: String = "ltr",
+        val autoScrollSpeed: String = "off",
+        val autoScrolling: Boolean = false,
         val readerFitMode: String = "fitWidth",
         val readerBackground: String = "black",
+        val readerBrightness: Int = -1,
         val tapZonesEnabled: Boolean = true,
         val keepScreenOn: Boolean = true,
         val volumeKeysEnabled: Boolean = true,
         val preloadLocalCount: Int = 5,
         val localPages: List<ArchiveFileReader.ArchiveEntry> = emptyList(),
+        val toc: List<TocEntry> = emptyList(),
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -182,10 +221,13 @@ class ReaderViewModel(
                     it.copy(
                         readerMode = settings.readerMode,
                         multiPageCount = settings.multiPageCount,
+                        autoDoublePageLandscape = settings.autoDoublePageLandscape,
                         preloadOnlineCount = settings.preloadOnlineCount,
                         readingDirection = settings.readingDirection,
+                        autoScrollSpeed = settings.autoScrollSpeed,
                         readerFitMode = settings.readerFitMode,
                         readerBackground = settings.readerBackground,
+                        readerBrightness = settings.readerBrightness,
                         tapZonesEnabled = settings.tapZonesEnabled,
                         keepScreenOn = settings.keepScreenOn,
                         volumeKeysEnabled = settings.volumeKeysEnabled,
@@ -222,6 +264,7 @@ class ReaderViewModel(
                                 pageCount = images.size,
                                 localPages = images,
                                 title = cached?.title ?: "",
+                                toc = cached?.metadata?.toc ?: emptyList(),
                                 currentPage = 0,
                                 loading = false,
                             )
@@ -233,6 +276,7 @@ class ReaderViewModel(
                                 offline = true,
                                 pageCount = cached.pageCount,
                                 title = cached.title,
+                                toc = cached.metadata?.toc ?: emptyList(),
                                 currentPage = 0,
                                 loading = false,
                             )
@@ -251,6 +295,7 @@ class ReaderViewModel(
                                 title = meta.title,
                                 tags = meta.tags,
                                 progress = meta.progress,
+                                toc = meta.toc,
                                 currentPage = start,
                                 loading = false,
                             )
@@ -302,35 +347,51 @@ class ReaderViewModel(
         }
     }
 
-    fun downloadCurrentPage(context: Context) {
-        viewModelScope.launch(Dispatchers.IO) {
-            val s = _state.value
-            if (s.pageCount <= 0) return@launch
-            val idx = s.currentPage.coerceIn(0, s.pageCount - 1)
-            try {
-                val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir, "收藏")
-                dir.mkdirs()
-                val dest = File(dir, "${arcid}_${idx + 1}.jpg")
-                if (s.offline) {
-                    container.offlineCache.pageFile(arcid, idx).copyTo(dest, overwrite = true)
-                } else {
-                    val url = s.onlinePages[idx]
-                    val req = Request.Builder().url(url).build()
-                    ApiClient.okHttpClient.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            resp.body?.byteStream()?.use { input ->
-                                FileOutputStream(dest).use { out -> input.copyTo(out) }
-                            }
+    fun downloadCurrentPage(context: Context, page: Int? = null) {
+        val s = _state.value
+        if (s.pageCount <= 0) return
+        val idx = (page ?: s.currentPage).coerceIn(0, s.pageCount - 1)
+        val appContext = context.applicationContext
+        container.downloadManager.enqueue(DownloadTaskType.PAGE, arcid, "第 ${idx + 1} 页") {
+            val dir = File(appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: appContext.filesDir, "收藏")
+            dir.mkdirs()
+            val dest = File(dir, "${arcid}_${idx + 1}.jpg")
+            if (s.offline) {
+                container.offlineCache.pageFile(arcid, idx).copyTo(dest, overwrite = true)
+            } else {
+                val url = s.onlinePages[idx]
+                val req = Request.Builder().url(url).build()
+                ApiClient.okHttpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        resp.body?.byteStream()?.use { input ->
+                            FileOutputStream(dest).use { out -> input.copyTo(out) }
                         }
+                    } else {
+                        throw IllegalStateException("下载失败 HTTP ${resp.code}")
                     }
                 }
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "已收藏到收藏文件夹", Toast.LENGTH_SHORT).show()
-                }
+            }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(appContext, "已收藏到收藏文件夹", Toast.LENGTH_SHORT).show()
+            }
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            Toast.makeText(context, "已加入下载队列", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** C4：把指定页（1 起）设为档案封面（复用 A5 端点），成功后刷新图库封面缓存。 */
+    fun setCoverFromPage(page: Int) {
+        viewModelScope.launch {
+            try {
+                container.repository.setThumbnailFromPage(arcid, page.coerceAtLeast(1))
+                CoverChangeBus.version.value++
+                LibraryRefreshBus.tick.value++
+                Toast.makeText(container.context, "封面已更新", Toast.LENGTH_SHORT).show()
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(context, "收藏失败：${e.message}", Toast.LENGTH_SHORT).show()
-                }
+                Toast.makeText(container.context, e.message ?: "更换封面失败", Toast.LENGTH_SHORT).show()
             }
         }
     }
@@ -362,12 +423,40 @@ class ReaderViewModel(
         viewModelScope.launch { container.settingsRepository.setReadingDirection(next) }
     }
 
+    fun setReaderBrightness(n: Int) {
+        val v = n.coerceIn(-1, 100)
+        _state.update { it.copy(readerBrightness = v) }
+        viewModelScope.launch { container.settingsRepository.setReaderBrightness(v) }
+    }
+
+    fun setAutoScrollSpeed(s: String) {
+        _state.update { it.copy(autoScrollSpeed = s) }
+        viewModelScope.launch { container.settingsRepository.setAutoScrollSpeed(s) }
+    }
+
+    /** C6：播放/暂停连续模式自动滚动；仅连续模式生效。 */
+    fun toggleAutoScroll() {
+        if (_state.value.readerMode != "continuous") return
+        _state.update { it.copy(autoScrolling = !it.autoScrolling) }
+    }
+
     override fun onCleared() {
         syncJob?.cancel()
         val s = _state.value
-        if (!s.offline && s.currentPage in 0 until s.pageCount) {
-            container.applicationScope.launch {
-                runCatching { container.repository.setProgress(arcid, s.currentPage + 1) }
+        val page = if (s.currentPage in 0 until s.pageCount) s.currentPage + 1 else null
+        // local_ 档案在服务器不存在，跳过；无有效页码也跳过。
+        if (page == null || arcid.startsWith("local_")) return
+
+        // B4: 会话结束回写进度（服务器从 1 计）。对非 local_ 且有有效页码的档案
+        // 一律尝试直连服务器，失败（含未配置服务器/离线不可达）记入待同步队列，
+        // 留待下次启动或联网后补推。取消异常直接向上抛出，不吞。
+        container.applicationScope.launch {
+            try {
+                container.repository.setProgress(arcid, page)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                container.pendingProgress.record(arcid, page)
             }
         }
     }
@@ -385,7 +474,7 @@ fun ReaderScreen(container: AppContainer, arcid: String, navController: NavContr
             state.pageCount <= 0 -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("没有可显示的页面", color = Color.White)
             }
-            else -> ReaderContent(vm, state, navController)
+            else -> ReaderContent(vm, state, navController, arcid)
         }
     }
 }
@@ -395,18 +484,22 @@ private fun ReaderContent(
     vm: ReaderViewModel,
     state: ReaderViewModel.UiState,
     navController: NavController,
+    arcid: String,
 ) {
     var showUi by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
+    var showGrid by remember { mutableStateOf(false) }
+    var showToc by remember { mutableStateOf(false) }
     var lastInteraction by remember { mutableStateOf(0L) }
+    var pageMenuIndex by remember { mutableStateOf<Int?>(null) }
     val scope = rememberCoroutineScope()
     val view = LocalView.current
     val context = LocalContext.current
     val focusRequester = remember { FocusRequester() }
 
     // 唤出 UI 后 2s 自动隐藏逻辑
-    LaunchedEffect(showUi, lastInteraction) {
-        if (showUi) {
+    LaunchedEffect(showUi, lastInteraction, showGrid) {
+        if (showUi && !showGrid) {
             delay(2000)
             showUi = false
         }
@@ -419,7 +512,13 @@ private fun ReaderContent(
         (0 until state.pageCount).map { vm.pageModel(it) }
     }
     val reverse = state.readingDirection == "rtl"
-    val pagesPerScreen = if (state.readerMode == "multi") state.multiPageCount else 1
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    val pagesPerScreen = when {
+        state.readerMode == "multi" -> state.multiPageCount
+        state.readerMode == "single" && state.autoDoublePageLandscape && isLandscape -> 2
+        else -> 1
+    }
     val preloadCount = if (state.offline) state.preloadLocalCount else state.preloadOnlineCount
     val screens = ((models.size + pagesPerScreen - 1) / pagesPerScreen).coerceAtLeast(1)
     val startScreen = (state.currentPage / pagesPerScreen).coerceIn(0, screens - 1)
@@ -431,6 +530,42 @@ private fun ReaderContent(
     DisposableEffect(state.keepScreenOn) {
         view.keepScreenOn = state.keepScreenOn
         onDispose { view.keepScreenOn = false }
+    }
+
+    // 进入阅读时应用偏好亮度；-1 表示跟随系统。
+    LaunchedEffect(Unit) {
+        setWindowBrightness(
+            context,
+            if (state.readerBrightness >= 0) state.readerBrightness / 100f
+            else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE,
+        )
+    }
+
+    // 退出阅读（含异常/返回导航）恢复系统亮度。
+    DisposableEffect(Unit) {
+        onDispose { setWindowBrightness(context, WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE) }
+    }
+
+    // C6：连续模式自动滚动。按速度平滑 scrollBy；到底自动停；LaunchedEffect 取消时协程自然取消。
+    LaunchedEffect(state.autoScrolling, state.autoScrollSpeed, state.readerMode) {
+        if (state.readerMode != "continuous" || !state.autoScrolling || state.autoScrollSpeed == "off") {
+            return@LaunchedEffect
+        }
+        val pxPerSec = when (state.autoScrollSpeed) {
+            "slow" -> 40f
+            "medium" -> 80f
+            "fast" -> 140f
+            else -> 0f
+        }
+        if (pxPerSec <= 0f) return@LaunchedEffect
+        while (true) {
+            if (!listState.canScrollForward) {
+                vm.toggleAutoScroll()
+                break
+            }
+            listState.scrollBy(pxPerSec * 0.016f)
+            delay(16)
+        }
     }
 
     fun jumpTo(idx: Int) {
@@ -448,6 +583,24 @@ private fun ReaderContent(
     fun stepScreen(delta: Int) {
         val per = if (state.readerMode == "continuous") 1 else pagesPerScreen
         jumpTo(state.currentPage + delta * per)
+    }
+
+    fun openPageMenu(idx: Int) {
+        lastInteraction = System.currentTimeMillis()
+        pageMenuIndex = idx
+    }
+
+    fun copyPageLink(idx: Int) {
+        if (state.offline) {
+            Toast.makeText(context, "离线档案无链接", Toast.LENGTH_SHORT).show()
+            return
+        }
+        if (idx !in state.onlinePages.indices) return
+        val url = ApiClient.displayBaseUrl().trimEnd('/') + "/" +
+            state.onlinePages[idx].removePrefix(ApiClient.SENTINEL_BASE)
+        context.getSystemService(ClipboardManager::class.java)
+            ?.setPrimaryClip(ClipData.newPlainText("页面链接", url))
+        Toast.makeText(context, "已复制链接", Toast.LENGTH_SHORT).show()
     }
 
     Box(
@@ -468,7 +621,14 @@ private fun ReaderContent(
             },
     ) {
         if (state.readerMode == "continuous") {
-            VerticalReader(listState, models, fitScale, vm::reportPage) { showUi = !showUi }
+            VerticalReader(
+                listState = listState,
+                models = models,
+                fitScale = fitScale,
+                onPage = vm::reportPage,
+                onToggleUi = { showUi = !showUi },
+                onPageLongPress = { openPageMenu(it) },
+            )
         } else {
             HorizontalReader(
                 pagerState = pagerState,
@@ -480,6 +640,7 @@ private fun ReaderContent(
                 tapZonesEnabled = state.tapZonesEnabled,
                 onPage = vm::reportPage,
                 onToggleUi = { showUi = !showUi },
+                onPageLongPress = { openPageMenu(it) },
             )
         }
 
@@ -487,6 +648,9 @@ private fun ReaderContent(
             ReaderTopBar(
                 current = state.currentPage + 1,
                 total = state.pageCount,
+                continuous = state.readerMode == "continuous",
+                autoScrolling = state.autoScrolling,
+                onToggleAutoScroll = vm::toggleAutoScroll,
                 onBack = { navController.popBackStack() },
             )
         }
@@ -526,9 +690,27 @@ private fun ReaderContent(
                     lastInteraction = System.currentTimeMillis()
                     showInfo = true
                 },
+                onOpenGrid = {
+                    lastInteraction = System.currentTimeMillis()
+                    showGrid = true
+                },
+                toc = state.toc,
+                onOpenToc = {
+                    lastInteraction = System.currentTimeMillis()
+                    showToc = true
+                },
                 onFavorite = {
                     lastInteraction = System.currentTimeMillis()
                     vm.downloadCurrentPage(context)
+                },
+                brightness = state.readerBrightness,
+                onBrightnessChange = { n ->
+                    lastInteraction = System.currentTimeMillis()
+                    vm.setReaderBrightness(n)
+                    setWindowBrightness(
+                        context,
+                        if (n >= 0) n / 100f else WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE,
+                    )
                 },
                 models = models,
             )
@@ -554,6 +736,60 @@ private fun ReaderContent(
         )
     }
 
+    if (showGrid) {
+        PageGridSheet(
+            arcid = arcid,
+            total = state.pageCount,
+            currentPage = state.currentPage,
+            offline = state.offline,
+            models = models,
+            onJump = { index ->
+                lastInteraction = System.currentTimeMillis()
+                jumpTo(index)
+                showGrid = false
+                focusRequester.requestFocus()
+            },
+            onDismiss = { showGrid = false },
+        )
+    }
+
+    if (showToc) {
+        TocSheet(
+            toc = state.toc,
+            onJump = { page ->
+                lastInteraction = System.currentTimeMillis()
+                jumpTo(page - 1)
+                showToc = false
+                focusRequester.requestFocus()
+            },
+            onDismiss = { showToc = false },
+        )
+    }
+
+    pageMenuIndex?.let { menuIdx ->
+        PageMenuSheet(
+            pageNumber = menuIdx + 1,
+            offline = state.offline,
+            onSave = {
+                vm.downloadCurrentPage(context, menuIdx)
+                pageMenuIndex = null
+            },
+            onCopyLink = {
+                copyPageLink(menuIdx)
+                pageMenuIndex = null
+            },
+            onSetCover = {
+                vm.setCoverFromPage(menuIdx + 1)
+                pageMenuIndex = null
+            },
+            onShowInfo = {
+                showInfo = true
+                pageMenuIndex = null
+            },
+            onDismiss = { pageMenuIndex = null },
+        )
+    }
+
     // 首帧及工具栏切换后把焦点还给阅读容器，保证音量键翻页生效。
     LaunchedEffect(Unit, showUi) { focusRequester.requestFocus() }
 }
@@ -565,6 +801,7 @@ private fun VerticalReader(
     fitScale: ContentScale,
     onPage: (Int) -> Unit,
     onToggleUi: () -> Unit,
+    onPageLongPress: (Int) -> Unit,
 ) {
     LaunchedEffect(listState) {
         snapshotFlow { listState.firstVisibleItemIndex }
@@ -573,17 +810,19 @@ private fun VerticalReader(
     }
     LazyColumn(
         state = listState,
-        modifier = Modifier
-            .fillMaxSize()
-            .pointerInput(Unit) { detectTapGestures(onTap = { onToggleUi() }) },
+        modifier = Modifier.fillMaxSize(),
     ) {
         itemsIndexed(models) { index, model ->
-            LoadingImage(
-                model = model,
-                contentDescription = "第 ${index + 1} 页",
-                contentScale = fitScale,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            Box(Modifier.fillMaxWidth()) {
+                ZoomablePage(
+                    model = model,
+                    modifier = Modifier.fillMaxWidth(),
+                    fitScale = fitScale,
+                    tapZonesEnabled = false,
+                    onTapRegion = { onToggleUi() },
+                    onLongPress = { onPageLongPress(index) },
+                )
+            }
         }
     }
 }
@@ -599,9 +838,10 @@ private fun HorizontalReader(
     tapZonesEnabled: Boolean,
     onPage: (Int) -> Unit,
     onToggleUi: () -> Unit,
+    onPageLongPress: (Int) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
-    LaunchedEffect(pagerState) {
+    LaunchedEffect(pagerState, pagesPerScreen) {
         snapshotFlow { pagerState.settledPage }
             .distinctUntilChanged()
             .collect { onPage(it * pagesPerScreen) }
@@ -640,6 +880,7 @@ private fun HorizontalReader(
                                     }
                                 }
                             },
+                            onLongPress = { onPageLongPress(idx) },
                         )
                     }
                 } else {
@@ -657,6 +898,7 @@ private fun ZoomablePage(
     fitScale: ContentScale,
     tapZonesEnabled: Boolean,
     onTapRegion: (TapRegion) -> Unit,
+    onLongPress: (() -> Unit)? = null,
 ) {
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
@@ -681,17 +923,20 @@ private fun ZoomablePage(
             .pointerInput(Unit) {
                 detectTapGestures(
                     onTap = { tapOffset ->
-                        if (!tapZonesEnabled) {
-                            onTapRegion(TapRegion.CENTER)
-                        } else {
-                            val w = size.width.toFloat()
-                            onTapRegion(
-                                when {
-                                    tapOffset.x < w / 3f -> TapRegion.LEFT
-                                    tapOffset.x > w * 2f / 3f -> TapRegion.RIGHT
-                                    else -> TapRegion.CENTER
-                                }
-                            )
+                        // 缩放时单击仅消费手势，不触发翻页/唤出 UI，避免放大状态下误翻页。
+                        if (scale <= 1f) {
+                            if (!tapZonesEnabled) {
+                                onTapRegion(TapRegion.CENTER)
+                            } else {
+                                val w = size.width.toFloat()
+                                onTapRegion(
+                                    when {
+                                        tapOffset.x < w / 3f -> TapRegion.LEFT
+                                        tapOffset.x > w * 2f / 3f -> TapRegion.RIGHT
+                                        else -> TapRegion.CENTER
+                                    }
+                                )
+                            }
                         }
                     },
                     onDoubleTap = {
@@ -701,6 +946,10 @@ private fun ZoomablePage(
                         } else {
                             scale = 2f
                         }
+                    },
+                    onLongPress = { _ ->
+                        // 长按且未缩放时才弹菜单，避免"想放大却弹菜单"。
+                        if (scale <= 1f) onLongPress?.invoke()
                     },
                 )
             },
@@ -734,6 +983,9 @@ private fun ZoomablePage(
 private fun ReaderTopBar(
     current: Int,
     total: Int,
+    continuous: Boolean,
+    autoScrolling: Boolean,
+    onToggleAutoScroll: () -> Unit,
     onBack: () -> Unit,
 ) {
     Row(
@@ -744,9 +996,19 @@ private fun ReaderTopBar(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         IconButton(onClick = onBack) {
-            Icon(Icons.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
         }
         Text("$current / $total", color = Color.White, style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.weight(1f))
+        if (continuous) {
+            IconButton(onClick = onToggleAutoScroll) {
+                Icon(
+                    if (autoScrolling) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                    contentDescription = if (autoScrolling) "暂停滚动" else "自动滚动",
+                    tint = Color.White,
+                )
+            }
+        }
     }
 }
 
@@ -765,10 +1027,16 @@ private fun ReaderBottomBar(
     onToggleFitMode: () -> Unit,
     onInfo: () -> Unit,
     onFavorite: () -> Unit,
+    onOpenGrid: () -> Unit,
+    toc: List<TocEntry>,
+    onOpenToc: () -> Unit,
+    brightness: Int,
+    onBrightnessChange: (Int) -> Unit,
     models: List<Any>,
 ) {
     var sliderValue by remember { mutableFloatStateOf(current.toFloat()) }
     var isDragging by remember { mutableStateOf(false) }
+    var showBrightness by remember { mutableStateOf(false) }
     LaunchedEffect(current) { sliderValue = current.toFloat() }
 
     Column(
@@ -831,9 +1099,230 @@ private fun ReaderBottomBar(
             TextButton(onClick = onToggleFitMode) {
                 Text(fitModeLabel(fitMode), color = Color.White)
             }
+            TextButton(onClick = { showBrightness = true }) { Text("亮度", color = Color.White) }
+            TextButton(onClick = onOpenToc, enabled = toc.isNotEmpty()) { Text("目录", color = Color.White) }
             Spacer(Modifier.weight(1f))
+            TextButton(onClick = onOpenGrid) { Text("网格", color = Color.White) }
             TextButton(onClick = onInfo) { Text("信息", color = Color.White) }
             TextButton(onClick = onFavorite) { Text("收藏", color = Color.White) }
+        }
+    }
+
+    if (showBrightness) {
+        BrightnessDialog(
+            brightness = brightness,
+            onBrightnessChange = onBrightnessChange,
+            onDismiss = { showBrightness = false },
+        )
+    }
+}
+
+@Composable
+private fun BrightnessDialog(
+    brightness: Int,
+    onBrightnessChange: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("阅读亮度") },
+        text = {
+            Column {
+                Slider(
+                    value = if (brightness < 0) 50f else brightness.toFloat(),
+                    onValueChange = { onBrightnessChange(it.toInt()) },
+                    valueRange = 0f..100f,
+                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (brightness < 0) "跟随系统" else "$brightness%",
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (brightness >= 0) {
+                        TextButton(onClick = { onBrightnessChange(-1) }) { Text("跟随系统") }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PageGridSheet(
+    arcid: String,
+    total: Int,
+    currentPage: Int,
+    offline: Boolean,
+    models: List<Any>,
+    onJump: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState()
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text("页码（共 $total 页）", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(12.dp))
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(4),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 480.dp),
+            ) {
+                items(total) { index ->
+                    val isCurrent = index == currentPage
+                    Box(
+                        Modifier
+                            .aspectRatio(0.72f)
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF2E2E2E))
+                            .then(
+                                if (isCurrent) {
+                                    Modifier.border(2.dp, Color(0xFF4C8DFF), RoundedCornerShape(6.dp))
+                                } else {
+                                    Modifier
+                                },
+                            )
+                            .clickable { onJump(index) },
+                    ) {
+                        AsyncImage(
+                            model = if (offline) models[index] else ApiClient.pageThumbnailUrl(arcid, index),
+                            contentDescription = "第 ${index + 1} 页",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                        Text(
+                            "${index + 1}",
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .background(Color(0x99000000))
+                                .padding(horizontal = 4.dp, vertical = 1.dp),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PageMenuSheet(
+    pageNumber: Int,
+    offline: Boolean,
+    onSave: () -> Unit,
+    onCopyLink: () -> Unit,
+    onSetCover: () -> Unit,
+    onShowInfo: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState()
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text("第 $pageNumber 页", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            TextButton(onClick = onSave, modifier = Modifier.fillMaxWidth()) {
+                Text("保存此页到收藏")
+            }
+            TextButton(
+                onClick = onCopyLink,
+                enabled = !offline,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("复制本页链接")
+            }
+            if (!offline) {
+                TextButton(onClick = onSetCover, modifier = Modifier.fillMaxWidth()) {
+                    Text("设为档案封面")
+                }
+            }
+            TextButton(onClick = onShowInfo, modifier = Modifier.fillMaxWidth()) {
+                Text("查看信息")
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TocSheet(
+    toc: List<TocEntry>,
+    onJump: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val sheetState = rememberModalBottomSheetState()
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 24.dp),
+        ) {
+            Text("目录", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(12.dp))
+            if (toc.isEmpty()) {
+                Text(
+                    "暂无目录",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(vertical = 8.dp),
+                )
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 480.dp),
+                ) {
+                    itemsIndexed(toc) { _, entry ->
+                        Row(
+                            Modifier
+                                .fillMaxWidth()
+                                .clickable { onJump(entry.page) }
+                                .padding(vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                entry.name.ifBlank { "未命名章节" },
+                                style = MaterialTheme.typography.bodyLarge,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                "第 ${entry.page} 页",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
