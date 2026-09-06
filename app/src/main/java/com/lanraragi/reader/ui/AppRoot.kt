@@ -27,6 +27,7 @@ import com.lanraragi.reader.ui.screens.CheckinScreen
 import com.lanraragi.reader.ui.screens.DetailScreen
 import com.lanraragi.reader.ui.screens.FavoritesScreen
 import com.lanraragi.reader.ui.screens.HistoryScreen
+import com.lanraragi.reader.ui.screens.LocalDetailScreen
 import com.lanraragi.reader.ui.screens.NavigationScreen
 import com.lanraragi.reader.ui.screens.OfflineScreen
 import com.lanraragi.reader.ui.screens.ReaderScreen
@@ -138,7 +139,12 @@ fun AppRoot() {
         }
 
         composable("${Routes.DETAIL}/{arcid}") { entry ->
-            DetailScreen(container, entry.arguments?.getString("arcid").orEmpty(), navController)
+            val arcid = entry.arguments?.getString("arcid").orEmpty()
+            if (arcid.startsWith("local_")) {
+                LocalDetailScreen(container, arcid, navController)
+            } else {
+                DetailScreen(container, arcid, navController)
+            }
         }
         composable("${Routes.READER}/{arcid}?page={page}") { entry ->
             ReaderScreen(
