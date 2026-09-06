@@ -10,15 +10,17 @@ import kotlinx.serialization.encodeToString
 import java.io.File
 import java.time.LocalDate
 
-/** 打开档案的历史记录。 */
+/** 打开档案的历史记录。page 为 0 起始页，pageCount 用于展示恢复进度。 */
 @Serializable
 data class HistoryEntry(
     val arcid: String,
     val title: String,
     val timestamp: Long,
+    val page: Int = 0,
+    val pageCount: Int = 0,
 )
 
-/** 打开档案历史：每次打开档案记录一条（时间戳），持久化到 filesDir/history.json。 */
+/** 打开档案历史：记录最近一次打开时间与阅读位置，持久化到 filesDir/history.json。 */
 class HistoryRepository(private val context: Context) {
 
     private val file = File(context.filesDir, "history.json")
@@ -38,17 +40,48 @@ class HistoryRepository(private val context: Context) {
         }
     }
 
-    suspend fun record(arcid: String, title: String) {
+    suspend fun record(arcid: String, title: String, page: Int = 0, pageCount: Int = 0) {
         val now = System.currentTimeMillis()
+        val safePage = page.coerceAtLeast(0)
+        val safeCount = pageCount.coerceAtLeast(0)
         val todayStart = LocalDate.now()
             .atStartOfDay(java.time.ZoneId.systemDefault())
             .toInstant().toEpochMilli()
-        // 一天内打开同一档案：合并为一条，更新时间戳为最后一次打开时间。
+        // 一天内打开同一档案：合并为一条，只更新最新时间和阅读位置。
         val todayEntry = _entries.value.firstOrNull { it.arcid == arcid && it.timestamp >= todayStart }
         _entries.value = if (todayEntry != null) {
-            _entries.value.map { if (it === todayEntry) HistoryEntry(arcid, title, now) else it }
+            _entries.value.map {
+                if (it === todayEntry) {
+                    HistoryEntry(arcid, title, now, safePage, if (safeCount > 0) safeCount else it.pageCount)
+                } else {
+                    it
+                }
+            }
         } else {
-            (listOf(HistoryEntry(arcid, title, now)) + _entries.value).take(500)
+            (listOf(HistoryEntry(arcid, title, now, safePage, safeCount)) + _entries.value).take(500)
+        }
+        persist()
+    }
+
+    /** 只更新阅读位置，不改变时间戳，避免长时间阅读把历史顺序抖动。 */
+    suspend fun recordProgress(arcid: String, page: Int, pageCount: Int = 0, title: String? = null) {
+        val safePage = page.coerceAtLeast(0)
+        val safeCount = pageCount.coerceAtLeast(0)
+        val current = _entries.value.firstOrNull { it.arcid == arcid }
+        if (current == null) {
+            record(arcid, title ?: arcid, safePage, safeCount)
+            return
+        }
+        _entries.value = _entries.value.map { entry ->
+            if (entry.arcid == arcid) {
+                entry.copy(
+                    page = safePage,
+                    pageCount = if (safeCount > 0) safeCount else entry.pageCount,
+                    title = title?.takeIf { it.isNotBlank() } ?: entry.title,
+                )
+            } else {
+                entry
+            }
         }
         persist()
     }
@@ -63,7 +96,7 @@ class HistoryRepository(private val context: Context) {
         persist()
     }
 
-    /** 最近阅读去重列表：按时间倒序取 n 个不同 arcid（title 可能过时，UI 层再补 metadata）。 */
+    /** 最近阅读去重列表：按时间倒序取 n 个不同 arcid。 */
     fun recentDeduped(n: Int): List<HistoryEntry> {
         val seen = mutableSetOf<String>()
         return _entries.value
