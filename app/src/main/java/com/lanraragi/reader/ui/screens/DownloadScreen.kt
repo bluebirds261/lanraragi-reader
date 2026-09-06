@@ -29,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
@@ -43,7 +44,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.PullToRefreshBox
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -107,7 +108,7 @@ class DownloadViewModel(private val container: AppContainer) : ViewModel() {
     fun refresh() {
         viewModelScope.launch {
             isRefreshing = true
-            // 重新扫描本地路径
+            // 重新扫描本地路径；LocalScanManager 会在文件系统签名未变化时自动跳过完整扫描。
             val settings = container.settingsRepository.settings.first()
             container.localScanManager.scan(settings.extraScanDirUris)
             // 重新加载离线索引
@@ -165,8 +166,10 @@ fun DownloadScreen(
     val serverTasks by container.jobTracker.tasks.collectAsStateWithLifecycle()
     val downloadTasks by container.downloadManager.tasks.collectAsStateWithLifecycle()
     val offlineUsage by container.offlineCache.usage.collectAsStateWithLifecycle()
-    
+
     var selectedTab by remember { mutableIntStateOf(0) } // 0: 全部, 1: 云端, 2: 本地
+    var showQueueMenu by remember { mutableStateOf(false) }
+    var showClearAllConfirm by remember { mutableStateOf(false) }
 
     val context = LocalContext.current
     val favDir = remember {
@@ -215,7 +218,48 @@ fun DownloadScreen(
                     onTabSelected = { selectedTab = it },
                     modifier = Modifier.weight(1f)
                 )
-                Spacer(Modifier.width(48.dp))
+                Box {
+                    IconButton(onClick = { showQueueMenu = true }) {
+                        Icon(Icons.Filled.Menu, contentDescription = "下载任务操作")
+                    }
+                    DropdownMenu(
+                        expanded = showQueueMenu,
+                        onDismissRequest = { showQueueMenu = false },
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("刷新") },
+                            onClick = {
+                                showQueueMenu = false
+                                vm.refresh()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("删除全部任务") },
+                            enabled = downloadTasks.isNotEmpty(),
+                            onClick = {
+                                showQueueMenu = false
+                                showClearAllConfirm = true
+                            },
+                        )
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("暂停全部") },
+                            enabled = downloadTasks.any { it.state == TaskState.WAITING || it.state == TaskState.RUNNING },
+                            onClick = {
+                                showQueueMenu = false
+                                container.downloadManager.pauseAll()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("开始全部") },
+                            enabled = downloadTasks.any { it.state == TaskState.PAUSED },
+                            onClick = {
+                                showQueueMenu = false
+                                container.downloadManager.resumeAll()
+                            },
+                        )
+                    }
+                }
             }
         },
     ) { padding ->
@@ -226,7 +270,7 @@ fun DownloadScreen(
         ) {
             // 云端下载的档案列表
             val cloudItems = index.items.mapNotNull { it.metadata }
-            
+
             // 合并列表用于“全部”页
             val allItems = (cloudItems + localArchives).sortedBy { it.title.lowercase() }
 
@@ -304,7 +348,7 @@ fun DownloadScreen(
                                     ) {
                                         ArchiveListRow(
                                             archive = item,
-                                            onClick = { navController?.navigate(Routes.reader(item.arcid)) },
+                                            onClick = { navController?.navigate(Routes.detail(item.arcid)) },
                                             isOffline = true,
                                             offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
                                         )
@@ -318,7 +362,7 @@ fun DownloadScreen(
                                     )
                                 }
                             }
-                            
+
                             if (selectedTab == 0 && favFiles.isNotEmpty()) {
                                 item { FavoriteSection(favFiles, favDir) { favFiles = it } }
                             }
@@ -356,7 +400,7 @@ fun DownloadScreen(
                                     ) {
                                         ArchiveCard(
                                             archive = item,
-                                            onClick = { navController?.navigate(Routes.reader(item.arcid)) },
+                                            onClick = { navController?.navigate(Routes.detail(item.arcid)) },
                                             compact = viewMode == "compact",
                                             isOffline = true,
                                             offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
@@ -383,6 +427,25 @@ fun DownloadScreen(
                 }
             }
         }
+    }
+
+    if (showClearAllConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearAllConfirm = false },
+            title = { Text("删除全部下载任务？") },
+            text = { Text("会取消当前下载并删除任务记录，不会删除已经完成的离线档案。") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        downloadTasks.forEach { container.downloadManager.remove(it.id) }
+                        showClearAllConfirm = false
+                    },
+                ) { Text("删除") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearAllConfirm = false }) { Text("取消") }
+            },
+        )
     }
 }
 
