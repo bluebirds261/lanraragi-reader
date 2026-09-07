@@ -1,0 +1,9 @@
+{
+  "id": 42,
+  "state": "finished",
+  "task": "run_plugin",
+  "result": {
+    "new_tags": "language:english, source:nhentai.net/g/123",
+    "title": "Pretty title"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "operation": "use_plugin",
+  "success": 1,
+  "type": "metadata",
+  "data": {
+    "new_tags": "artist:tester, source:e-hentai.org/g/1/token",
+    "title": "Scraped title",
+    "provider_extra": { "gid": 1 }
+  }
+}
