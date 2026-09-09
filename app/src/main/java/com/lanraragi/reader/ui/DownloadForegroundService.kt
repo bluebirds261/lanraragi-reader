@@ -28,8 +28,8 @@ import kotlinx.coroutines.flow.onEach
 /**
  * 下载前台服务：DownloadManager 是状态的唯一来源，本服务只做「执行器」，
  * 把进行中的任务名与百分比渲染到通知栏，并在任务完成时发一条可点击通知。
- * 进程被杀后由系统按 START_STICKY 重启，读回持久化队列展示
- * （实际下载续传受限于 work 闭包内存态，v1 仅展示队列）。
+ * 进程被杀后由系统按 START_STICKY 重启；AppContainer 会从 Room 恢复可序列化任务，
+ * runner 根据 .part 文件和 Range 协议继续执行，本服务只渲染持久队列状态。
  */
 class DownloadForegroundService : Service() {
 

@@ -25,6 +25,8 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
@@ -42,7 +44,9 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.assets.CoverState
 import com.lanraragi.reader.data.model.Archive
+import com.lanraragi.reader.di.AppContainer
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -55,17 +59,56 @@ fun ArchiveCover(
     firstPageUrl: String? = null,
     isOffline: Boolean = false,
     offlineCover: Any? = null,
+    thumbnailState: CoverState? = null,
+    thumbnailContainer: AppContainer? = null,
 ) {
-    LoadingImage(
-        model = when {
-            offlineCover != null -> offlineCover
-            isOffline -> firstPageUrl // 离线但没传文件，回退
-            else -> firstPageUrl ?: ApiClient.thumbnailUrl(archive.arcid)
-        },
-        contentDescription = null,
-        modifier = modifier,
-        contentScale = contentScale,
-    )
+    if (thumbnailContainer != null && offlineCover == null && !isOffline && firstPageUrl == null) {
+        RemoteThumbnailImage(
+            container = thumbnailContainer,
+            arcid = archive.arcid,
+            modifier = modifier,
+            contentScale = contentScale,
+        )
+        return
+    }
+    val ready = when (val state = thumbnailState) {
+        is CoverState.Ready -> state
+        is CoverState.Generating -> state.lastGood
+        is CoverState.Failed -> state.lastGood
+        else -> null
+    }
+    val remoteRequest = ready?.resource?.value
+    val waitingForRemote = thumbnailState != null &&
+        offlineCover == null &&
+        !isOffline &&
+        firstPageUrl == null &&
+        remoteRequest == null
+    if (waitingForRemote) {
+        Box(
+            modifier = modifier.background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Filled.Image,
+                contentDescription = "封面生成中",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                modifier = Modifier.size(32.dp),
+            )
+        }
+    } else {
+        LoadingImage(
+            model = when {
+                offlineCover != null -> offlineCover
+                isOffline -> firstPageUrl // 离线但没传文件，回退
+                firstPageUrl != null -> firstPageUrl
+                remoteRequest != null -> remoteRequest
+                else -> ApiClient.thumbnailUrl(archive.arcid)
+            },
+            contentDescription = null,
+            modifier = modifier,
+            contentScale = contentScale,
+        )
+    }
 }
 
 /** 网格视图卡片：松散有标题（只显示标题），紧凑无文字。 */
@@ -79,9 +122,13 @@ fun ArchiveCard(
     compact: Boolean = false,
     isOffline: Boolean = false,
     offlineCover: Any? = null,
+    thumbnailState: CoverState? = null,
+    thumbnailContainer: AppContainer? = null,
     isCached: Boolean = false,
     isFavorite: Boolean = false,
     onToggleFavorite: (() -> Unit)? = null,
+    isPinned: Boolean = false,
+    onTogglePin: (() -> Unit)? = null,
     // D2 多选：选择模式显示勾选圈；非选择模式长按进入选择
     selectionMode: Boolean = false,
     isSelected: Boolean = false,
@@ -104,8 +151,12 @@ fun ArchiveCard(
                 isCached,
                 isFavorite,
                 onToggleFavorite,
+                isPinned,
+                onTogglePin,
                 selectionMode,
                 isSelected,
+                thumbnailState,
+                thumbnailContainer,
             )
         } else {
             Column {
@@ -117,8 +168,12 @@ fun ArchiveCard(
                     isCached,
                     isFavorite,
                     onToggleFavorite,
+                    isPinned,
+                    onTogglePin,
                     selectionMode,
                     isSelected,
+                    thumbnailState,
+                    thumbnailContainer,
                 )
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 4.dp)) {
                     Text(
@@ -184,8 +239,12 @@ private fun CoverBox(
     isCached: Boolean,
     isFavorite: Boolean,
     onToggleFavorite: (() -> Unit)?,
+    isPinned: Boolean,
+    onTogglePin: (() -> Unit)?,
     selectionMode: Boolean = false,
     isSelected: Boolean = false,
+    thumbnailState: CoverState? = null,
+    thumbnailContainer: AppContainer? = null,
 ) {
     Box(Modifier.fillMaxWidth().aspectRatio(0.72f)) {
         ArchiveCover(
@@ -194,6 +253,8 @@ private fun CoverBox(
             firstPageUrl = coverUrl,
             isOffline = isOffline,
             offlineCover = offlineCover,
+            thumbnailState = thumbnailState,
+            thumbnailContainer = thumbnailContainer,
         )
         if (selectionMode) {
             SelectionCheck(
@@ -207,6 +268,8 @@ private fun CoverBox(
                 isCached = isCached,
                 isFavorite = isFavorite,
                 onToggleFavorite = onToggleFavorite,
+                isPinned = isPinned,
+                onTogglePin = onTogglePin,
                 modifier = Modifier
                     .align(Alignment.TopStart)
                     .padding(6.dp),
@@ -247,6 +310,8 @@ private fun CoverBadges(
     isCached: Boolean,
     isFavorite: Boolean,
     onToggleFavorite: (() -> Unit)?,
+    isPinned: Boolean = false,
+    onTogglePin: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -264,6 +329,22 @@ private fun CoverBadges(
                     imageVector = Icons.Filled.DownloadDone,
                     contentDescription = "已缓存",
                     tint = Color.White,
+                    modifier = Modifier.size(14.dp),
+                )
+            }
+        }
+        if (onTogglePin != null) {
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color.Black.copy(alpha = 0.42f))
+                    .clickable(onClick = onTogglePin)
+                    .padding(horizontal = 5.dp, vertical = 3.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.PushPin,
+                    contentDescription = if (isPinned) "取消固定" else "固定保存资源",
+                    tint = if (isPinned) MaterialTheme.colorScheme.tertiary else Color.White,
                     modifier = Modifier.size(14.dp),
                 )
             }
@@ -297,9 +378,13 @@ fun ArchiveListRow(
     onRequestCover: (() -> Unit)? = null,
     isOffline: Boolean = false,
     offlineCover: Any? = null,
+    thumbnailState: CoverState? = null,
+    thumbnailContainer: AppContainer? = null,
     isCached: Boolean = false,
     isFavorite: Boolean = false,
     onToggleFavorite: (() -> Unit)? = null,
+    isPinned: Boolean = false,
+    onTogglePin: (() -> Unit)? = null,
     // D2 多选：选择模式显示勾选圈；非选择模式长按进入选择
     selectionMode: Boolean = false,
     isSelected: Boolean = false,
@@ -331,6 +416,8 @@ fun ArchiveListRow(
                     firstPageUrl = coverUrl,
                     isOffline = isOffline,
                     offlineCover = offlineCover,
+                    thumbnailState = thumbnailState,
+                    thumbnailContainer = thumbnailContainer,
                 )
                 if (selectionMode) {
                     SelectionCheck(
@@ -344,6 +431,8 @@ fun ArchiveListRow(
                         isCached = isCached,
                         isFavorite = isFavorite,
                         onToggleFavorite = onToggleFavorite,
+                        isPinned = isPinned,
+                        onTogglePin = onTogglePin,
                         modifier = Modifier
                             .align(Alignment.TopStart)
                             .padding(4.dp),

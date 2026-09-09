@@ -12,27 +12,34 @@ data class LegacyImport(
     val importer: LegacyJsonImporter,
 )
 
+data class LegacyImportResult(
+    val key: String,
+    val imported: Boolean,
+)
+
 class LegacyJsonImportCoordinator(
     private val database: ReaderDatabase,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    suspend fun run(imports: List<LegacyImport>) {
-        imports.forEach { legacyImport ->
+    suspend fun run(imports: List<LegacyImport>): List<LegacyImportResult> {
+        return imports.map { legacyImport ->
             require(legacyImport.key.isNotBlank()) { "legacy import key must not be blank" }
-            database.withTransaction {
+            val imported = database.withTransaction {
                 val previous = database.legacyImportStateDao().find(legacyImport.key)
                 if (previous != null && previous.sourceVersion >= legacyImport.sourceVersion) {
-                    return@withTransaction
+                    return@withTransaction false
                 }
                 legacyImport.importer.import(database)
-                database.legacyImportStateDao().insert(
+                database.legacyImportStateDao().upsert(
                     LegacyImportStateEntity(
                         importKey = legacyImport.key,
                         sourceVersion = legacyImport.sourceVersion,
                         completedAt = clock(),
                     ),
                 )
+                true
             }
+            LegacyImportResult(legacyImport.key, imported)
         }
     }
 }

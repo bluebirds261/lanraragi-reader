@@ -51,11 +51,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
 import com.lanraragi.reader.data.HistoryEntry
-import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.EmptyBox
-import com.lanraragi.reader.ui.LoadingImage
+import com.lanraragi.reader.ui.RemoteThumbnailImage
 import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.edgeSwipeBack
 import kotlinx.coroutines.launch
@@ -108,7 +107,7 @@ fun HistoryScreen(container: AppContainer, navController: NavController) {
                         )
                     }
                     items(dayEntries, key = { it.timestamp }) { entry ->
-                        HistoryRow(entry) {
+                        HistoryRow(container, entry) {
                             navController.navigate(Routes.detail(entry.arcid))
                         }
                     }
@@ -119,7 +118,7 @@ fun HistoryScreen(container: AppContainer, navController: NavController) {
 }
 
 @Composable
-private fun HistoryRow(entry: HistoryEntry, onClick: () -> Unit) {
+private fun HistoryRow(container: AppContainer, entry: HistoryEntry, onClick: () -> Unit) {
     Card(onClick = onClick, shape = RoundedCornerShape(10.dp)) {
         Row(
             Modifier.fillMaxWidth().padding(10.dp),
@@ -131,9 +130,9 @@ private fun HistoryRow(entry: HistoryEntry, onClick: () -> Unit) {
                     .aspectRatio(0.72f)
                     .clip(RoundedCornerShape(6.dp)),
             ) {
-                LoadingImage(
-                    model = ApiClient.thumbnailUrl(entry.arcid),
-                    contentDescription = null,
+                RemoteThumbnailImage(
+                    container = container,
+                    arcid = entry.arcid,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop,
                 )

@@ -65,6 +65,7 @@ import com.lanraragi.reader.ui.EmptyBox
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.LoadingBox
 import com.lanraragi.reader.ui.LoadingImage
+import com.lanraragi.reader.ui.RemoteThumbnailImage
 import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.edgeSwipeBack
 import kotlinx.coroutines.CancellationException
@@ -236,7 +237,7 @@ fun TankoubonBrowseScreen(
                 state.membersLoading && state.members.isEmpty() -> LoadingBox()
                 state.error != null && state.members.isEmpty() -> ErrorBox(state.error!!, onRetry = { state.selected?.let { vm.openTank(it.id) } })
                 state.members.isEmpty() -> EmptyBox("该卷暂无档案\n（在档案详情页点「加入卷」添加）")
-                else -> TankDetail(state, vm, navController)
+                else -> TankDetail(container, state, vm, navController)
             }
         }
 
@@ -287,6 +288,7 @@ private fun TankWall(tanks: List<Tankoubon>, onOpen: (String) -> Unit) {
 
 @Composable
 private fun TankDetail(
+    container: AppContainer,
     state: TankoubonBrowseViewModel.UiState,
     vm: TankoubonBrowseViewModel,
     navController: NavController,
@@ -327,9 +329,9 @@ private fun TankDetail(
                                 .aspectRatio(0.72f)
                                 .clip(RoundedCornerShape(6.dp)),
                         ) {
-                            LoadingImage(
-                                model = ApiClient.thumbnailUrl(archive.arcid),
-                                contentDescription = null,
+                            RemoteThumbnailImage(
+                                container = container,
+                                arcid = archive.arcid,
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop,
                             )

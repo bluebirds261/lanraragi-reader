@@ -6,6 +6,7 @@ data class MetadataProvenance(
     val sourceUrl: String? = null,
     val confidence: Float? = null,
     val fetchedAt: Long = System.currentTimeMillis(),
+    val dataVersion: String? = null,
 ) {
     init {
         require(providerId.isNotBlank()) { "providerId must not be blank" }

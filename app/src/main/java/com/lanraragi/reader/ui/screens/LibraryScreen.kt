@@ -72,12 +72,14 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
@@ -93,11 +95,15 @@ import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
 import com.kyant.shapes.Capsule
-import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
 import com.lanraragi.reader.data.model.FilterPreset
 import com.lanraragi.reader.data.model.TagStat
+import com.lanraragi.reader.data.catalog.LibraryQuery
+import com.lanraragi.reader.data.catalog.LibrarySort
+import com.lanraragi.reader.data.catalog.SortDirection
+import com.lanraragi.reader.data.catalog.LibrarySource
+import com.lanraragi.reader.domain.model.ArchiveIdentity
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.ArchiveCard
 import com.lanraragi.reader.ui.ArchiveListRow
@@ -110,6 +116,10 @@ import com.lanraragi.reader.ui.TagFilterChip
 import com.lanraragi.reader.ui.categoryDisplayName
 import com.lanraragi.reader.ui.categoryNameError
 import com.lanraragi.reader.ui.isProtectedCategoryName
+import com.lanraragi.reader.ui.adaptive.AdaptiveLayout
+import com.lanraragi.reader.ui.adaptive.AdaptiveLayoutHost
+import com.lanraragi.reader.ui.adaptive.adaptiveLayout
+import com.lanraragi.reader.ui.library.AdaptiveLibraryDetailPane
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -125,9 +135,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import java.util.Collections
+import java.util.UUID
+import java.nio.charset.StandardCharsets
 
 private val SORT_OPTIONS = listOf(
     "title" to "标题",
@@ -158,7 +168,6 @@ data class LibraryState(
     val newOnly: Boolean = false,
     val untaggedOnly: Boolean = false,
     val columns: Int = 3,
-    val coverVersion: Int = 0,
     val presets: List<FilterPreset> = emptyList(),
     val defaultPreset: String = "",
     val showPresets: Boolean = false,
@@ -183,8 +192,6 @@ class LibraryViewModel(
 
     private val repository = container.repository
     private val query = MutableStateFlow("")
-    private val loadMutex = Mutex()
-    private var nextStart = 0
     private var categoryMutationInFlight = false
 
     private val _state = MutableStateFlow(LibraryState())
@@ -207,6 +214,24 @@ class LibraryViewModel(
                     sortby = s.gallerySortby,
                     order = s.galleryOrder,
                 )
+            }
+        }
+
+        // The coordinator is the sole owner of remote/local library request
+        // lifecycle.  This legacy screen keeps its Archive-shaped state for
+        // the existing card/batch UI, but never starts a second request path.
+        viewModelScope.launch {
+            container.libraryRequests.state.collect { request ->
+                _state.update {
+                    it.copy(
+                        items = request.items.map { entry -> entry.toLegacyArchive() },
+                        total = request.total,
+                        loading = request.loading,
+                        loadingMore = request.loadingMore,
+                        hasMore = request.hasMore,
+                        error = request.error?.message ?: request.error?.javaClass?.simpleName,
+                    )
+                }
             }
         }
 
@@ -278,12 +303,6 @@ class LibraryViewModel(
                 if (t > 0) {
                     refresh()
                 }
-            }
-        }
-
-        viewModelScope.launch {
-            CoverChangeBus.version.collect { v ->
-                _state.update { it.copy(coverVersion = v) }
             }
         }
 
@@ -360,11 +379,20 @@ class LibraryViewModel(
     }
 
     fun refresh() {
-        viewModelScope.launch {
-            if (loadPage(0, append = false)) {
-                _scrollToTop.emit(Unit)
-            }
-        }
+        val s = _state.value
+        container.libraryRequests.refresh(
+            LibraryQuery(
+                text = s.filter,
+                tags = s.selectedTags.toSet(),
+                categoryId = s.categoryId.ifBlank { null },
+                source = LibrarySource.ALL,
+                newOnly = s.newOnly,
+                untaggedOnly = s.untaggedOnly,
+                sort = s.sortby.toLibrarySort(),
+                direction = if (s.order.equals("desc", true)) SortDirection.DESC else SortDirection.ASC,
+            ),
+        )
+        viewModelScope.launch { _scrollToTop.emit(Unit) }
     }
 
     fun loadMore() {
@@ -374,9 +402,7 @@ class LibraryViewModel(
             return
         }
 
-        viewModelScope.launch {
-            loadPage(nextStart, append = true)
-        }
+        container.libraryRequests.loadMore()
     }
 
     fun setSort(v: String) {
@@ -1009,98 +1035,40 @@ class LibraryViewModel(
         setViewMode(next)
     }
 
-    private suspend fun loadPage(
-        start: Int,
-        append: Boolean,
-    ): Boolean {
-        return loadMutex.withLock {
-            val s = _state.value
+    private fun String.toLibrarySort(): LibrarySort = when (lowercase()) {
+        "lastread" -> LibrarySort.LAST_READ
+        "date_added" -> LibrarySort.DATE_ADDED
+        "artist" -> LibrarySort.ARTIST
+        "language" -> LibrarySort.LANGUAGE
+        "series" -> LibrarySort.SERIES
+        else -> LibrarySort.TITLE
+    }
 
-            if (append) {
-                _state.update {
-                    it.copy(
-                        loadingMore = true,
-                        error = null,
-                    )
-                }
-            } else {
-                _state.update {
-                    it.copy(
-                        loading = true,
-                        error = null,
-                    )
-                }
-            }
+    private fun com.lanraragi.reader.data.catalog.LibraryEntry.toLegacyArchive(): Archive = when (val sourceIdentity = identity) {
+        is ArchiveIdentity.Remote -> Archive(
+            arcid = sourceIdentity.arcid,
+            title = title,
+            tags = tags.joinToString(","),
+            isnew = if (isNew) "true" else "false",
+            pagecount = pageCount,
+            progress = progress,
+            dateadded = dateAdded,
+            summary = summary,
+            category = categoryId.orEmpty(),
+        )
+        is ArchiveIdentity.LocalSaf -> Archive(
+            arcid = "local_${UUID.nameUUIDFromBytes(sourceIdentity.uri.toByteArray(StandardCharsets.UTF_8))}",
+            title = title,
+            tags = tags.joinToString(","),
+            pagecount = pageCount,
+            summary = localUri ?: sourceIdentity.uri,
+        )
+        is ArchiveIdentity.Tankoubon -> Archive(arcid = sourceIdentity.tankId, title = title, tags = tags.joinToString(","), pagecount = pageCount, summary = summary)
+    }
 
-            try {
-                // 多个条件用逗号分隔，LANraragi 按 AND 逻辑取交集。
-                val combined =
-                    buildList {
-                        s.filter
-                            .trim()
-                            .takeIf { it.isNotEmpty() }
-                            ?.let { add(it) }
-
-                        s.selectedTags.forEach {
-                            add("$it$")
-                        }
-                    }.joinToString(",")
-
-                val r = repository.getArchives(
-                    page = start,
-                    filter = combined.ifBlank { null },
-                    sortby = s.sortby,
-                    order = s.order,
-                    categoryId = s.categoryId.ifBlank { null },
-                    newonly = s.newOnly,
-                    untaggedonly = s.untaggedOnly,
-                )
-
-                val prev = _state.value.items
-
-                val merged =
-                    if (append) {
-                        (prev + r.items).distinctBy {
-                            it.arcid
-                        }
-                    } else {
-                        r.items
-                    }
-
-                val hasMore =
-                    r.items.isNotEmpty() &&
-                            merged.size > prev.size &&
-                            (r.total == null || merged.size < r.total)
-
-                nextStart = start + r.items.size
-
-                _state.update {
-                    it.copy(
-                        items = merged,
-                        total = r.total,
-                        hasMore = hasMore,
-                        loading = false,
-                        loadingMore = false,
-                        error = null,
-                    )
-                }
-
-                true
-
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                _state.update {
-                    it.copy(
-                        loading = false,
-                        loadingMore = false,
-                        error = e.message ?: "加载失败",
-                    )
-                }
-
-                false
-            }
-        }
+    override fun onCleared() {
+        container.libraryRequests.cancel()
+        super.onCleared()
     }
 }
 
@@ -1159,6 +1127,16 @@ fun LibraryScreen(
 
     val listState = rememberLazyListState()
     val gridState = rememberLazyGridState()
+    val adaptiveLayout = adaptiveLayout(LocalConfiguration.current.screenWidthDp.dp)
+    var detailSelection by rememberSaveable { mutableStateOf<String?>(null) }
+
+    // Keep a selection keyed by archive id across refreshes/recomposition. If the
+    // selected row disappears, clear it rather than showing stale details.
+    LaunchedEffect(state.items, adaptiveLayout) {
+        if (detailSelection != null && state.items.none { it.arcid == detailSelection }) {
+            detailSelection = null
+        }
+    }
 
     LaunchedEffect(vm, state.viewMode) {
         vm.scrollToTop.collect {
@@ -1308,11 +1286,14 @@ fun LibraryScreen(
 
                     else -> {
 
-                        PullToRefreshBox(
-                            isRefreshing = state.loading,
-                            onRefresh = vm::refresh,
-                            modifier = Modifier.fillMaxSize(),
-                        ) {
+                        AdaptiveLayoutHost(
+                            layout = adaptiveLayout,
+                            master = {
+                                PullToRefreshBox(
+                                    isRefreshing = state.loading,
+                                    onRefresh = vm::refresh,
+                                    modifier = Modifier.fillMaxSize(),
+                                ) {
 
                             if (state.viewMode == "list") {
 
@@ -1363,25 +1344,21 @@ fun LibraryScreen(
                                         state.items,
                                         key = { it.arcid },
                                     ) { archive ->
-
                                         ArchiveListRow(
                                             archive = archive,
                                             onClick = if (state.selectedIds.isNotEmpty()) {
                                                 { vm.toggleSelection(archive.arcid) }
                                             } else {
                                                 {
-                                                    navController.navigate(
-                                                        Routes.detail(
-                                                            archive.arcid,
-                                                        )
-                                                    )
+                                                    if (adaptiveLayout == AdaptiveLayout.TABLET_MASTER_DETAIL) {
+                                                        detailSelection = archive.arcid
+                                                    } else navController.navigate(Routes.detail(archive.arcid))
                                                 }
                                             },
                                             selectionMode = state.selectedIds.isNotEmpty(),
                                             isSelected = archive.arcid in state.selectedIds,
                                             onLongPress = { vm.enterSelection(archive.arcid) },
-                                            coverUrl = ApiClient.thumbnailUrl(archive.arcid) +
-                                                if (state.coverVersion > 0) "?v=${state.coverVersion}" else "",
+                                            thumbnailContainer = container,
                                             isCached = archive.arcid in state.offlineArcidSet,
                                         )
                                     }
@@ -1462,25 +1439,21 @@ fun LibraryScreen(
                                         state.items,
                                         key = { it.arcid },
                                     ) { archive ->
-
                                         ArchiveCard(
                                             archive = archive,
                                             onClick = if (state.selectedIds.isNotEmpty()) {
                                                 { vm.toggleSelection(archive.arcid) }
                                             } else {
                                                 {
-                                                    navController.navigate(
-                                                        Routes.detail(
-                                                            archive.arcid,
-                                                        )
-                                                    )
+                                                    if (adaptiveLayout == AdaptiveLayout.TABLET_MASTER_DETAIL) {
+                                                        detailSelection = archive.arcid
+                                                    } else navController.navigate(Routes.detail(archive.arcid))
                                                 }
                                             },
                                             selectionMode = state.selectedIds.isNotEmpty(),
                                             isSelected = archive.arcid in state.selectedIds,
                                             onLongPress = { vm.enterSelection(archive.arcid) },
-                                            coverUrl = ApiClient.thumbnailUrl(archive.arcid) +
-                                                if (state.coverVersion > 0) "?v=${state.coverVersion}" else "",
+                                            thumbnailContainer = container,
                                             compact = compactGrid,
                                             isCached = archive.arcid in state.offlineArcidSet,
                                         )
@@ -1501,7 +1474,23 @@ fun LibraryScreen(
                                     }
                                 }
                             }
-                        }
+                                }
+                            },
+                            detail = {
+                                val selected = state.items.firstOrNull { it.arcid == detailSelection }
+                                if (selected == null) {
+                                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                        Text("选择一个档案查看详情", style = MaterialTheme.typography.bodyLarge)
+                                    }
+                                } else {
+                                    AdaptiveLibraryDetailPane(
+                                        archive = selected,
+                                        onOpenDetail = { navController.navigate(Routes.detail(selected.arcid)) },
+                                        onRead = { navController.navigate(Routes.reader(selected.arcid)) },
+                                    )
+                                }
+                            },
+                        )
                     }
                 }
             }
@@ -2806,3 +2795,35 @@ private fun viewModeLabel(v: String) =
         "compact" -> "紧凑网格"
         else -> "松散网格"
     }
+
+@Composable
+private fun LibraryDetailPane(
+    archive: Archive,
+    onOpenDetail: () -> Unit,
+    onRead: () -> Unit,
+) {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(20.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text(archive.displayTitle.ifBlank { archive.arcid }, style = MaterialTheme.typography.titleLarge)
+        if (archive.tags.isNotBlank()) {
+            Text(archive.tags, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Text(
+            if (archive.pagecount > 0) "${archive.pagecount} 页 · 已读 ${archive.progress.coerceIn(0, archive.pagecount)} 页"
+            else "页数将在本地/服务器索引可用后显示",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        if (archive.summary.isNotBlank()) {
+            Text(archive.summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            TextButton(onClick = onOpenDetail) { Text("打开详情") }
+            TextButton(onClick = onRead) { Text("开始阅读") }
+        }
+    }
+}

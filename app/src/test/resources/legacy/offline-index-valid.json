@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "arcid": "remote-one",
+      "title": "Only a projection is imported",
+      "pageCount": 12,
+      "lastAccess": 100,
+      "metadata": {"arcid": "remote-one", "pagecount": 12, "tags": "secret,not,persisted"}
+    },
+    {
+      "arcid": "remote-two",
+      "pagecount": 4,
+      "lastAccessAt": 300
+    }
+  ]
+}

@@ -25,6 +25,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.lanraragi.reader.data.model.TagStat
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.LoadingBox
@@ -53,9 +54,18 @@ fun TagStatsScreen(container: AppContainer, navController: NavController) {
             LoadingBox(Modifier.padding(padding))
         } else {
             val namespaceCount = remember(tags) {
-                tags.mapNotNull { it.namespace }.distinct().size
+                tags.mapNotNull { TagNamespaceRegistry.canonicalNamespace(it.namespace) }
+                    .distinct()
+                    .size
             }
-            val maxWeight = remember(tags) { (tags.maxOfOrNull { it.weight } ?: 0).coerceAtLeast(1) }
+            val visibleTags = remember(tags) {
+                tags.filterNot {
+                    TagNamespaceRegistry.descriptor(it.namespace)?.defaultHidden == true
+                }
+            }
+            val maxWeight = remember(visibleTags) {
+                (visibleTags.maxOfOrNull { it.weight } ?: 0).coerceAtLeast(1)
+            }
             Column(
                 Modifier
                     .fillMaxSize()
@@ -77,7 +87,10 @@ fun TagStatsScreen(container: AppContainer, navController: NavController) {
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(4.dp),
                 ) {
-                    tags.sortedByDescending { it.weight }.take(120).forEach { tag ->
+                    visibleTags.asSequence()
+                        .sortedByDescending { it.weight }
+                        .take(120)
+                        .forEach { tag ->
                         val ns = TagRules.nsOf(tag.full)
                         Text(
                             rememberTagText(ns, TagRules.valueOf(tag.full)),

@@ -1,0 +1,33 @@
+{
+  "tasks": [
+    {
+      "id": "waiting-cache",
+      "type": "OFFLINE_CACHE",
+      "arcid": "archive-a",
+      "title": "Archive A",
+      "state": "WAITING",
+      "progress": 0.45,
+      "apiKey": "must-not-be-persisted"
+    },
+    {
+      "taskId": "finished-file",
+      "taskType": "archive_file",
+      "archiveId": "archive-b",
+      "name": "Archive B",
+      "status": "DONE",
+      "completedBytes": 150,
+      "totalBytes": 100,
+      "retryCount": -3,
+      "priority": 2
+    },
+    {
+      "id": "failed-page",
+      "type": "PAGE",
+      "arcid": "archive-c",
+      "title": "Archive C",
+      "state": "FAILED",
+      "error": "remote timeout",
+      "percent": 120
+    }
+  ]
+}

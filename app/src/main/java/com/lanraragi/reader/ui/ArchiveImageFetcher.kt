@@ -4,110 +4,79 @@ import coil.ImageLoader
 import coil.annotation.ExperimentalCoilApi
 import coil.decode.DataSource
 import coil.decode.ImageSource
-import coil.disk.DiskCache
 import coil.fetch.FetchResult
 import coil.fetch.Fetcher
 import coil.fetch.SourceResult
 import coil.request.Options
+import coil.request.ImageRequest
+import coil.request.CachePolicy
 import com.lanraragi.reader.data.ArchiveFileReader
 import com.lanraragi.reader.ui.screens.ArchivePageModel
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import okio.Buffer
 import okio.buffer
 import okio.source
 
+fun ArchivePageModel.asImageRequest(): ImageRequest = ImageRequest.Builder(context)
+    .data(this)
+    .memoryCacheKey(revision ?: "archive:${archiveUri}:$pageIndex:${if (thumbnail) "thumb" else "full"}")
+    .diskCachePolicy(CachePolicy.DISABLED)
+    .build()
+
 class ArchiveImageFetcher(
     private val data: ArchivePageModel,
-    private val options: Options,
-    private val diskCache: DiskCache?,
 ) : Fetcher {
 
     @OptIn(ExperimentalCoilApi::class)
     override suspend fun fetch(): FetchResult? {
-        // A Keyer cannot query SAF metadata without blocking Coil's main-thread interceptor.
-        // Resolve the revision here on the fetcher dispatcher and never trust a URI-only key.
-        val diskCacheKey = ArchiveFileReader.imageCacheKey(
-            data.context,
-            data.archiveUri,
-            data.pageIndex,
-        )
-        val lockEntry = retainFetchLock(diskCacheKey)
+        val images = ArchiveFileReader.getImages(data.context, data.archiveUri)
+        if (data.pageIndex !in images.indices) return null
+        val entryName = images[data.pageIndex].name
+        val revision = ArchiveFileReader.localArtifactRevision(data.context, data.archiveUri, entryName)
+        val cover = data.thumbnail
+        val cacheKey = "local-derived:${if (cover) "cover" else "page"}:${revision.value}"
+        val lockEntry = retainFetchLock(cacheKey)
 
         try {
             return lockEntry.mutex.withLock {
-                readCached(diskCacheKey)?.let { return@withLock it }
-
-                val images = ArchiveFileReader.getImages(data.context, data.archiveUri)
-                if (data.pageIndex !in images.indices) return@withLock null
+                ArchiveFileReader.getDerivedImage(data.context, revision, cover)?.let { bytes ->
+                    return@withLock byteSource(bytes)
+                }
                 val stream = ArchiveFileReader.openImageStream(
                     data.context,
                     data.archiveUri,
-                    images[data.pageIndex].name,
+                    entryName,
                 ) ?: return@withLock null
-
-                val cache = diskCache
-                if (cache == null || !options.diskCachePolicy.writeEnabled) {
-                    return@withLock SourceResult(
-                        source = ImageSource(stream.source().buffer(), data.context.applicationContext),
-                        mimeType = null,
-                        dataSource = DataSource.DISK,
-                    )
-                }
-
-                val editor = cache.openEditor(diskCacheKey)
-                if (editor == null) {
-                    return@withLock SourceResult(
-                        source = ImageSource(stream.source().buffer(), data.context.applicationContext),
-                        mimeType = null,
-                        dataSource = DataSource.DISK,
-                    )
-                }
-
                 try {
                     stream.use { input ->
-                        cache.fileSystem.write(editor.metadata) {}
-                        cache.fileSystem.write(editor.data) {
-                            writeAll(input.source())
-                        }
+                        val bytes = input.readBytes()
+                        ArchiveFileReader.putDerivedImage(data.context, revision, cover, bytes)
+                        byteSource(bytes)
                     }
-                    val snapshot = editor.commitAndOpenSnapshot() ?: return@withLock null
-                    SourceResult(
-                        source = ImageSource(snapshot.data, cache.fileSystem, diskCacheKey, snapshot),
-                        mimeType = null,
-                        dataSource = DataSource.DISK,
-                    )
                 } catch (e: CancellationException) {
-                    editor.abort()
-                    throw e
-                } catch (e: Exception) {
-                    editor.abort()
                     throw e
                 }
             }
         } finally {
-            releaseFetchLock(diskCacheKey, lockEntry)
+            releaseFetchLock(cacheKey, lockEntry)
         }
     }
 
     @OptIn(ExperimentalCoilApi::class)
-    private fun readCached(diskCacheKey: String): SourceResult? {
-        if (!options.diskCachePolicy.readEnabled) return null
-        val cache = diskCache ?: return null
-        val snapshot = cache.openSnapshot(diskCacheKey) ?: return null
-        return SourceResult(
-            source = ImageSource(snapshot.data, cache.fileSystem, diskCacheKey, snapshot),
-            mimeType = null,
-            dataSource = DataSource.DISK,
-        )
-    }
+    private fun byteSource(bytes: ByteArray): SourceResult = SourceResult(
+        source = ImageSource(Buffer().write(bytes), data.context.applicationContext),
+        mimeType = null,
+        dataSource = DataSource.DISK,
+    )
 
     class Factory : Fetcher.Factory<ArchivePageModel> {
         override fun create(
             data: ArchivePageModel,
             options: Options,
             imageLoader: ImageLoader,
-        ): Fetcher = ArchiveImageFetcher(data, options, imageLoader.diskCache)
+        ): Fetcher = ArchiveImageFetcher(data)
     }
 
     private companion object {

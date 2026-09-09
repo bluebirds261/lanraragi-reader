@@ -105,7 +105,6 @@ import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.shapes.Capsule
 import com.lanraragi.reader.data.HistoryEntry
-import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.screens.DownloadScreen
 import com.lanraragi.reader.ui.screens.LibraryScreen
@@ -577,7 +576,9 @@ fun MainScreen(
 
                         SettingsScreen(
                             container = container,
-                            onBack = null
+                            onBack = null,
+                            onOpenDiagnostics = { navController.navigate(Routes.DIAGNOSTICS) },
+                            onOpenEhFavorites = { navController.navigate(Routes.EH_FAVORITES_SYNC) },
                         )
                     }
                 }
@@ -2849,6 +2850,7 @@ fun MainScreen(
                         ) {
                             items(recentItems, key = { it.arcid }) { item ->
                                 RecentCard(
+                                    container = container,
                                     item = item,
                                     onOpen = {
                                         showRecentList = false
@@ -3002,6 +3004,7 @@ private fun SingleTabItem(
 
 @Composable
 private fun RecentCard(
+    container: AppContainer,
     item: RecentItem,
     onOpen: () -> Unit,
     onRemove: () -> Unit,
@@ -3018,8 +3021,9 @@ private fun RecentCard(
                 .clip(RoundedCornerShape(10.dp))
                 .background(MaterialTheme.colorScheme.surfaceVariant),
         ) {
-            LoadingImage(
-                model = ApiClient.thumbnailUrl(item.arcid),
+            RemoteThumbnailImage(
+                container = container,
+                arcid = item.arcid,
                 contentDescription = item.title,
                 modifier = Modifier.fillMaxSize(),
             )

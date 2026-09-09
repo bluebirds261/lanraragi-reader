@@ -122,20 +122,42 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
-import com.lanraragi.reader.data.ArchiveFileReader
+import coil.request.ImageRequest
 import com.lanraragi.reader.data.AUTO_SCROLL_MAX_SECONDS
 import com.lanraragi.reader.data.AUTO_SCROLL_MIN_SECONDS
-import com.lanraragi.reader.data.DownloadTaskType
+import com.lanraragi.reader.domain.model.ArchiveIdentity
 import com.lanraragi.reader.data.autoScrollSeconds
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.download.DownloadDestination
+import com.lanraragi.reader.data.download.DownloadSourceIdentity
+import com.lanraragi.reader.data.download.DownloadTaskSpec
 import com.lanraragi.reader.data.model.TocEntry
 import com.lanraragi.reader.data.normalizeAutoScrollSpeed
+import com.lanraragi.reader.data.reader.DefaultReaderSourceResolver
+import com.lanraragi.reader.data.reader.PageModel
+import com.lanraragi.reader.data.reader.PageSourceResolver
+import com.lanraragi.reader.data.reader.PrefetchCoordinator
+import com.lanraragi.reader.data.reader.ReaderGestureArbiter
+import com.lanraragi.reader.data.ReaderOrientationProfile
+import com.lanraragi.reader.ui.reader.ReaderAction
+import com.lanraragi.reader.ui.reader.CoilPagePrefetcher
+import com.lanraragi.reader.ui.reader.ReaderControls
+import com.lanraragi.reader.ui.reader.ReaderRouteEffects
+import com.lanraragi.reader.ui.reader.ReaderSurface
+import com.lanraragi.reader.ui.reader.ReaderSurfaceMode
+import com.lanraragi.reader.ui.reader.ReaderSheets
+import com.lanraragi.reader.ui.reader.rememberReaderFrameSampler
+import com.lanraragi.reader.ui.reader.readerActionForKey
+import com.lanraragi.reader.data.reader.ReaderSession
+import com.lanraragi.reader.data.reader.SavedArchivePageSource
+import com.lanraragi.reader.domain.reader.ReaderPageMapping
 import com.lanraragi.reader.di.AppContainer
-import com.lanraragi.reader.ui.CoverChangeBus
 import com.lanraragi.reader.ui.ErrorBox
+import com.lanraragi.reader.ui.CoverChangeBus
 import com.lanraragi.reader.ui.LibraryRefreshBus
 import com.lanraragi.reader.ui.LoadingBox
 import com.lanraragi.reader.ui.edgeSwipeBack
+import com.lanraragi.reader.ui.asImageRequest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -148,7 +170,6 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
 
@@ -159,6 +180,34 @@ private fun fitContentScale(mode: String): ContentScale = when (mode) {
     "fitScreen" -> ContentScale.Fit
     "original" -> ContentScale.None
     else -> ContentScale.FillWidth
+}
+
+/** Stable identity for Compose lazy containers; never derives identity from the list position alone. */
+private fun stablePageKey(model: Any, index: Int): String = when (model) {
+    is ArchivePageModel -> "archive:${model.archiveUri}:$index"
+    is PageModel -> "${model.revision}:$index"
+    is java.io.File -> "file:${model.absolutePath}:$index"
+    else -> "page:$index:${model.toString()}"
+}
+
+@Composable
+private fun coilPageModel(model: Any): Any {
+    val context = LocalContext.current
+    return when (model) {
+        is PageModel.RemotePage -> ImageRequest.Builder(context)
+            .data(model.url)
+            .memoryCacheKey(model.cacheKey)
+            .diskCacheKey(model.cacheKey)
+            .build()
+        is PageModel.LocalEntry -> ArchivePageModel(
+            model.uri,
+            model.index,
+            context,
+            model.thumbnail,
+            model.cacheKey,
+        ).asImageRequest()
+        else -> model
+    }
 }
 
 @Composable
@@ -180,20 +229,26 @@ private fun setWindowBrightness(context: Context, value: Float) {
     context.findActivity()?.window?.let { w -> w.attributes = w.attributes.apply { screenBrightness = value } }
 }
 
-data class ArchivePageModel(val archiveUri: Uri, val pageIndex: Int, val context: Context)
+data class ArchivePageModel(
+    val archiveUri: Uri,
+    val pageIndex: Int,
+    val context: Context,
+    val thumbnail: Boolean = false,
+    val revision: String? = null,
+)
 
 class ReaderViewModel(
     private val container: AppContainer,
     private val arcid: String,
     private val initialPage: Int? = null,
 ) : ViewModel() {
+    val diagnostics = container.diagnostics
     data class UiState(
         val loading: Boolean = true,
         val error: String? = null,
         val title: String = "",
         val tags: String = "",
         val pageCount: Int = 0,
-        val onlinePages: List<String> = emptyList(),
         val offline: Boolean = false,
         val progress: Int = 0,
         val currentPage: Int = 0,
@@ -211,16 +266,69 @@ class ReaderViewModel(
         val keepScreenOn: Boolean = true,
         val volumeKeysEnabled: Boolean = true,
         val preloadLocalCount: Int = 5,
-        val localPages: List<ArchiveFileReader.ArchiveEntry> = emptyList(),
         val toc: List<TocEntry> = emptyList(),
+        val pageSourceRevision: String? = null,
+        val firstPageAlone: Boolean = false,
     )
 
     private val _state = MutableStateFlow(UiState())
     val state = _state.asStateFlow()
     private var syncJob: Job? = null
     private var lastSynced = -1
+    private var metadataReady = false
+    private var pendingInitialPage = initialPage?.coerceAtLeast(0) ?: 0
+    private var orientationProfile = ReaderOrientationProfile.GLOBAL
+    /** Shared page-source/session owner; legacy metadata state remains in this VM for compatibility. */
+    private val readerSession = ReaderSession(
+        resolver = DefaultReaderSourceResolver(
+            PageSourceResolver(
+                container.context,
+                container.repository,
+                container.offlineCache,
+                container.savedArtifactRepository,
+            ),
+        ),
+        scope = viewModelScope,
+        diagnostics = container.diagnostics,
+    )
+    private val prefetchCoordinator = PrefetchCoordinator(viewModelScope)
+    private val pagePrefetcher = CoilPagePrefetcher(container.context)
 
     init {
+        val localUri = if (arcid.startsWith("local_")) {
+            container.localScanManager.localArchives.value
+                .firstOrNull { it.arcid == arcid }
+                ?.summary
+                ?.let(Uri::parse)
+        } else null
+        val identity = if (localUri != null) {
+            ArchiveIdentity.LocalSaf(localUri.toString())
+        } else {
+            ArchiveIdentity.Remote(arcid, ApiClient.config.baseUrl)
+        }
+        readerSession.open(identity, localUri, initialPage ?: 0)
+        viewModelScope.launch {
+            readerSession.state.collect { session ->
+                val source = session.source
+                val resolvedPage = source?.let {
+                    pendingInitialPage.coerceIn(0, (it.pageCount - 1).coerceAtLeast(0))
+                } ?: session.currentPage
+                if (source != null && session.currentPage != resolvedPage) {
+                    readerSession.setPage(resolvedPage)
+                }
+                _state.update { state ->
+                    state.copy(
+                        pageCount = source?.pageCount ?: state.pageCount,
+                        pageSourceRevision = source?.revision ?: state.pageSourceRevision,
+                        offline = source is SavedArchivePageSource ||
+                            (source?.identity !is ArchiveIdentity.Remote && source != null),
+                        currentPage = resolvedPage,
+                        loading = !metadataReady || session.loading,
+                        error = session.error ?: state.error,
+                    )
+                }
+            }
+        }
         load()
         viewModelScope.launch { container.settingsRepository.setLastReadArcId(arcid) }
     }
@@ -230,15 +338,38 @@ class ReaderViewModel(
             _state.update { it.copy(loading = true, error = null) }
             try {
                 val settings = container.settingsRepository.settings.first()
+                val orientationProfile = if (container.context.resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) {
+                    ReaderOrientationProfile.LANDSCAPE
+                } else ReaderOrientationProfile.PORTRAIT
+                this@ReaderViewModel.orientationProfile = orientationProfile
                 _state.update {
                     it.copy(
-                        readerMode = settings.readerMode,
+                        readerMode = when (orientationProfile) {
+                            ReaderOrientationProfile.LANDSCAPE -> settings.readerModeLandscape ?: settings.readerMode
+                            ReaderOrientationProfile.PORTRAIT -> settings.readerModePortrait ?: settings.readerMode
+                            ReaderOrientationProfile.GLOBAL -> settings.readerMode
+                        },
                         multiPageCount = settings.multiPageCount,
                         autoDoublePageLandscape = settings.autoDoublePageLandscape,
                         preloadOnlineCount = settings.preloadOnlineCount,
-                        readingDirection = settings.readingDirection,
+                        readingDirection = when (orientationProfile) {
+                            ReaderOrientationProfile.LANDSCAPE -> settings.readingDirectionLandscape ?: settings.readingDirection
+                            ReaderOrientationProfile.PORTRAIT -> settings.readingDirectionPortrait ?: settings.readingDirection
+                            ReaderOrientationProfile.GLOBAL -> settings.readingDirection
+                        },
                         autoScrollSpeed = settings.autoScrollSpeed,
-                        readerFitMode = settings.readerFitMode,
+                        readerFitMode = when (orientationProfile) {
+                            ReaderOrientationProfile.LANDSCAPE -> settings.readerFitModeLandscape ?: settings.readerFitMode
+                            ReaderOrientationProfile.PORTRAIT -> settings.readerFitModePortrait ?: settings.readerFitMode
+                            ReaderOrientationProfile.GLOBAL -> settings.readerFitMode
+                        },
+                        firstPageAlone = when (orientationProfile) {
+                            ReaderOrientationProfile.LANDSCAPE -> settings.doublePageFirstPageAloneLandscape
+                                ?: settings.doublePageFirstPageAlone
+                            ReaderOrientationProfile.PORTRAIT -> settings.doublePageFirstPageAlonePortrait
+                                ?: settings.doublePageFirstPageAlone
+                            ReaderOrientationProfile.GLOBAL -> settings.doublePageFirstPageAlone
+                        },
                         readerBackground = settings.readerBackground,
                         readerBrightness = settings.readerBrightness,
                         tapZonesEnabled = settings.tapZonesEnabled,
@@ -254,73 +385,55 @@ class ReaderViewModel(
                 if (arcid.startsWith("local_")) {
                     val local = container.localScanManager.localArchives.value.find { it.arcid == arcid }
                         ?: throw Exception("本地文件未找到")
-                    val images = ArchiveFileReader.getImages(container.context, Uri.parse(local.summary))
                     _state.update {
                         it.copy(
                             offline = true,
-                            pageCount = images.size,
-                            localPages = images,
                             title = local.title,
-                            currentPage = requestedPage.coerceIn(0, (images.size - 1).coerceAtLeast(0)),
-                            loading = false,
                         )
                     }
+                    pendingInitialPage = requestedPage
                 } else {
                     val cached = container.offlineCache.cached(arcid)
-                    val offlineFile = container.offlineCache.archiveFile(arcid)
-                    if (offlineFile.exists()) {
-                        val images = ArchiveFileReader.getImages(container.context, Uri.fromFile(offlineFile))
+                    if (cached != null) {
                         val cachedProgress = savedPage.takeIf { it > 0 }
                             ?: cached?.metadata?.progress?.minus(1)?.coerceAtLeast(0) ?: 0
                         _state.update {
                             it.copy(
                                 offline = true,
-                                pageCount = images.size,
-                                localPages = images,
                                 title = cached?.title ?: "",
                                 tags = cached?.metadata?.tags ?: "",
                                 toc = cached?.metadata?.toc ?: emptyList(),
-                                currentPage = cachedProgress.coerceIn(0, (images.size - 1).coerceAtLeast(0)),
-                                loading = false,
                             )
                         }
-                    } else if (cached != null && cached.pageCount > 0) {
-                        val cachedProgress = savedPage.takeIf { it > 0 }
-                            ?: cached.metadata?.progress?.minus(1)?.coerceAtLeast(0)
-                            ?: 0
-                        _state.update {
-                            it.copy(
-                                offline = true,
-                                pageCount = cached.pageCount,
-                                title = cached.title,
-                                tags = cached.metadata?.tags ?: "",
-                                toc = cached.metadata?.toc ?: emptyList(),
-                                currentPage = cachedProgress.coerceIn(0, cached.pageCount - 1),
-                                loading = false,
-                            )
-                        }
+                        pendingInitialPage = cachedProgress
                     } else {
                         val meta = container.repository.getMetadata(arcid)
-                        val pageUrls = container.repository.getPageUrls(arcid)
-                        val serverProgress = meta.progress.minus(1).coerceIn(0, (pageUrls.size - 1).coerceAtLeast(0))
-                        val start = initialPage?.coerceIn(0, (pageUrls.size - 1).coerceAtLeast(0))
-                            ?: savedPage.coerceIn(0, (pageUrls.size - 1).coerceAtLeast(0))
+                        val serverProgress = meta.progress.minus(1).coerceAtLeast(0)
+                        val start = initialPage?.coerceAtLeast(0)
+                            ?: savedPage.coerceAtLeast(0)
                                 .takeIf { savedPage > 0 }
                             ?: serverProgress
                         _state.update {
                             it.copy(
                                 offline = false,
-                                pageCount = pageUrls.size,
-                                onlinePages = pageUrls,
                                 title = meta.title,
                                 tags = meta.tags,
                                 progress = meta.progress,
                                 toc = meta.toc,
-                                currentPage = start,
-                                loading = false,
                             )
                         }
+                        pendingInitialPage = start
                     }
+                }
+                metadataReady = true
+                val session = readerSession.state.value
+                _state.update {
+                    it.copy(
+                        pageCount = session.pageCount,
+                        currentPage = pendingInitialPage.coerceIn(0, (session.pageCount - 1).coerceAtLeast(0)),
+                        loading = session.loading || session.source == null,
+                        error = session.error ?: it.error,
+                    )
                 }
                 val loaded = _state.value
                 container.historyRepository.record(arcid, loaded.title, loaded.currentPage, loaded.pageCount)
@@ -332,26 +445,42 @@ class ReaderViewModel(
         }
     }
 
-    fun pageModel(index: Int): Any {
-        val s = _state.value
-        return when {
-            s.offline && s.localPages.isNotEmpty() -> {
-                val uri = if (arcid.startsWith("local_")) {
-                    Uri.parse(container.localScanManager.localArchives.value.find { it.arcid == arcid }?.summary ?: "")
-                } else {
-                    Uri.fromFile(container.offlineCache.archiveFile(arcid))
-                }
-                ArchivePageModel(uri, index, container.context)
+    fun applyOrientation(orientation: Int) {
+        viewModelScope.launch {
+            val settings = container.settingsRepository.settings.first()
+            val landscape = orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+            orientationProfile = if (landscape) ReaderOrientationProfile.LANDSCAPE else ReaderOrientationProfile.PORTRAIT
+            _state.update { state ->
+                state.copy(
+                    readerMode = if (landscape) settings.readerModeLandscape ?: settings.readerMode else settings.readerModePortrait ?: settings.readerMode,
+                    readingDirection = if (landscape) settings.readingDirectionLandscape ?: settings.readingDirection else settings.readingDirectionPortrait ?: settings.readingDirection,
+                    readerFitMode = if (landscape) settings.readerFitModeLandscape ?: settings.readerFitMode else settings.readerFitModePortrait ?: settings.readerFitMode,
+                    firstPageAlone = if (landscape) settings.doublePageFirstPageAloneLandscape
+                        ?: settings.doublePageFirstPageAlone
+                    else settings.doublePageFirstPageAlonePortrait ?: settings.doublePageFirstPageAlone,
+                )
             }
-            s.offline -> container.offlineCache.pageFile(arcid, index)
-            else -> s.onlinePages[index]
         }
     }
+
+    fun pageModel(index: Int): PageModel = readerSession.state.value.source?.pageModel(index)
+        ?: throw IllegalStateException("页面源尚未就绪")
 
     fun reportPage(page: Int) {
         val s = _state.value
         if (page !in 0 until s.pageCount) return
         _state.update { it.copy(currentPage = page) }
+        readerSession.setPage(page)
+        val source = readerSession.state.value.source
+        if (source != null) {
+            prefetchCoordinator.updateModels(
+                center = page,
+                pageCount = s.pageCount,
+                radius = if (s.offline) s.preloadLocalCount else s.preloadOnlineCount,
+                model = source::pageModel,
+                prefetcher = pagePrefetcher,
+            )
+        }
         viewModelScope.launch { container.historyRepository.recordProgress(arcid, page, s.pageCount, s.title) }
         if (s.offline) return
         syncJob?.cancel()
@@ -360,7 +489,7 @@ class ReaderViewModel(
             val p = _state.value.currentPage
             if (p >= 0 && p != lastSynced) {
                 lastSynced = p
-                runCatching { container.repository.setProgress(arcid, p + 1) }
+                container.progressWriter.record(ArchiveIdentity.Remote(arcid), p, _state.value.pageCount)
             }
         }
     }
@@ -404,23 +533,48 @@ class ReaderViewModel(
         if (s.pageCount <= 0) return
         val idx = (page ?: s.currentPage).coerceIn(0, s.pageCount - 1)
         val appContext = context.applicationContext
-        container.downloadManager.enqueue(DownloadTaskType.PAGE, arcid, "第 ${idx + 1} 页") {
-            val dir = File(
-                appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: appContext.filesDir,
-                "收藏",
-            )
-            dir.mkdirs()
-            val dest = File(dir, "${arcid}_${idx + 1}.jpg")
-            if (s.offline) {
-                container.offlineCache.pageFile(arcid, idx).copyTo(dest, overwrite = true)
-            } else {
-                ApiClient.okHttpClient.newCall(Request.Builder().url(s.onlinePages[idx]).build()).execute().use { resp ->
-                    if (!resp.isSuccessful) throw IllegalStateException("下载失败 HTTP ${resp.code}")
-                    resp.body?.byteStream()?.use { input -> FileOutputStream(dest).use { out -> input.copyTo(out) } }
+        val dir = File(
+            appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: appContext.filesDir,
+            "收藏",
+        )
+        dir.mkdirs()
+        val destination = File(dir, "${arcid}_${idx + 1}.jpg")
+
+        if (s.offline) {
+            // Local/previously saved archives are exported locally and never enter a server task.
+            viewModelScope.launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        when (val model = pageModel(idx)) {
+                            is PageModel.LocalEntry -> {
+                                val input = com.lanraragi.reader.data.ArchiveFileReader
+                                    .openImageStream(appContext, model.uri, model.entryName)
+                                    ?: throw IllegalStateException("无法读取本地页面")
+                                input.use { source ->
+                                    FileOutputStream(destination).use { output -> source.copyTo(output) }
+                                }
+                            }
+                            else -> throw IllegalStateException("离线页面不可用")
+                        }
+                    }
+                    Toast.makeText(appContext, "已保存到收藏文件夹", Toast.LENGTH_SHORT).show()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Toast.makeText(appContext, e.message ?: "保存页面失败", Toast.LENGTH_SHORT).show()
                 }
             }
-            withContext(Dispatchers.Main) { Toast.makeText(appContext, "已收藏到收藏文件夹", Toast.LENGTH_SHORT).show() }
+            return
         }
+
+        container.downloadManager.enqueue(
+            DownloadTaskSpec.Page(
+                source = DownloadSourceIdentity(arcid, ApiClient.config.baseUrl),
+                destination = DownloadDestination(destination.absolutePath),
+                page = idx,
+                label = "第 ${idx + 1} 页",
+            ),
+        )
         Toast.makeText(context, "已加入下载队列", Toast.LENGTH_SHORT).show()
     }
 
@@ -429,6 +583,7 @@ class ReaderViewModel(
         viewModelScope.launch {
             try {
                 container.repository.setThumbnailFromPage(arcid, page.coerceAtLeast(1))
+                container.thumbnailRepository.refreshCover(arcid)
                 CoverChangeBus.version.value++
                 LibraryRefreshBus.tick.value++
                 Toast.makeText(container.context, "封面已更新", Toast.LENGTH_SHORT).show()
@@ -442,17 +597,22 @@ class ReaderViewModel(
 
     fun setReaderMode(mode: String) {
         _state.update { it.copy(readerMode = mode) }
-        viewModelScope.launch { container.settingsRepository.setReaderMode(mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderModeForOrientation(orientationProfile, mode) }
     }
 
     fun setReaderFitMode(mode: String) {
         _state.update { it.copy(readerFitMode = mode) }
-        viewModelScope.launch { container.settingsRepository.setReaderFitMode(mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderFitModeForOrientation(orientationProfile, mode) }
     }
 
     fun setReadingDirection(direction: String) {
         _state.update { it.copy(readingDirection = direction) }
-        viewModelScope.launch { container.settingsRepository.setReadingDirection(direction) }
+        viewModelScope.launch { container.settingsRepository.setReadingDirectionForOrientation(orientationProfile, direction) }
+    }
+
+    fun setFirstPageAlone(enabled: Boolean) {
+        _state.update { it.copy(firstPageAlone = enabled) }
+        viewModelScope.launch { container.settingsRepository.setFirstPageAloneForOrientation(orientationProfile, enabled) }
     }
 
     fun setReaderBrightness(n: Int) {
@@ -477,13 +637,13 @@ class ReaderViewModel(
 
     override fun onCleared() {
         syncJob?.cancel()
+        prefetchCoordinator.cancel()
+        readerSession.close()
         val s = _state.value
         val page = if (s.currentPage in 0 until s.pageCount) s.currentPage + 1 else null
         if (page == null || arcid.startsWith("local_")) return
         container.applicationScope.launch {
-            try { container.repository.setProgress(arcid, page) }
-            catch (e: CancellationException) { throw e }
-            catch (_: Exception) { container.pendingProgress.record(arcid, page) }
+            container.progressWriter.record(ArchiveIdentity.Remote(arcid), page - 1, s.pageCount)
         }
     }
 }
@@ -495,14 +655,7 @@ fun ReaderScreen(container: AppContainer, arcid: String, navController: NavContr
     val context = LocalContext.current
     val view = LocalView.current
 
-    DisposableEffect(view) {
-        val window = context.findActivity()?.window
-        val insetsController = window?.let { WindowInsetsControllerCompat(it, view) }
-        insetsController?.hide(WindowInsetsCompat.Type.statusBars())
-        onDispose {
-            insetsController?.show(WindowInsetsCompat.Type.statusBars())
-        }
-    }
+    ReaderRouteEffects(context, view)
 
     Box(
         Modifier
@@ -533,6 +686,7 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
     val context = LocalContext.current
     val view = LocalView.current
     val focusRequester = remember { FocusRequester() }
+    rememberReaderFrameSampler(vm.diagnostics)
 
     fun touch() { showUi = true; lastInteraction = System.currentTimeMillis() }
 
@@ -545,18 +699,27 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
 
     val bgColor = readerBackgroundColor(state.readerBackground)
     val fitScale = fitContentScale(state.readerFitMode)
-    val models = remember(state.pageCount, state.offline, state.onlinePages) { (0 until state.pageCount).map(vm::pageModel) }
+    val models = remember(state.pageCount, state.offline, state.pageSourceRevision) {
+        (0 until state.pageCount).map(vm::pageModel)
+    }
     val reverse = state.readingDirection == "rtl"
     val configuration = LocalConfiguration.current
     val isLandscape = configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE
+    LaunchedEffect(configuration.orientation) { vm.applyOrientation(configuration.orientation) }
     val pagesPerScreen = when {
         state.readerMode == "multi" -> state.multiPageCount
         state.readerMode == "single" && state.autoDoublePageLandscape && isLandscape -> 2
         else -> 1
     }
     val preloadCount = if (state.offline) state.preloadLocalCount else state.preloadOnlineCount
-    val screens = ((models.size + pagesPerScreen - 1) / pagesPerScreen).coerceAtLeast(1)
-    val startScreen = (state.currentPage / pagesPerScreen).coerceIn(0, screens - 1)
+    val firstPageAlone = state.firstPageAlone && pagesPerScreen > 1
+    val screens = ReaderPageMapping.screenCount(models.size, pagesPerScreen, firstPageAlone).coerceAtLeast(1)
+    val startScreen = ReaderPageMapping.pageToScreen(
+        state.currentPage,
+        models.size,
+        pagesPerScreen,
+        firstPageAlone,
+    ).coerceIn(0, screens - 1)
     val listState = key(state.readerMode) {
         rememberLazyListState(initialFirstVisibleItemIndex = state.currentPage)
     }
@@ -605,15 +768,28 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
 
     fun jumpTo(idx: Int, revealUi: Boolean = true) {
         val page = idx.coerceIn(0, (state.pageCount - 1).coerceAtLeast(0))
-        scope.launch { if (state.readerMode == "continuous") listState.animateScrollToItem(page) else pagerState.animateScrollToPage(page / pagesPerScreen) }
+        scope.launch {
+            if (state.readerMode == "continuous") listState.animateScrollToItem(page)
+            else pagerState.animateScrollToPage(
+                ReaderPageMapping.pageToScreen(page, state.pageCount, pagesPerScreen, firstPageAlone),
+            )
+        }
         vm.reportPage(page)
         if (revealUi) touch()
     }
     fun stepScreen(delta: Int, revealUi: Boolean = true) {
-        jumpTo(
-            state.currentPage + delta * if (state.readerMode == "continuous") 1 else pagesPerScreen,
-            revealUi,
-        )
+        if (state.readerMode == "continuous") {
+            jumpTo(state.currentPage + delta, revealUi)
+        } else {
+            val screen = ReaderPageMapping.pageToScreen(
+                state.currentPage, state.pageCount, pagesPerScreen, firstPageAlone,
+            )
+            val target = (screen + delta).coerceIn(0, screens - 1)
+            jumpTo(
+                ReaderPageMapping.screenToFirstPage(target, state.pageCount, pagesPerScreen, firstPageAlone),
+                revealUi,
+            )
+        }
     }
     fun openPageMenu(idx: Int) { touch(); pageMenuIndex = idx }
 
@@ -624,11 +800,30 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
             .focusRequester(focusRequester)
             .focusable()
             .onPreviewKeyEvent { event ->
-                if (!state.volumeKeysEnabled || event.type != KeyEventType.KeyDown) false
-                else when (event.key) { Key.VolumeUp -> { stepScreen(-1); true }; Key.VolumeDown -> { stepScreen(1); true }; else -> false }
+                if (event.type != KeyEventType.KeyDown) {
+                    false
+                } else {
+                    when (readerActionForKey(event.key, state.volumeKeysEnabled)) {
+                        ReaderAction.Previous -> {
+                            stepScreen(-1)
+                            true
+                        }
+                        ReaderAction.Next -> {
+                            stepScreen(1)
+                            true
+                        }
+                        null -> false
+                    }
+                }
             },
     ) {
-        if (state.readerMode == "continuous") {
+        ReaderSurface(
+            mode = when {
+                state.readerMode == "continuous" -> ReaderSurfaceMode.CONTINUOUS
+                state.readingDirection == "ttb" -> ReaderSurfaceMode.VERTICAL_PAGED
+                else -> ReaderSurfaceMode.HORIZONTAL_PAGED
+            },
+            continuous = {
             ContinuousReader(
                 listState,
                 models,
@@ -636,45 +831,39 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
                 vm::reportPage,
                 { if (showUi) showUi = false else touch() },
                 ::openPageMenu,
-            )
-        } else if (state.readingDirection == "ttb") {
+            ) },
+            verticalPaged = {
             VerticalPagedReader(
                 pagerState,
                 models,
                 pagesPerScreen,
+                firstPageAlone,
                 preloadCount,
                 fitScale,
                 state.tapZonesEnabled,
                 vm::reportPage,
                 { if (showUi) showUi = false else touch() },
                 ::openPageMenu,
-            )
-        } else {
+            ) },
+            horizontalPaged = {
             HorizontalReader(
                 pagerState,
                 models,
                 reverse,
                 pagesPerScreen,
+                firstPageAlone,
                 preloadCount,
                 fitScale,
                 state.tapZonesEnabled,
                 vm::reportPage,
                 { if (showUi) showUi = false else touch() },
                 ::openPageMenu,
-            )
-        }
+            ) },
+        )
 
-        AnimatedVisibility(
+        ReaderControls(
             visible = showUi,
             modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding(),
-            enter = slideInVertically(
-                initialOffsetY = { it },
-                animationSpec = tween(durationMillis = 140),
-            ) + fadeIn(animationSpec = tween(durationMillis = 100)),
-            exit = slideOutVertically(
-                targetOffsetY = { it },
-                animationSpec = tween(durationMillis = 120),
-            ) + fadeOut(animationSpec = tween(durationMillis = 100)),
         ) {
             ReaderTimeline(
                 currentPage = state.currentPage,
@@ -693,28 +882,32 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
         }
     }
 
-    if (showToc) TocSheet(
-        state.toc,
-        state.currentPage,
-        state.offline,
-        { jumpTo(it - 1); showToc = false },
-        { vm.addToc(it); showToc = false; touch() },
-        { vm.deleteToc(it); touch() },
-    ) { showToc = false; touch() }
-    if (showSettings) ReaderSettingsSheet(state, vm, { showSettings = false; touch() }, ::touch)
-    if (showAutoPage) {
-        AutoPageSheet(state, vm, { showAutoPage = false; touch() }, ::touch)
-    }
-    if (showHistory) {
+    ReaderSheets(
+        tocVisible = showToc,
+        settingsVisible = showSettings,
+        autoPageVisible = showAutoPage,
+        historyVisible = showHistory,
+        infoVisible = showInfo,
+        pageMenuVisible = pageMenuIndex != null,
+        toc = { TocSheet(
+            state.toc,
+            state.currentPage,
+            state.offline,
+            { jumpTo(it - 1); showToc = false },
+            { vm.addToc(it); showToc = false; touch() },
+            { vm.deleteToc(it); touch() },
+        ) { showToc = false; touch() } },
+        settings = { ReaderSettingsSheet(state, vm, { showSettings = false; touch() }, ::touch) },
+        autoPage = { AutoPageSheet(state, vm, { showAutoPage = false; touch() }, ::touch) },
+        history = {
         AlertDialog(onDismissRequest = { showHistory = false; touch() }, title = { Text("阅读进度") },
             text = { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text(state.title.ifBlank { arcid }, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 Text("当前第 ${state.currentPage + 1} / ${state.pageCount} 页")
                 Text(if (state.offline) "当前使用本地/离线资源" else "当前使用服务器资源", color = MaterialTheme.colorScheme.onSurfaceVariant)
             } },
-            confirmButton = { TextButton(onClick = { showHistory = false; touch() }) { Text("关闭") } })
-    }
-    if (showInfo) {
+            confirmButton = { TextButton(onClick = { showHistory = false; touch() }) { Text("关闭") } }) },
+        info = {
         AlertDialog(
             onDismissRequest = { showInfo = false; touch() },
             title = { Text(state.title.ifBlank { "原档信息" }) },
@@ -727,14 +920,14 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
                 }
             },
             confirmButton = { TextButton(onClick = { showInfo = false; touch() }) { Text("关闭") } },
-        )
-    }
-    pageMenuIndex?.let { menuIdx ->
+        ) },
+        pageMenu = { pageMenuIndex?.let { menuIdx ->
         PageMenuSheet(menuIdx + 1, state.offline,
             { vm.downloadCurrentPage(context, menuIdx); pageMenuIndex = null; touch() },
             {
-                if (!state.offline && menuIdx in state.onlinePages.indices) {
-                    val url = ApiClient.displayBaseUrl().trimEnd('/') + "/" + state.onlinePages[menuIdx].removePrefix(ApiClient.SENTINEL_BASE)
+                val pageModel = runCatching { vm.pageModel(menuIdx) }.getOrNull()
+                if (!state.offline && pageModel is PageModel.RemotePage) {
+                    val url = ApiClient.displayBaseUrl().trimEnd('/') + "/" + pageModel.url.removePrefix(ApiClient.SENTINEL_BASE)
                     context.getSystemService(ClipboardManager::class.java)?.setPrimaryClip(ClipData.newPlainText("页面链接", url))
                     Toast.makeText(context, "已复制链接", Toast.LENGTH_SHORT).show()
                 }
@@ -743,14 +936,19 @@ private fun ReaderContent(vm: ReaderViewModel, state: ReaderViewModel.UiState, a
             { vm.setCoverFromPage(menuIdx + 1); pageMenuIndex = null; touch() },
             { pageMenuIndex = null; showInfo = true; touch() },
             { pageMenuIndex = null; touch() })
-    }
+        } },
+    )
     LaunchedEffect(Unit, showUi) { focusRequester.requestFocus() }
 }
 
 @Composable
 private fun ContinuousReader(listState: LazyListState, models: List<Any>, fitScale: ContentScale, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
     LaunchedEffect(listState) { snapshotFlow { listState.firstVisibleItemIndex }.distinctUntilChanged().collect { onPage(it) } }
-    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) { itemsIndexed(models) { index, model -> ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, { _ -> onToggleUi() }) { onPageLongPress(index) } } }
+    LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+        itemsIndexed(models, key = { index, model -> stablePageKey(model, index) }) { index, model ->
+            ZoomablePage(model, Modifier.fillMaxWidth(), fitScale, false, { _ -> onToggleUi() }) { onPageLongPress(index) }
+        }
+    }
 }
 
 @Composable
@@ -758,6 +956,7 @@ private fun VerticalPagedReader(
     pagerState: PagerState,
     models: List<Any>,
     pagesPerScreen: Int,
+    firstPageAlone: Boolean,
     preloadCount: Int,
     fitScale: ContentScale,
     tapZonesEnabled: Boolean,
@@ -769,16 +968,19 @@ private fun VerticalPagedReader(
     LaunchedEffect(pagerState, pagesPerScreen) {
         snapshotFlow { pagerState.settledPage }
             .distinctUntilChanged()
-            .collect { onPage(it * pagesPerScreen) }
+            .collect {
+                onPage(ReaderPageMapping.screenToFirstPage(it, models.size, pagesPerScreen, firstPageAlone))
+            }
     }
     VerticalPager(
         state = pagerState,
         beyondViewportPageCount = preloadCount,
         modifier = Modifier.fillMaxSize(),
     ) { screen ->
-        val start = screen * pagesPerScreen
+        val start = ReaderPageMapping.screenToFirstPage(screen, models.size, pagesPerScreen, firstPageAlone)
         Row(Modifier.fillMaxSize()) {
-            repeat(pagesPerScreen) { i ->
+            val count = if (firstPageAlone && screen == 0) 1 else pagesPerScreen
+            repeat(count) { i ->
                 val idx = start + i
                 if (idx < models.size) {
                     Box(Modifier.weight(1f).fillMaxSize()) {
@@ -815,13 +1017,18 @@ private fun VerticalPagedReader(
 }
 
 @Composable
-private fun HorizontalReader(pagerState: PagerState, models: List<Any>, reverse: Boolean, pagesPerScreen: Int, preloadCount: Int, fitScale: ContentScale, tapZonesEnabled: Boolean, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
+private fun HorizontalReader(pagerState: PagerState, models: List<Any>, reverse: Boolean, pagesPerScreen: Int, firstPageAlone: Boolean, preloadCount: Int, fitScale: ContentScale, tapZonesEnabled: Boolean, onPage: (Int) -> Unit, onToggleUi: () -> Unit, onPageLongPress: (Int) -> Unit) {
     val scope = rememberCoroutineScope()
-    LaunchedEffect(pagerState, pagesPerScreen) { snapshotFlow { pagerState.settledPage }.distinctUntilChanged().collect { onPage(it * pagesPerScreen) } }
+    LaunchedEffect(pagerState, pagesPerScreen, firstPageAlone) {
+        snapshotFlow { pagerState.settledPage }.distinctUntilChanged().collect {
+            onPage(ReaderPageMapping.screenToFirstPage(it, models.size, pagesPerScreen, firstPageAlone))
+        }
+    }
     HorizontalPager(state = pagerState, reverseLayout = reverse, beyondViewportPageCount = preloadCount, modifier = Modifier.fillMaxSize()) { screen ->
-        val start = screen * pagesPerScreen
+        val start = ReaderPageMapping.screenToFirstPage(screen, models.size, pagesPerScreen, firstPageAlone)
         Row(Modifier.fillMaxSize()) {
-            repeat(pagesPerScreen) { i ->
+            val count = if (firstPageAlone && screen == 0) 1 else pagesPerScreen
+            repeat(count) { i ->
                 val idx = start + i
                 if (idx < models.size) Box(Modifier.weight(1f).fillMaxSize()) {
                     ZoomablePage(models[idx], Modifier.fillMaxSize(), fitScale, tapZonesEnabled, { region ->
@@ -847,8 +1054,10 @@ private fun ZoomablePage(
     verticalTapZones: Boolean = false,
     onLongPress: (() -> Unit)? = null,
 ) {
+    val imageModel = coilPageModel(model)
     val scale = remember(model) { mutableFloatStateOf(1f) }
     val offset = remember(model) { mutableStateOf(Offset.Zero) }
+    val gestureArbiter = remember(model) { ReaderGestureArbiter() }
     val tapZonesEnabledState = rememberUpdatedState(tapZonesEnabled)
     val verticalTapZonesState = rememberUpdatedState(verticalTapZones)
     val onTapRegionState = rememberUpdatedState(onTapRegion)
@@ -873,23 +1082,31 @@ private fun ZoomablePage(
             if (scale.floatValue > 1f) {
                 scale.floatValue = 1f
                 offset.value = Offset.Zero
+                gestureArbiter.resetZoom()
             } else {
                 scale.floatValue = 2f
                 offset.value = Offset.Zero
+                gestureArbiter.applyZoom(2f)
             }
         }, onLongPress = { if (scale.floatValue <= 1f) onLongPressState.value?.invoke() })
     }.pointerInput(model) {
         awaitEachGesture {
             awaitFirstDown(requireUnconsumed = false)
+            gestureArbiter.resetZoom()
+            if (scale.floatValue > 1f) gestureArbiter.applyZoom(scale.floatValue)
+            gestureArbiter.begin()
             var ownsGesture = scale.floatValue > 1f
             do {
                 val event = awaitPointerEvent()
                 val pressedPointers = event.changes.count { it.pressed }
-                if (pressedPointers >= 2) ownsGesture = true
+                if (pressedPointers >= 2) {
+                    ownsGesture = true
+                    gestureArbiter.begin(pressedPointers)
+                }
 
                 if (ownsGesture) {
                     val oldScale = scale.floatValue
-                    val newScale = (oldScale * event.calculateZoom()).coerceIn(1f, 5f)
+                    val newScale = gestureArbiter.applyZoom(event.calculateZoom()).zoom.coerceIn(1f, 5f)
                     if (newScale <= 1f) {
                         scale.floatValue = 1f
                         offset.value = Offset.Zero
@@ -913,9 +1130,10 @@ private fun ZoomablePage(
                     }
                 }
             } while (event.changes.any { it.pressed })
+            gestureArbiter.end()
         }
     }, contentAlignment = Alignment.Center) {
-        AsyncImage(model = model, contentDescription = null, contentScale = fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale.floatValue; scaleY = scale.floatValue; translationX = offset.value.x; translationY = offset.value.y })
+        AsyncImage(model = imageModel, contentDescription = null, contentScale = fitScale, onLoading = { loading = true }, onSuccess = { loading = false }, onError = { loading = false }, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale.floatValue; scaleY = scale.floatValue; translationX = offset.value.x; translationY = offset.value.y })
         if (loading) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator(Modifier.size(28.dp), strokeWidth = 2.dp, color = Color.White) }
     }
 }
@@ -966,7 +1184,7 @@ private fun ReaderTimeline(
                 horizontalArrangement = Arrangement.spacedBy(thumbnailSpacing),
                 verticalAlignment = Alignment.Top,
             ) {
-                items(models.size, key = { it }) { page ->
+                items(models.size, key = { page -> stablePageKey(models[page], page) }) { page ->
                     val selected = page == previewPage
                     Column(
                         Modifier
@@ -987,7 +1205,7 @@ private fun ReaderTimeline(
                                 .background(if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.16f) else Color(0xFF202020)),
                         ) {
                             AsyncImage(
-                                model = models[page],
+                                model = coilPageModel(models[page]),
                                 contentDescription = "第 ${page + 1} 页",
                                 contentScale = ContentScale.Crop,
                                 modifier = Modifier.fillMaxSize().graphicsLayer {
@@ -1238,6 +1456,13 @@ private fun ReaderSettingsSheet(
                     )
                 }
             }
+
+            ReaderSettingsLabel("双页")
+            FilterChip(
+                selected = state.firstPageAlone,
+                onClick = { vm.setFirstPageAlone(!state.firstPageAlone); onTouch() },
+                label = { Text("首封面单独显示") },
+            )
 
             ReaderSettingsLabel("图片适应")
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

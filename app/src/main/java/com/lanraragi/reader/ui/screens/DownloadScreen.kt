@@ -79,6 +79,8 @@ import coil.compose.AsyncImage
 import com.lanraragi.reader.data.ArchiveFileReader
 import com.lanraragi.reader.data.DownloadTask
 import com.lanraragi.reader.data.DownloadTaskType
+import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.download.DownloadSourceIdentity
 import com.lanraragi.reader.data.ServerTask
 import com.lanraragi.reader.data.TaskState
 import com.lanraragi.reader.data.model.Archive
@@ -87,6 +89,7 @@ import com.lanraragi.reader.ui.ArchiveCard
 import com.lanraragi.reader.ui.ArchiveListRow
 import com.lanraragi.reader.ui.EmptyBox
 import com.lanraragi.reader.ui.Routes
+import com.lanraragi.reader.ui.asImageRequest
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collect
@@ -104,6 +107,31 @@ class DownloadViewModel(private val container: AppContainer) : ViewModel() {
     // 正在上传到服务器的本地档案 arcid 集合（状态锁：上传中禁止并发上传）。
     var uploadingArcids by mutableStateOf<Set<String>>(emptySet())
         private set
+
+    var pinnedArcids by mutableStateOf<Set<String>>(emptySet())
+        private set
+
+    fun loadPinned(arcids: Collection<String>) {
+        viewModelScope.launch {
+            pinnedArcids = arcids.mapNotNull { arcid ->
+                container.savedArtifactRepository.findBySource(
+                    DownloadSourceIdentity(arcid, ApiClient.config.baseUrl),
+                )?.takeIf { it.pinned }?.source?.archiveId
+            }.toSet()
+        }
+    }
+
+    fun togglePinned(arcid: String) {
+        viewModelScope.launch {
+            val artifact = container.savedArtifactRepository.findBySource(
+                DownloadSourceIdentity(arcid, ApiClient.config.baseUrl),
+            ) ?: return@launch
+            val next = arcid !in pinnedArcids
+            if (container.savedArtifactRepository.pin(artifact.artifactKey, next)) {
+                pinnedArcids = if (next) pinnedArcids + arcid else pinnedArcids - arcid
+            }
+        }
+    }
 
     fun refresh() {
         viewModelScope.launch {
@@ -177,6 +205,7 @@ fun DownloadScreen(
         File(base, "收藏")
     }
     var favFiles by remember { mutableStateOf(favDir.listFiles()?.toList().orEmpty()) }
+    LaunchedEffect(index.items) { vm.loadPinned(index.items.map { it.arcid }) }
 
     val viewMode = settings?.galleryViewMode ?: "grid"
     val columns = settings?.galleryColumns ?: 3
@@ -351,7 +380,13 @@ fun DownloadScreen(
                                             archive = item,
                                             onClick = {},
                                             isOffline = true,
-                                            offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
+                                            offlineCover = ArchivePageModel(
+                                                Uri.parse(item.summary),
+                                                0,
+                                                context,
+                                                thumbnail = true,
+                                                revision = "index:${item.dateadded}:${item.pagecount}",
+                                            ).asImageRequest(),
                                         )
                                     }
                                 } else {
@@ -360,6 +395,8 @@ fun DownloadScreen(
                                         onClick = { navController?.navigate(Routes.reader(item.arcid)) },
                                         isOffline = true,
                                         offlineCover = container.offlineCache.coverFile(item.arcid),
+                                        isPinned = item.arcid in vm.pinnedArcids,
+                                        onTogglePin = { vm.togglePinned(item.arcid) },
                                     )
                                 }
                             }
@@ -405,7 +442,13 @@ fun DownloadScreen(
                                             onClick = {},
                                             compact = viewMode == "compact",
                                             isOffline = true,
-                                            offlineCover = ArchivePageModel(Uri.parse(item.summary), 0, context),
+                                            offlineCover = ArchivePageModel(
+                                                Uri.parse(item.summary),
+                                                0,
+                                                context,
+                                                thumbnail = true,
+                                                revision = "index:${item.dateadded}:${item.pagecount}",
+                                            ).asImageRequest(),
                                         )
                                     }
                                 } else {
@@ -415,6 +458,8 @@ fun DownloadScreen(
                                         compact = viewMode == "compact",
                                         isOffline = true,
                                         offlineCover = container.offlineCache.coverFile(item.arcid),
+                                        isPinned = item.arcid in vm.pinnedArcids,
+                                        onTogglePin = { vm.togglePinned(item.arcid) },
                                     )
                                 }
                             }
@@ -594,6 +639,13 @@ private fun DownloadTasksSection(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    downloadTransferSummary(task)?.let { summary ->
+                        Text(
+                            text = summary,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     if (task.state == TaskState.RUNNING || task.state == TaskState.WAITING) {
                         if (task.progress != null) {
                             LinearProgressIndicator(
@@ -604,7 +656,7 @@ private fun DownloadTasksSection(
                             LinearProgressIndicator(modifier = Modifier.fillMaxWidth().padding(top = 4.dp))
                         }
                     }
-                    if (task.state == TaskState.FAILED && task.error != null) {
+                    if (task.error != null && (task.state == TaskState.FAILED || task.retryAtEpochMs != null)) {
                         Text(
                             text = task.error,
                             style = MaterialTheme.typography.bodySmall,
@@ -644,11 +696,36 @@ private fun downloadTypeLabel(type: DownloadTaskType): String = when (type) {
 }
 
 private fun downloadStateLabel(task: DownloadTask): String = when (task.state) {
-    TaskState.WAITING -> "等待"
+    TaskState.WAITING -> if (task.retryAtEpochMs != null) "等待重试" else "等待"
     TaskState.RUNNING -> if (task.progress != null) "${(task.progress * 100).toInt()}%" else "进行中"
     TaskState.PAUSED -> "已暂停"
     TaskState.FAILED -> "失败"
     TaskState.DONE -> "完成"
+}
+
+private fun downloadTransferSummary(task: DownloadTask): String? {
+    if (task.completedBytes <= 0L) return null
+    val bytes = buildString {
+        append(formatBytes(task.completedBytes))
+        task.totalBytes?.let { append(" / ").append(formatBytes(it)) }
+    }
+    if (task.state != TaskState.RUNNING) return bytes
+    val elapsedMs = (task.updatedAtEpochMs - task.createdAtEpochMs).coerceAtLeast(1L)
+    val bytesPerSecond = task.completedBytes * 1_000L / elapsedMs
+    if (bytesPerSecond <= 0L) return bytes
+    val eta = task.totalBytes?.let { total ->
+        ((total - task.completedBytes).coerceAtLeast(0L) / bytesPerSecond).let(::formatDuration)
+    }
+    return buildString {
+        append(bytes).append(" · ").append(formatBytes(bytesPerSecond)).append("/s")
+        eta?.let { append(" · ETA ").append(it) }
+    }
+}
+
+private fun formatDuration(seconds: Long): String = when {
+    seconds < 60L -> "${seconds}s"
+    seconds < 3_600L -> "${seconds / 60}m ${seconds % 60}s"
+    else -> "${seconds / 3_600}h ${(seconds % 3_600) / 60}m"
 }
 
 private fun stateLabel(state: String): String {

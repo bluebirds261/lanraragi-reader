@@ -2,14 +2,23 @@ package com.lanraragi.reader.data
 
 import com.lanraragi.reader.data.model.ServerInfo
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * 运行时服务器配置。由 [com.lanraragi.reader.data.api.ServerInterceptor] 读取，
  * 用于在请求时动态替换 host 并注入 Authorization 头。
  */
 class ServerConfig {
+    private val _serverKey = MutableStateFlow("")
+    val serverKey: StateFlow<String> = _serverKey.asStateFlow()
+
     @Volatile
     var baseUrl: String = ""
+        set(value) {
+            field = value
+            _serverKey.value = value
+        }
 
     @Volatile
     var apiKey: String = ""

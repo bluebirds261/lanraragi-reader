@@ -109,12 +109,31 @@ import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.data.TaskState
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.isActive
+import com.lanraragi.reader.data.download.DownloadDestination
+import com.lanraragi.reader.data.download.DownloadSourceIdentity
+import com.lanraragi.reader.data.download.DownloadTaskSpec
+import com.lanraragi.reader.data.download.SavedArtifactExporter
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
 import com.lanraragi.reader.data.model.PluginInfo
 import com.lanraragi.reader.data.model.Tankoubon
 import com.lanraragi.reader.data.model.TocEntry
+import com.lanraragi.reader.data.metadata.MetadataApplyResult
+import com.lanraragi.reader.data.metadata.MetadataPendingReason
+import com.lanraragi.reader.data.metadata.matching.MatchCandidate
+import com.lanraragi.reader.data.metadata.matching.MatchResult
+import com.lanraragi.reader.data.metadata.matching.MatchTarget
+import com.lanraragi.reader.data.metadata.matching.MetadataMatchEngine
+import com.lanraragi.reader.data.metadata.providers.MetadataCandidateInput
+import com.lanraragi.reader.data.metadata.providers.NativeMetadataProviders
+import com.lanraragi.reader.data.metadata.providers.NativeGalleryMetadata
+import com.lanraragi.reader.data.metadata.applyTo
+import com.lanraragi.reader.data.metadata.toMetadataSnapshot
+import com.lanraragi.reader.data.metadata.plugins.MetadataPluginExecution
+import com.lanraragi.reader.data.metadata.plugins.MetadataPluginRequest
+import com.lanraragi.reader.data.metadata.plugins.ServerMetadataPlugin
 import com.lanraragi.reader.di.AppContainer
+import com.lanraragi.reader.domain.model.ArchiveIdentity
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.ArchiveCover
 import com.lanraragi.reader.ui.CategoryManagementSheet
@@ -163,7 +182,6 @@ class DetailViewModel(
         val cacheTaskActive: Boolean = false,
         val message: String? = null,
         val pageUrls: List<String> = emptyList(),
-        val coverVersion: Int = 0,
         val previewColumns: Int = 3,
         val previewCount: Int = 12,
         val visiblePreviewCount: Int = 12,
@@ -176,6 +194,9 @@ class DetailViewModel(
         val plugins: List<PluginInfo> = emptyList(),
         val pluginsLoading: Boolean = false,
         val pluginRunning: Boolean = false,
+        val metadataCandidates: List<MatchResult> = emptyList(),
+        val providerPatchPending: Boolean = false,
+        val nativeProviderLoading: Boolean = false,
         // A11 加入卷
         val tanks: List<Tankoubon> = emptyList(),
         val archiveTankoubonIds: Set<String> = emptySet(),
@@ -187,6 +208,7 @@ class DetailViewModel(
 
     private var lastArchFailed = false
     private var categoryMutationInFlight = false
+    private val metadataTarget = ArchiveIdentity.Remote(arcid, ApiClient.config.baseUrl)
 
     init {
         load()
@@ -356,6 +378,154 @@ class DetailViewModel(
                     )
                 }
             }
+        }
+    }
+
+    fun loadMetadataWorkbench() {
+        viewModelScope.launch {
+            val refreshed = container.metadataRepository.refresh(metadataTarget)
+            val snapshot = refreshed.latest ?: _state.value.archive?.toMetadataSnapshot() ?: return@launch
+            _state.update { it.copy(metadataCandidates = nativeCandidates(snapshot, it.archive)) }
+        }
+    }
+
+    internal fun previewMetadata(submission: MetadataEditSubmission) {
+        val archive = _state.value.archive ?: return
+        viewModelScope.launch {
+            val current = container.metadataRepository.observe(metadataTarget).value.latest
+                ?: archive.toMetadataSnapshot()
+            val manual = buildManualMetadataPatch(current, submission)
+            if (manual.patch == com.lanraragi.reader.domain.metadata.MetadataPatch()) {
+                _state.update { it.copy(message = "没有需要预览的元数据变化") }
+                return@launch
+            }
+            container.metadataRepository.stagePatch(metadataTarget, manual.baseline, manual.patch)
+            container.metadataRepository.preview(metadataTarget, userMetadataApplyPolicy())
+            _state.update { it.copy(providerPatchPending = false) }
+        }
+    }
+
+    fun previewMetadataCandidate(result: MatchResult) {
+        val patch = result.candidate.patch ?: return
+        viewModelScope.launch {
+            val current = container.metadataRepository.observe(metadataTarget).value.latest
+                ?: _state.value.archive?.toMetadataSnapshot()
+                ?: return@launch
+            container.metadataRepository.stagePatch(metadataTarget, current, patch)
+            container.metadataRepository.preview(metadataTarget, providerMetadataApplyPolicy())
+            _state.update { it.copy(providerPatchPending = true) }
+        }
+    }
+
+    fun fetchNativeMetadata(result: MatchResult) {
+        val candidate = result.candidate
+        val sourceId = candidate.sourceId ?: return
+        val sourceUrl = candidate.sourceUrl ?: return
+        if (candidate.providerId !in setOf("ehentai", "nhentai")) return
+        viewModelScope.launch {
+            _state.update { it.copy(nativeProviderLoading = true, message = null) }
+            try {
+                val cookie = if (candidate.providerId == "ehentai") {
+                    container.ehFavoriteCredentials.currentCookie()
+                } else null
+                val fetched = container.nativeMetadataFetch.fetch(
+                    candidate.providerId,
+                    sourceId,
+                    sourceUrl,
+                    cookie,
+                )
+                previewFetchedNativeMetadata(fetched)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                _state.update { it.copy(message = "原生元数据抓取失败：${error.message}") }
+            } finally {
+                _state.update { it.copy(nativeProviderLoading = false) }
+            }
+        }
+    }
+
+    private suspend fun previewFetchedNativeMetadata(fetched: NativeGalleryMetadata) {
+        val current = container.metadataRepository.observe(metadataTarget).value.latest
+            ?: _state.value.archive?.toMetadataSnapshot()
+            ?: return
+        val patch = fetched.toPatch()
+        val ranked = MetadataMatchEngine.rank(
+            current.toMatchTarget(_state.value.archive),
+            listOf(
+                MatchCandidate(
+                    providerId = fetched.providerId,
+                    sourceId = fetched.sourceId,
+                    sourceUrl = fetched.sourceUrl,
+                    title = fetched.title,
+                    tags = fetched.tags,
+                    patch = patch,
+                ),
+            ),
+        ).first()
+        container.metadataRepository.stagePatch(metadataTarget, current, patch)
+        container.metadataRepository.preview(metadataTarget, providerMetadataApplyPolicy())
+        _state.update {
+            it.copy(
+                metadataCandidates = (listOf(ranked) + it.metadataCandidates)
+                    .distinctBy { match -> match.candidate.identity },
+                providerPatchPending = true,
+                message = "原生元数据已纳入预览，请确认后保存",
+            )
+        }
+    }
+
+    fun applyMetadata(approveRebasedSnapshot: Boolean) {
+        viewModelScope.launch {
+            when (
+                val result = container.metadataRepository.applyPending(
+                    metadataTarget,
+                    if (_state.value.providerPatchPending) {
+                        providerMetadataApplyPolicy(approveRebasedSnapshot)
+                    } else {
+                        userMetadataApplyPolicy(approveRebasedSnapshot)
+                    },
+                )
+            ) {
+                is MetadataApplyResult.Applied -> {
+                    result.state.latest?.let { snapshot ->
+                        _state.update { current ->
+                            current.copy(
+                                archive = current.archive?.let(snapshot::applyTo),
+                                message = "元数据已保存",
+                                providerPatchPending = false,
+                            )
+                        }
+                    }
+                    LibraryRefreshBus.tick.value++
+                }
+
+                is MetadataApplyResult.Blocked -> _state.update {
+                    it.copy(message = "元数据需要重新审阅后才能保存")
+                }
+
+                is MetadataApplyResult.Pending -> _state.update {
+                    val message = when (result.reason) {
+                        MetadataPendingReason.LOCKED -> "档案正被服务器锁定，修改已保留"
+                        MetadataPendingReason.NETWORK -> "网络不可用，修改已保留"
+                        MetadataPendingReason.INVALID_RESPONSE -> "服务器返回内容与预览不一致，修改已保留"
+                        MetadataPendingReason.PERSISTENCE_ERROR -> "修改状态保存失败"
+                        MetadataPendingReason.REMOTE_ERROR -> "服务器拒绝更新，修改已保留"
+                    }
+                    it.copy(message = message)
+                }
+
+                is MetadataApplyResult.NoPending -> _state.update {
+                    it.copy(message = "没有待应用的元数据修改")
+                }
+            }
+        }
+    }
+
+    fun discardMetadataPatch() {
+        viewModelScope.launch {
+            container.metadataRepository.discardPending(metadataTarget)
+            _state.update { it.copy(message = "已放弃待应用的元数据修改", providerPatchPending = false) }
         }
     }
 
@@ -598,57 +768,46 @@ class DetailViewModel(
             }
 
             try {
-                val jobid =
-                    container.repository.usePluginAsync(
-                        arcid,
-                        plugin.namespace,
-                        null,
-                    )
-
-                val job =
-                    container.repository.pollJobUntilDone(jobid)
-
-                if (job == null) {
-                    _state.update {
-                        it.copy(
-                            message = "插件执行超时，请稍后刷新查看",
-                        )
-                    }
+                val candidate = container.metadataPluginCoordinator.run(
+                    MetadataPluginRequest(
+                        target = metadataTarget,
+                        plugin = ServerMetadataPlugin(
+                            namespace = plugin.namespace,
+                            name = plugin.name.ifBlank { plugin.namespace },
+                            version = plugin.version.ifBlank { null },
+                        ),
+                        execution = MetadataPluginExecution.ASYNCHRONOUS,
+                    ),
+                )
+                if (candidate == null) {
+                    _state.update { it.copy(message = "插件未返回可预览的元数据，结果已保留") }
                     return@launch
                 }
-
-                val s = job.state.lowercase()
-
-                if (
-                    s.contains("fail") ||
-                    s.contains("error") ||
-                    s.contains("inactive") ||
-                    s == "dead" ||
-                    s.isBlank()
-                ) {
-                    val detail =
-                        job.result.ifBlank {
-                            job.note.ifBlank {
-                                job.state
-                            }
-                        }
-
-                    _state.update {
-                        it.copy(
-                            message = "插件执行失败：$detail",
-                        )
-                    }
-
-                    return@launch
-                }
-
-                val a =
-                    container.repository.getMetadata(arcid)
-
+                val current = container.metadataRepository.observe(metadataTarget).value.latest
+                    ?: _state.value.archive?.toMetadataSnapshot()
+                    ?: return@launch
+                val ranked = MetadataMatchEngine.rank(
+                    target = current.toMatchTarget(_state.value.archive),
+                    candidates = listOf(
+                        MatchCandidate(
+                            providerId = candidate.plugin.namespace,
+                            sourceId = candidate.raw.raw["gid"]?.toString()?.trim('"'),
+                            sourceUrl = candidate.patch.sourceUrl?.value,
+                            title = candidate.raw.title,
+                            tags = candidate.patch.addTags,
+                            patch = candidate.patch,
+                        ),
+                    ),
+                )
+                val result = ranked.first()
+                container.metadataRepository.stagePatch(metadataTarget, current, candidate.patch)
+                container.metadataRepository.preview(metadataTarget, providerMetadataApplyPolicy())
                 _state.update {
                     it.copy(
-                        archive = a,
-                        message = "插件执行完成",
+                        metadataCandidates = (listOf(result) + it.metadataCandidates)
+                            .distinctBy { match -> match.candidate.identity },
+                        providerPatchPending = true,
+                        message = "插件候选已生成并纳入预览，请在元数据工作台确认",
                     )
                 }
             } catch (e: CancellationException) {
@@ -737,127 +896,58 @@ class DetailViewModel(
             return
         }
 
-        val appContext =
-            context.applicationContext
-
         val title =
             archive.title.ifBlank { arcid }
-
-        container.downloadManager.enqueue(
-            DownloadTaskType.ARCHIVE_FILE,
-            arcid,
-            title,
-        ) { onProgress ->
-
-            val tmp =
-                File(
-                    appContext.cacheDir,
-                    "$arcid.part",
-                )
-
-            container.repository.downloadArchive(
-                arcid,
-                tmp,
-            ) { w, t ->
-                val p =
-                    if (
-                        t != null &&
-                        t > 0
-                    ) {
-                        w.toFloat() / t
-                    } else {
-                        null
-                    }
-
-                onProgress(p)
-            }
-
-            val name =
-                sanitizeFileName(title) +
-                        detectExtension(tmp)
-
-            val treeUri =
-                container.settingsRepository
-                    .settings
-                    .first()
-                    .downloadDirUri
-
-            val savedDesc =
-                if (treeUri != null) {
-                    val tree =
-                        Uri.parse(treeUri)
-
-                    val docId =
-                        DocumentsContract
-                            .getTreeDocumentId(tree)
-
-                    val parentUri =
-                        DocumentsContract
-                            .buildDocumentUriUsingTree(
-                                tree,
-                                docId,
-                            )
-
-                    val fileUri =
-                        DocumentsContract.createDocument(
-                            appContext.contentResolver,
-                            parentUri,
-                            "application/octet-stream",
-                            name,
-                        )
-
-                    if (fileUri != null) {
-                        appContext.contentResolver
-                            .openOutputStream(fileUri)
-                            ?.use { out ->
-                                tmp.inputStream().use { input ->
-                                    input.copyTo(out)
-                                }
-                            }
-
-                        "自定义下载文件夹"
-                    } else {
-                        null
-                    }
+        viewModelScope.launch {
+            val destination = withContext(Dispatchers.IO) {
+                val appContext = context.applicationContext
+                val treeUri = container.settingsRepository.settings.first().downloadDirUri
+                if (treeUri == null) {
+                    File(
+                        appContext.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
+                            ?: appContext.filesDir,
+                        "LANraragi/${sanitizeFileName(title)}.archive",
+                    ).absolutePath
                 } else {
-                    val dir =
-                        File(
-                            appContext.getExternalFilesDir(
-                                Environment.DIRECTORY_DOWNLOADS,
-                            ) ?: appContext.filesDir,
-                            "LANraragi",
-                        )
-
-                    dir.mkdirs()
-
-                    val final =
-                        File(dir, name)
-
-                    if (final.exists()) {
-                        final.delete()
-                    }
-
-                    tmp.renameTo(final)
-
-                    final.absolutePath
-                }
-
-            tmp.delete()
-
-            if (savedDesc == null) {
-                throw IllegalStateException(
-                    "写入下载文件夹失败",
-                )
-            } else {
-                withContext(Dispatchers.Main) {
-                    _state.update {
-                        it.copy(
-                            message =
-                                "已保存到 $savedDesc",
-                        )
-                    }
+                    val tree = Uri.parse(treeUri)
+                    val rootId = DocumentsContract.getTreeDocumentId(tree)
+                    val parent = DocumentsContract.buildDocumentUriUsingTree(tree, rootId)
+                    DocumentsContract.createDocument(
+                        appContext.contentResolver,
+                        parent,
+                        "application/octet-stream",
+                        "${sanitizeFileName(title)}.archive",
+                    )?.toString()
                 }
             }
+            if (destination == null) {
+                _state.update { it.copy(message = "无法创建下载目标") }
+                return@launch
+            }
+            val source = DownloadSourceIdentity(arcid, ApiClient.config.baseUrl)
+            val saved = container.savedArtifactRepository.findBySource(source)
+            if (saved != null) {
+                try {
+                    SavedArtifactExporter(container.context.contentResolver).export(
+                        saved,
+                        DownloadDestination(destination),
+                    )
+                    _state.update { it.copy(message = "已从本地保存资源导出原档") }
+                    return@launch
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Fall through to the durable server task if the saved copy is stale.
+                }
+            }
+            container.downloadManager.enqueue(
+                DownloadTaskSpec.Archive(
+                    source = source,
+                    destination = DownloadDestination(destination),
+                    label = title,
+                ),
+            )
+            _state.update { it.copy(message = "已加入下载队列") }
         }
     }
 
@@ -881,13 +971,8 @@ class DetailViewModel(
                     page,
                 )
 
-                _state.update {
-                    it.copy(
-                        coverVersion =
-                            it.coverVersion + 1,
-                        message = "封面已更新",
-                    )
-                }
+                container.thumbnailRepository.refreshCover(arcid)
+                _state.update { it.copy(message = "封面已更新") }
 
                 CoverChangeBus.version.value++
                 LibraryRefreshBus.tick.value++
@@ -992,47 +1077,6 @@ class DetailViewModel(
         }
     }
 
-    private fun detectExtension(file: File): String {
-        file.inputStream().use { input ->
-            val b = ByteArray(8)
-            val n = input.read(b)
-
-            if (
-                n >= 2 &&
-                b[0] == 'P'.code.toByte() &&
-                b[1] == 'K'.code.toByte()
-            ) {
-                return ".zip"
-            }
-
-            if (
-                n >= 3 &&
-                b[0] == 'R'.code.toByte() &&
-                b[1] == 'a'.code.toByte() &&
-                b[2] == 'r'.code.toByte()
-            ) {
-                return ".rar"
-            }
-
-            if (
-                n >= 2 &&
-                b[0] == '7'.code.toByte() &&
-                b[1] == 'z'.code.toByte()
-            ) {
-                return ".7z"
-            }
-
-            if (
-                n >= 2 &&
-                b[0] == 0x1f.toByte() &&
-                b[1] == 0x8b.toByte()
-            ) {
-                return ".gz"
-            }
-        }
-
-        return ".zip"
-    }
 
     private fun sanitizeFileName(
         name: String,
@@ -1044,6 +1088,35 @@ class DetailViewModel(
             )
             .trim()
             .take(120)
+
+    private fun nativeCandidates(
+        snapshot: com.lanraragi.reader.data.metadata.MetadataSnapshot,
+        archive: Archive?,
+    ): List<MatchResult> {
+        val input = MetadataCandidateInput(
+            sourceUrls = listOfNotNull(snapshot.sourceUrl),
+            existingTags = snapshot.tags,
+            archiveTitle = archive?.title ?: snapshot.title,
+            fileName = archive?.title,
+        )
+        val candidates = NativeMetadataProviders.all.flatMap { it.findCandidates(input) }
+        return MetadataMatchEngine.rank(
+            snapshot.toMatchTarget(archive),
+            MetadataMatchEngine.fromProviderCandidates(candidates),
+        )
+    }
+
+    private fun com.lanraragi.reader.data.metadata.MetadataSnapshot.toMatchTarget(
+        archive: Archive?,
+    ) = MatchTarget(
+        sourceUrls = listOfNotNull(sourceUrl).toSet(),
+        sourceTags = tags.filter { it.identity.namespace == "source" }
+            .map { it.raw.substringAfter(':').trim() }
+            .toSet(),
+        fileName = archive?.title,
+        title = archive?.title ?: title,
+        tags = tags,
+    )
 }
 
 
@@ -1701,6 +1774,13 @@ fun DetailScreen(
 
     val state by
     vm.state.collectAsStateWithLifecycle()
+    val metadataTarget = remember(arcid, ApiClient.config.baseUrl) {
+        ArchiveIdentity.Remote(arcid, ApiClient.config.baseUrl)
+    }
+
+    val metadataState by container.metadataRepository
+        .observe(metadataTarget)
+        .collectAsStateWithLifecycle()
 
     val snackbarHostState =
         remember {
@@ -1728,6 +1808,11 @@ fun DetailScreen(
     }
 
     var showPluginsSheet by
+    remember {
+        mutableStateOf(false)
+    }
+
+    var showMetadataSheet by
     remember {
         mutableStateOf(false)
     }
@@ -1879,14 +1964,6 @@ fun DetailScreen(
                             val archive =
                                 state.archive!!
 
-                            val coverUrl =
-                                ApiClient.thumbnailUrl(arcid) +
-                                        if (state.coverVersion > 0) {
-                                            "?v=${state.coverVersion}"
-                                        } else {
-                                            ""
-                                        }
-
                             Column(
                                 Modifier
                                     .fillMaxSize()
@@ -1909,15 +1986,15 @@ fun DetailScreen(
                                                         RoundedCornerShape(
                                                             10.dp,
                                                         ),
-                                                    )
-                                                    .combinedClickable(
+                                            )
+                                            .combinedClickable(
                                                         onClick = {},
                                                         onLongClick = {
                                                             showCoverMenu =
                                                                 true
                                                         },
                                                     ),
-                                            firstPageUrl = coverUrl,
+                                            thumbnailContainer = container,
                                         )
 
                                         DropdownMenu(
@@ -2207,6 +2284,17 @@ fun DetailScreen(
                                                 onClick = {
                                                     showEditMenu = false
                                                     showTocSheet = true
+                                                },
+                                            )
+
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text("编辑元数据")
+                                                },
+                                                onClick = {
+                                                    showEditMenu = false
+                                                    showMetadataSheet = true
+                                                    vm.loadMetadataWorkbench()
                                                 },
                                             )
 
@@ -2636,6 +2724,23 @@ fun DetailScreen(
                 onDismiss = {
                     showPluginsSheet = false
                 },
+            )
+        }
+        if (showMetadataSheet) {
+            val initialMetadata = metadataState.latest
+                ?: state.archive?.toMetadataSnapshot()
+                ?: com.lanraragi.reader.data.metadata.MetadataSnapshot()
+            MetadataWorkbenchSheet(
+                initial = initialMetadata,
+                state = metadataState,
+                candidates = state.metadataCandidates,
+                onPreviewCandidate = vm::previewMetadataCandidate,
+                onFetchCandidate = vm::fetchNativeMetadata,
+                nativeProviderLoading = state.nativeProviderLoading,
+                onPreview = vm::previewMetadata,
+                onApply = vm::applyMetadata,
+                onDiscard = vm::discardMetadataPatch,
+                onDismiss = { showMetadataSheet = false },
             )
         }
 

@@ -53,7 +53,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
-import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
 import com.lanraragi.reader.di.AppContainer
@@ -62,7 +61,7 @@ import com.lanraragi.reader.ui.ArchiveCard
 import com.lanraragi.reader.ui.EmptyBox
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.LoadingBox
-import com.lanraragi.reader.ui.LoadingImage
+import com.lanraragi.reader.ui.RemoteThumbnailImage
 import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.edgeSwipeBack
 import kotlinx.coroutines.CancellationException
@@ -308,7 +307,7 @@ fun CategoryBrowseScreen(
 
                 state.selected == null && state.categories.isEmpty() -> EmptyBox("暂无分类")
 
-                state.selected == null -> CategoryWall(state.categories, vm::openCategory)
+                state.selected == null -> CategoryWall(container, state.categories, vm::openCategory)
 
                 state.error != null && state.archives.isEmpty() -> ErrorBox(
                     state.error!!,
@@ -319,7 +318,7 @@ fun CategoryBrowseScreen(
 
                 state.archives.isEmpty() -> EmptyBox("该分类暂无档案")
 
-                else -> CategoryArchiveGrid(state, vm, navController)
+                else -> CategoryArchiveGrid(container, state, vm, navController)
             }
         }
 
@@ -337,6 +336,7 @@ fun CategoryBrowseScreen(
 
 @Composable
 private fun CategoryWall(
+    container: AppContainer,
     categories: List<Category>,
     onOpen: (String) -> Unit,
 ) {
@@ -360,9 +360,9 @@ private fun CategoryWall(
                             .aspectRatio(1.4f),
                     ) {
                         if (coverArcId != null) {
-                            LoadingImage(
-                                model = ApiClient.thumbnailUrl(coverArcId),
-                                contentDescription = null,
+                            RemoteThumbnailImage(
+                                container = container,
+                                arcid = coverArcId,
                                 modifier = Modifier.fillMaxSize(),
                                 contentScale = ContentScale.Crop,
                             )
@@ -402,6 +402,7 @@ private fun CategoryWall(
 
 @Composable
 private fun CategoryArchiveGrid(
+    container: AppContainer,
     state: CategoryBrowseViewModel.UiState,
     vm: CategoryBrowseViewModel,
     navController: NavController,
@@ -452,7 +453,7 @@ private fun CategoryArchiveGrid(
                 ArchiveCard(
                     archive = archive,
                     onClick = { navController.navigate(Routes.detail(archive.arcid)) },
-                    coverUrl = ApiClient.thumbnailUrl(archive.arcid),
+                    thumbnailContainer = container,
                 )
             }
             if (state.loadingMore) {

@@ -4,17 +4,28 @@ import android.content.Context
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.FilterPreset
 import com.lanraragi.reader.data.model.ServerProfile
+import com.lanraragi.reader.data.security.AndroidKeystoreSecretStore
+import com.lanraragi.reader.data.security.ConfigTransferCodec
+import com.lanraragi.reader.data.security.filterSensitiveFields
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.math.BigDecimal
 
 private val Context.settingsDataStore by preferencesDataStore(name = "settings")
@@ -84,22 +95,84 @@ data class Settings(
     val lastReadArcId: String = "",
     val authEnabled: Boolean = false,
     val biometricEnabled: Boolean = false,
+    val screenshotProtectionEnabled: Boolean = false,
     val hideInGallery: Boolean = false,
     val blurInRecents: Boolean = false,
     val extraScanDirUris: Set<String> = emptySet(),
     val preloadLocalCount: Int = 5,
     val clearNewOnOpen: Boolean = true,
     val featureFlags: Map<String, Boolean> = emptyMap(),
-    val offlineCacheLimitGb: Int = 0,
+    val offlineCacheLimitBytes: Long = 0L,
     /** 同时下载的最大任务数，1..8。 */
     val downloadConcurrency: Int = 2,
     val profiles: List<ServerProfile> = emptyList(),
     val activeProfileIndex: Int = 0,
+    /** Optional orientation-specific reader overrides; null means use the global value. */
+    val readerModePortrait: String? = null,
+    val readerModeLandscape: String? = null,
+    val readingDirectionPortrait: String? = null,
+    val readingDirectionLandscape: String? = null,
+    val readerFitModePortrait: String? = null,
+    val readerFitModeLandscape: String? = null,
+    val doublePageFirstPageAlone: Boolean = false,
+    val doublePageFirstPageAlonePortrait: Boolean? = null,
+    val doublePageFirstPageAloneLandscape: Boolean? = null,
 )
+
+data class ReaderPreferences(
+    val mode: String,
+    val multiPageCount: Int,
+    val autoDoublePageLandscape: Boolean,
+    val preloadOnlineCount: Int,
+    val preloadLocalCount: Int,
+    val readingDirection: String,
+    val fitMode: String,
+    val background: String,
+    val brightness: Int,
+    val tapZonesEnabled: Boolean,
+    val keepScreenOn: Boolean,
+    val volumeKeysEnabled: Boolean,
+    val autoScrollSpeed: String,
+    val firstPageAlone: Boolean,
+)
+
+data class DownloadPreferences(
+    val directoryUri: String?,
+    val concurrency: Int,
+    val offlineCacheLimitBytes: Long,
+)
+
+data class LibraryPreferences(
+    val columns: Int,
+    val viewMode: String,
+    val sortBy: String,
+    val order: String,
+    val presets: List<FilterPreset>,
+    val defaultPreset: String,
+    val extraScanDirectoryUris: Set<String>,
+)
+
+data class AppearancePreferences(
+    val theme: String,
+    val tagColors: Map<String, String>,
+    val galleryTitle: String,
+    val galleryTitleMode: String,
+    val showArchiveCount: Boolean,
+    val showFloatingButton: Boolean,
+    val floatingButtonColor: String,
+    val bottomBarColor: String,
+    val bottomBarActiveColor: String,
+)
+
+data class ConfigImportPreview(val payload: String, val changedFields: List<String>)
+
+enum class ReaderOrientationProfile { GLOBAL, PORTRAIT, LANDSCAPE }
 
 class SettingsRepository(private val context: Context) {
 
     private val dataStore = context.settingsDataStore
+    private val secretStore = AndroidKeystoreSecretStore(context)
+    @Volatile private var apiKeyCache: String = ""
 
     companion object {
         val KEY_URL = stringPreferencesKey("base_url")
@@ -139,6 +212,7 @@ class SettingsRepository(private val context: Context) {
         val KEY_LAST_READ_ARCID = stringPreferencesKey("last_read_arcid")
         val KEY_AUTH_ENABLED = booleanPreferencesKey("auth_enabled")
         val KEY_BIOMETRIC_ENABLED = booleanPreferencesKey("biometric_enabled")
+        val KEY_SCREENSHOT_PROTECTION = booleanPreferencesKey("screenshot_protection_enabled")
         val KEY_HIDE_IN_GALLERY = booleanPreferencesKey("hide_in_gallery")
         val KEY_BLUR_IN_RECENTS = booleanPreferencesKey("blur_in_recents")
         val KEY_EXTRA_SCAN_DIRS = stringPreferencesKey("extra_scan_dirs")
@@ -146,16 +220,30 @@ class SettingsRepository(private val context: Context) {
         val KEY_CLEAR_NEW_ON_OPEN = booleanPreferencesKey("clear_new_on_open")
         val KEY_FEATURE_FLAGS = stringPreferencesKey("feature_flags")
         val KEY_OFFLINE_CACHE_LIMIT = intPreferencesKey("offline_cache_limit_gb")
+        val KEY_OFFLINE_CACHE_LIMIT_BYTES = longPreferencesKey("offline_cache_limit_bytes")
         val KEY_DOWNLOAD_CONCURRENCY = intPreferencesKey("download_concurrency")
         val KEY_SCHEMA_VERSION = intPreferencesKey("schema_version")
         val KEY_PROFILES = stringPreferencesKey("profiles_json")
         val KEY_ACTIVE_PROFILE = intPreferencesKey("active_profile_index")
+        val KEY_MODE_PORTRAIT = stringPreferencesKey("reader_mode_portrait")
+        val KEY_MODE_LANDSCAPE = stringPreferencesKey("reader_mode_landscape")
+        val KEY_DIRECTION_PORTRAIT = stringPreferencesKey("reading_direction_portrait")
+        val KEY_DIRECTION_LANDSCAPE = stringPreferencesKey("reading_direction_landscape")
+        val KEY_FIT_MODE_PORTRAIT = stringPreferencesKey("reader_fit_mode_portrait")
+        val KEY_FIT_MODE_LANDSCAPE = stringPreferencesKey("reader_fit_mode_landscape")
+        val KEY_FIRST_PAGE_ALONE = booleanPreferencesKey("double_page_first_page_alone")
+        val KEY_FIRST_PAGE_ALONE_PORTRAIT = booleanPreferencesKey("double_page_first_page_alone_portrait")
+        val KEY_FIRST_PAGE_ALONE_LANDSCAPE = booleanPreferencesKey("double_page_first_page_alone_landscape")
+        const val SECRET_API_KEY = "lanraragi/api_key"
+        private val READER_MODES = setOf("single", "multi", "continuous")
+        private val READING_DIRECTIONS = setOf("ltr", "rtl", "ttb")
+        private val FIT_MODES = setOf("fitWidth", "fitHeight", "fitScreen", "original")
     }
 
     val settings: Flow<Settings> = dataStore.data.map { p ->
         Settings(
             baseUrl = p[KEY_URL] ?: "",
-            apiKey = SecurePrefs.decrypt(p[KEY_KEY] ?: ""),
+            apiKey = apiKeyCache,
             serverName = p[KEY_SERVER_NAME] ?: "",
             readerMode = p[KEY_MODE] ?: "single",
             multiPageCount = p[KEY_MULTI] ?: 2,
@@ -195,6 +283,7 @@ class SettingsRepository(private val context: Context) {
             lastReadArcId = p[KEY_LAST_READ_ARCID] ?: "",
             authEnabled = p[KEY_AUTH_ENABLED] ?: false,
             biometricEnabled = p[KEY_BIOMETRIC_ENABLED] ?: false,
+            screenshotProtectionEnabled = p[KEY_SCREENSHOT_PROTECTION] ?: false,
             hideInGallery = p[KEY_HIDE_IN_GALLERY] ?: false,
             blurInRecents = p[KEY_BLUR_IN_RECENTS] ?: false,
             extraScanDirUris = runCatching {
@@ -205,16 +294,31 @@ class SettingsRepository(private val context: Context) {
             featureFlags = runCatching {
                 ApiClient.json.decodeFromString<Map<String, Boolean>>(p[KEY_FEATURE_FLAGS] ?: "{}")
             }.getOrDefault(emptyMap()),
-            offlineCacheLimitGb = p[KEY_OFFLINE_CACHE_LIMIT] ?: 0,
+            offlineCacheLimitBytes = p[KEY_OFFLINE_CACHE_LIMIT_BYTES]
+                ?: (p[KEY_OFFLINE_CACHE_LIMIT]?.toLong()?.let { it * BYTES_PER_GIB } ?: 0L),
             downloadConcurrency = (p[KEY_DOWNLOAD_CONCURRENCY] ?: 2).coerceIn(1, 8),
             profiles = runCatching {
                 ApiClient.json.decodeFromString<List<ServerProfile>>(p[KEY_PROFILES] ?: "[]")
             }.getOrDefault(emptyList()),
             activeProfileIndex = p[KEY_ACTIVE_PROFILE] ?: 0,
+            readerModePortrait = p[KEY_MODE_PORTRAIT],
+            readerModeLandscape = p[KEY_MODE_LANDSCAPE],
+            readingDirectionPortrait = p[KEY_DIRECTION_PORTRAIT],
+            readingDirectionLandscape = p[KEY_DIRECTION_LANDSCAPE],
+            readerFitModePortrait = p[KEY_FIT_MODE_PORTRAIT],
+            readerFitModeLandscape = p[KEY_FIT_MODE_LANDSCAPE],
+            doublePageFirstPageAlone = p[KEY_FIRST_PAGE_ALONE] ?: false,
+            doublePageFirstPageAlonePortrait = p[KEY_FIRST_PAGE_ALONE_PORTRAIT],
+            doublePageFirstPageAloneLandscape = p[KEY_FIRST_PAGE_ALONE_LANDSCAPE],
         )
     }
 
     val schemaVersion: Flow<Int> = dataStore.data.map { it[KEY_SCHEMA_VERSION] ?: 1 }
+
+    val readerPreferences: Flow<ReaderPreferences> = settings.map { it.readerPreferences() }
+    val downloadPreferences: Flow<DownloadPreferences> = settings.map { it.downloadPreferences() }
+    val libraryPreferences: Flow<LibraryPreferences> = settings.map { it.libraryPreferences() }
+    val appearancePreferences: Flow<AppearancePreferences> = settings.map { it.appearancePreferences() }
 
     init {
         DataMigration.register(2) { migrateApiKeyV2() }
@@ -226,6 +330,7 @@ class SettingsRepository(private val context: Context) {
             val cur = dataStore.data.first()[KEY_SCHEMA_VERSION] ?: 1
             val next = DataMigration.runPending(context, cur)
             if (next > cur) dataStore.edit { it[KEY_SCHEMA_VERSION] = next }
+            migrateApiKeyToKeystore()
         } catch (e: CancellationException) {
             throw e
         } catch (_: Exception) {
@@ -233,11 +338,12 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun applyToRuntime() {
+        migrateIfNeeded()
+        apiKeyCache = secretStore.read(SECRET_API_KEY).orEmpty()
         val s = settings.first()
         val profile = s.profiles.getOrNull(s.activeProfileIndex)
         ApiClient.config.baseUrl = (profile?.url ?: s.baseUrl).trim().trimEnd('/')
-        ApiClient.config.apiKey = (profile?.apiKey ?: s.apiKey).trim()
-        migrateIfNeeded()
+        ApiClient.config.apiKey = apiKeyCache.trim()
     }
 
     private suspend fun migrateApiKeyV2() {
@@ -252,13 +358,48 @@ class SettingsRepository(private val context: Context) {
         }
     }
 
+    private suspend fun migrateApiKeyToKeystore() {
+        val prefs = dataStore.data.first()
+        val profiles = runCatching {
+            ApiClient.json.decodeFromString<List<ServerProfile>>(prefs[KEY_PROFILES] ?: "[]")
+        }.getOrDefault(emptyList())
+        val activeIndex = prefs[KEY_ACTIVE_PROFILE] ?: 0
+        val old = prefs[KEY_KEY].orEmpty()
+        if (old.isBlank() && profiles.none { it.apiKey.isNotBlank() }) return
+        try {
+            if (old.isNotBlank()) {
+                val plain = SecurePrefs.decrypt(old)
+                secretStore.write(SECRET_API_KEY, plain)
+                apiKeyCache = plain
+            }
+            profiles.forEachIndexed { index, profile ->
+                if (profile.apiKey.isNotBlank()) {
+                    val plain = SecurePrefs.decrypt(profile.apiKey)
+                    secretStore.write(profileSecretName(index), plain)
+                    if (index == activeIndex && old.isBlank()) {
+                        secretStore.write(SECRET_API_KEY, plain)
+                        apiKeyCache = plain
+                    }
+                }
+            }
+            dataStore.edit {
+                it.remove(KEY_KEY)
+                if (profiles.isNotEmpty()) {
+                    it[KEY_PROFILES] = ApiClient.json.encodeToString(profiles.map { profile -> profile.copy(apiKey = "") })
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+        }
+    }
+
     private suspend fun migrateProfilesV3() {
         try {
             val prefs = dataStore.data.first()
             val url = prefs[KEY_URL]?.trim()?.takeIf { it.isNotBlank() } ?: return
-            val key = prefs[KEY_KEY] ?: ""
             val name = prefs[KEY_SERVER_NAME] ?: ""
-            val profile = ServerProfile(name = name, url = url, apiKey = key)
+            val profile = ServerProfile(name = name, url = url, apiKey = "")
             dataStore.edit {
                 it[KEY_PROFILES] = ApiClient.json.encodeToString(listOf(profile))
                 it[KEY_ACTIVE_PROFILE] = 0
@@ -270,14 +411,17 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun saveServer(url: String, apiKey: String, name: String = "") {
+        val normalizedKey = apiKey.trim()
+        secretStore.write(SECRET_API_KEY, normalizedKey)
+        apiKeyCache = normalizedKey
         dataStore.edit {
             it[KEY_URL] = normalizeBaseUrl(url)
-            it[KEY_KEY] = SecurePrefs.encrypt(apiKey.trim()) ?: apiKey.trim()
+            it.remove(KEY_KEY)
             it[KEY_SERVER_NAME] = name.trim()
             val profiles = runCatching {
                 ApiClient.json.decodeFromString<List<ServerProfile>>(it[KEY_PROFILES] ?: "[]")
             }.getOrDefault(emptyList()).toMutableList()
-            val p = ServerProfile(name = name.trim(), url = normalizeBaseUrl(url), apiKey = it[KEY_KEY] ?: apiKey.trim())
+            val p = ServerProfile(name = name.trim(), url = normalizeBaseUrl(url), apiKey = "")
             if (profiles.isNotEmpty()) profiles[0] = p else profiles.add(p)
             it[KEY_PROFILES] = ApiClient.json.encodeToString(profiles)
         }
@@ -285,6 +429,15 @@ class SettingsRepository(private val context: Context) {
     }
 
     suspend fun setReaderMode(mode: String) { dataStore.edit { it[KEY_MODE] = mode } }
+    suspend fun setReaderModeForOrientation(profile: ReaderOrientationProfile, mode: String?) {
+        dataStore.edit { prefs ->
+            when (profile) {
+                ReaderOrientationProfile.GLOBAL -> if (mode == null) prefs.remove(KEY_MODE) else prefs[KEY_MODE] = mode
+                ReaderOrientationProfile.PORTRAIT -> if (mode == null) prefs.remove(KEY_MODE_PORTRAIT) else prefs[KEY_MODE_PORTRAIT] = mode
+                ReaderOrientationProfile.LANDSCAPE -> if (mode == null) prefs.remove(KEY_MODE_LANDSCAPE) else prefs[KEY_MODE_LANDSCAPE] = mode
+            }
+        }
+    }
     suspend fun setAutoScrollSpeed(s: String) {
         dataStore.edit { it[KEY_AUTO_SCROLL_SPEED] = normalizeAutoScrollSpeed(s) }
     }
@@ -292,6 +445,15 @@ class SettingsRepository(private val context: Context) {
     suspend fun setAutoDoublePageLandscape(enabled: Boolean) { dataStore.edit { it[KEY_AUTO_DOUBLE_PAGE_LANDSCAPE] = enabled } }
     suspend fun setPreloadOnlineCount(n: Int) { dataStore.edit { it[KEY_PRELOAD_ONLINE] = n.coerceIn(1, 20) } }
     suspend fun setReadingDirection(direction: String) { dataStore.edit { it[KEY_DIRECTION] = direction } }
+    suspend fun setReadingDirectionForOrientation(profile: ReaderOrientationProfile, direction: String?) {
+        dataStore.edit { prefs ->
+            when (profile) {
+                ReaderOrientationProfile.GLOBAL -> if (direction == null) prefs.remove(KEY_DIRECTION) else prefs[KEY_DIRECTION] = direction
+                ReaderOrientationProfile.PORTRAIT -> if (direction == null) prefs.remove(KEY_DIRECTION_PORTRAIT) else prefs[KEY_DIRECTION_PORTRAIT] = direction
+                ReaderOrientationProfile.LANDSCAPE -> if (direction == null) prefs.remove(KEY_DIRECTION_LANDSCAPE) else prefs[KEY_DIRECTION_LANDSCAPE] = direction
+            }
+        }
+    }
     suspend fun setGalleryColumns(n: Int) { dataStore.edit { it[KEY_GALLERY_COLS] = n.coerceIn(2, 8) } }
     suspend fun setPreviewColumns(n: Int) { dataStore.edit { it[KEY_PREVIEW_COLS] = n.coerceIn(2, 8) } }
     suspend fun setPreviewCount(n: Int) { dataStore.edit { it[KEY_PREVIEW_COUNT] = n.coerceIn(4, 200) } }
@@ -303,6 +465,24 @@ class SettingsRepository(private val context: Context) {
     suspend fun setPresets(presets: List<FilterPreset>) { dataStore.edit { it[KEY_PRESETS] = ApiClient.json.encodeToString(presets) } }
     suspend fun setDefaultPreset(name: String) { dataStore.edit { it[KEY_DEFAULT_PRESET] = name } }
     suspend fun setReaderFitMode(mode: String) { dataStore.edit { it[KEY_FIT_MODE] = mode } }
+    suspend fun setReaderFitModeForOrientation(profile: ReaderOrientationProfile, mode: String?) {
+        dataStore.edit { prefs ->
+            when (profile) {
+                ReaderOrientationProfile.GLOBAL -> if (mode == null) prefs.remove(KEY_FIT_MODE) else prefs[KEY_FIT_MODE] = mode
+                ReaderOrientationProfile.PORTRAIT -> if (mode == null) prefs.remove(KEY_FIT_MODE_PORTRAIT) else prefs[KEY_FIT_MODE_PORTRAIT] = mode
+                ReaderOrientationProfile.LANDSCAPE -> if (mode == null) prefs.remove(KEY_FIT_MODE_LANDSCAPE) else prefs[KEY_FIT_MODE_LANDSCAPE] = mode
+            }
+        }
+    }
+    suspend fun setFirstPageAloneForOrientation(profile: ReaderOrientationProfile, enabled: Boolean?) {
+        dataStore.edit { prefs ->
+            when (profile) {
+                ReaderOrientationProfile.GLOBAL -> if (enabled == null) prefs.remove(KEY_FIRST_PAGE_ALONE) else prefs[KEY_FIRST_PAGE_ALONE] = enabled
+                ReaderOrientationProfile.PORTRAIT -> if (enabled == null) prefs.remove(KEY_FIRST_PAGE_ALONE_PORTRAIT) else prefs[KEY_FIRST_PAGE_ALONE_PORTRAIT] = enabled
+                ReaderOrientationProfile.LANDSCAPE -> if (enabled == null) prefs.remove(KEY_FIRST_PAGE_ALONE_LANDSCAPE) else prefs[KEY_FIRST_PAGE_ALONE_LANDSCAPE] = enabled
+            }
+        }
+    }
     suspend fun setReaderBackground(bg: String) { dataStore.edit { it[KEY_READER_BG] = bg } }
     suspend fun setReaderBrightness(n: Int) { dataStore.edit { it[KEY_READER_BRIGHTNESS] = n.coerceIn(-1, 100) } }
     suspend fun setTapZonesEnabled(enabled: Boolean) { dataStore.edit { it[KEY_TAP_ZONES] = enabled } }
@@ -323,6 +503,67 @@ class SettingsRepository(private val context: Context) {
     suspend fun setLastReadArcId(arcid: String) { dataStore.edit { it[KEY_LAST_READ_ARCID] = arcid } }
     suspend fun setAuthEnabled(enabled: Boolean) { dataStore.edit { it[KEY_AUTH_ENABLED] = enabled } }
     suspend fun setBiometricEnabled(enabled: Boolean) { dataStore.edit { it[KEY_BIOMETRIC_ENABLED] = enabled } }
+    suspend fun setScreenshotProtectionEnabled(enabled: Boolean) { dataStore.edit { it[KEY_SCREENSHOT_PROTECTION] = enabled } }
+
+    suspend fun exportNonSensitiveConfig(): String {
+        return ConfigTransferCodec.export(filterSensitiveFields(settings.first().nonSensitiveConfig()).value)
+    }
+
+    suspend fun previewNonSensitiveConfig(payload: String): ConfigImportPreview {
+        val imported = ConfigTransferCodec.import(payload)
+        val current = settings.first().nonSensitiveConfig()
+        return ConfigImportPreview(
+            payload = payload,
+            changedFields = imported.config.entries
+                .filter { (key, value) -> current[key] != value }
+                .map { it.key }
+                .sorted(),
+        )
+    }
+
+    suspend fun importNonSensitiveConfig(payload: String) {
+        val config = ConfigTransferCodec.import(payload).config
+        val current = settings.first()
+        dataStore.edit { prefs ->
+            prefs[KEY_MODE] = config.stringValueOr("readerMode", current.readerMode).validated(READER_MODES, current.readerMode)
+            prefs[KEY_DIRECTION] = config.stringValueOr("readingDirection", current.readingDirection).validated(READING_DIRECTIONS, current.readingDirection)
+            prefs[KEY_FIT_MODE] = config.stringValueOr("readerFitMode", current.readerFitMode).validated(FIT_MODES, current.readerFitMode)
+            prefs[KEY_MULTI] = config.intValueOr("multiPageCount", current.multiPageCount).coerceIn(2, 8)
+            prefs[KEY_AUTO_DOUBLE_PAGE_LANDSCAPE] = config.booleanValueOr("autoDoublePageLandscape", current.autoDoublePageLandscape)
+            prefs[KEY_FIRST_PAGE_ALONE] = config.booleanValueOr("doublePageFirstPageAlone", current.doublePageFirstPageAlone)
+            prefs[KEY_PRELOAD_ONLINE] = config.intValueOr("preloadOnlineCount", current.preloadOnlineCount).coerceIn(1, 20)
+            prefs[KEY_PRELOAD_LOCAL] = config.intValueOr("preloadLocalCount", current.preloadLocalCount).coerceIn(1, 50)
+            prefs[KEY_TAP_ZONES] = config.booleanValueOr("tapZonesEnabled", current.tapZonesEnabled)
+            prefs[KEY_KEEP_SCREEN_ON] = config.booleanValueOr("keepScreenOn", current.keepScreenOn)
+            prefs[KEY_VOLUME_KEYS] = config.booleanValueOr("volumeKeysEnabled", current.volumeKeysEnabled)
+            prefs[KEY_DOWNLOAD_CONCURRENCY] = config.intValueOr("downloadConcurrency", current.downloadConcurrency).coerceIn(1, 8)
+            prefs[KEY_OFFLINE_CACHE_LIMIT_BYTES] = config.longValueOr("offlineCacheLimitBytes", current.offlineCacheLimitBytes).coerceAtLeast(0L)
+            prefs[KEY_GALLERY_COLS] = config.intValueOr("galleryColumns", current.galleryColumns).coerceIn(2, 8)
+            prefs[KEY_GALLERY_VIEW] = config.stringValueOr("galleryViewMode", current.galleryViewMode).validated(setOf("grid", "list", "compact"), current.galleryViewMode)
+            prefs[KEY_GALLERY_SORTBY] = config.stringValueOr("gallerySortby", current.gallerySortby)
+            prefs[KEY_GALLERY_ORDER] = config.stringValueOr("galleryOrder", current.galleryOrder).validated(setOf("asc", "desc"), current.galleryOrder)
+            prefs[KEY_THEME] = config.stringValueOr("theme", current.theme)
+            prefs[KEY_SHOW_COUNT] = config.booleanValueOr("showArchiveCount", current.showArchiveCount)
+            prefs[KEY_SHOW_FAB] = config.booleanValueOr("showFloatingButton", current.showFloatingButton)
+            prefs[KEY_BIOMETRIC_ENABLED] = config.booleanValueOr("biometricEnabled", current.biometricEnabled)
+            prefs[KEY_BLUR_IN_RECENTS] = config.booleanValueOr("maskRecentTasks", current.blurInRecents)
+            prefs[KEY_SCREENSHOT_PROTECTION] = config.booleanValueOr("screenshotProtectionEnabled", current.screenshotProtectionEnabled)
+        }
+    }
+
+    private fun kotlinx.serialization.json.JsonObject.stringValueOr(name: String, fallback: String): String =
+        (get(name) as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull ?: fallback
+
+    private fun kotlinx.serialization.json.JsonObject.booleanValueOr(name: String, fallback: Boolean): Boolean =
+        (get(name) as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: fallback
+
+    private fun kotlinx.serialization.json.JsonObject.intValueOr(name: String, fallback: Int): Int =
+        (get(name) as? kotlinx.serialization.json.JsonPrimitive)?.intOrNull ?: fallback
+
+    private fun kotlinx.serialization.json.JsonObject.longValueOr(name: String, fallback: Long): Long =
+        (get(name) as? kotlinx.serialization.json.JsonPrimitive)?.longOrNull ?: fallback
+
+    private fun profileSecretName(index: Int): String = "lanraragi/profile/$index/api_key"
 
     suspend fun setHideInGallery(enabled: Boolean) {
         dataStore.edit { it[KEY_HIDE_IN_GALLERY] = enabled }
@@ -347,6 +588,94 @@ class SettingsRepository(private val context: Context) {
     suspend fun setPreloadLocalCount(n: Int) { dataStore.edit { it[KEY_PRELOAD_LOCAL] = n.coerceIn(1, 50) } }
     suspend fun setClearNewOnOpen(enabled: Boolean) { dataStore.edit { it[KEY_CLEAR_NEW_ON_OPEN] = enabled } }
     suspend fun setFeatureFlag(key: String, enabled: Boolean) { val updated = settings.first().featureFlags + (key to enabled); dataStore.edit { it[KEY_FEATURE_FLAGS] = ApiClient.json.encodeToString(updated) } }
-    suspend fun setOfflineCacheLimitGb(n: Int) { dataStore.edit { it[KEY_OFFLINE_CACHE_LIMIT] = n.coerceAtLeast(0) } }
+    suspend fun setOfflineCacheLimitBytes(bytes: Long) {
+        require(bytes >= 0L) { "cache limit must not be negative" }
+        dataStore.edit {
+            it[KEY_OFFLINE_CACHE_LIMIT_BYTES] = bytes
+            it.remove(KEY_OFFLINE_CACHE_LIMIT)
+        }
+    }
+    suspend fun setOfflineCacheLimitGb(n: Int) = setOfflineCacheLimitBytes(n.coerceAtLeast(0).toLong() * BYTES_PER_GIB)
     suspend fun setDownloadConcurrency(n: Int) { dataStore.edit { it[KEY_DOWNLOAD_CONCURRENCY] = n.coerceIn(1, 8) } }
+
+    private fun String.validated(allowed: Set<String>, fallback: String): String = takeIf(allowed::contains) ?: fallback
+
+}
+
+private const val BYTES_PER_GIB = 1024L * 1024L * 1024L
+
+fun Settings.readerPreferences(profile: ReaderOrientationProfile = ReaderOrientationProfile.GLOBAL): ReaderPreferences {
+    val mode = when (profile) {
+        ReaderOrientationProfile.GLOBAL -> readerMode
+        ReaderOrientationProfile.PORTRAIT -> readerModePortrait ?: readerMode
+        ReaderOrientationProfile.LANDSCAPE -> readerModeLandscape ?: readerMode
+    }
+    val direction = when (profile) {
+        ReaderOrientationProfile.GLOBAL -> readingDirection
+        ReaderOrientationProfile.PORTRAIT -> readingDirectionPortrait ?: readingDirection
+        ReaderOrientationProfile.LANDSCAPE -> readingDirectionLandscape ?: readingDirection
+    }
+    val fit = when (profile) {
+        ReaderOrientationProfile.GLOBAL -> readerFitMode
+        ReaderOrientationProfile.PORTRAIT -> readerFitModePortrait ?: readerFitMode
+        ReaderOrientationProfile.LANDSCAPE -> readerFitModeLandscape ?: readerFitMode
+    }
+    val firstAlone = when (profile) {
+        ReaderOrientationProfile.GLOBAL -> doublePageFirstPageAlone
+        ReaderOrientationProfile.PORTRAIT -> doublePageFirstPageAlonePortrait ?: doublePageFirstPageAlone
+        ReaderOrientationProfile.LANDSCAPE -> doublePageFirstPageAloneLandscape ?: doublePageFirstPageAlone
+    }
+    return ReaderPreferences(
+        mode,
+        multiPageCount,
+        autoDoublePageLandscape,
+        preloadOnlineCount,
+        preloadLocalCount,
+        direction,
+        fit,
+        readerBackground,
+        readerBrightness,
+        tapZonesEnabled,
+        keepScreenOn,
+        volumeKeysEnabled,
+        autoScrollSpeed,
+        firstAlone,
+    )
+}
+
+fun Settings.downloadPreferences() = DownloadPreferences(downloadDirUri, downloadConcurrency, offlineCacheLimitBytes)
+
+fun Settings.libraryPreferences() = LibraryPreferences(
+    galleryColumns, galleryViewMode, gallerySortby, galleryOrder, presets, defaultPreset, extraScanDirUris,
+)
+
+fun Settings.appearancePreferences() = AppearancePreferences(
+    theme, tagColors, galleryTitle, galleryTitleMode, showArchiveCount, showFloatingButton,
+    floatingButtonColor, bottomBarColor, bottomBarActiveColor,
+)
+
+private fun Settings.nonSensitiveConfig() = buildJsonObject {
+    put("readerMode", readerMode)
+    put("readingDirection", readingDirection)
+    put("readerFitMode", readerFitMode)
+    put("multiPageCount", multiPageCount)
+    put("autoDoublePageLandscape", autoDoublePageLandscape)
+    put("doublePageFirstPageAlone", doublePageFirstPageAlone)
+    put("preloadOnlineCount", preloadOnlineCount)
+    put("preloadLocalCount", preloadLocalCount)
+    put("tapZonesEnabled", tapZonesEnabled)
+    put("keepScreenOn", keepScreenOn)
+    put("volumeKeysEnabled", volumeKeysEnabled)
+    put("downloadConcurrency", downloadConcurrency)
+    put("offlineCacheLimitBytes", offlineCacheLimitBytes)
+    put("galleryColumns", galleryColumns)
+    put("galleryViewMode", galleryViewMode)
+    put("gallerySortby", gallerySortby)
+    put("galleryOrder", galleryOrder)
+    put("theme", theme)
+    put("showArchiveCount", showArchiveCount)
+    put("showFloatingButton", showFloatingButton)
+    put("biometricEnabled", biometricEnabled)
+    put("maskRecentTasks", blurInRecents)
+    put("screenshotProtectionEnabled", screenshotProtectionEnabled)
 }

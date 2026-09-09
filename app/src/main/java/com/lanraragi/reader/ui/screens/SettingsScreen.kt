@@ -6,6 +6,7 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -87,12 +88,15 @@ import coil.imageLoader
 import com.lanraragi.reader.R
 import com.lanraragi.reader.data.AUTO_SCROLL_MAX_SECONDS
 import com.lanraragi.reader.data.AUTO_SCROLL_MIN_SECONDS
+import com.lanraragi.reader.data.ReaderOrientationProfile
+import com.lanraragi.reader.data.ConfigImportPreview
 import com.lanraragi.reader.data.FeatureFlags
 import com.lanraragi.reader.data.OfflineUsage
 import com.lanraragi.reader.data.autoScrollSeconds
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.model.ServerInfo
 import com.lanraragi.reader.data.model.ServerStats
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import com.lanraragi.reader.data.normalizeBaseUrl
 import com.lanraragi.reader.data.normalizeAutoScrollSpeed
 import com.lanraragi.reader.data.refreshServerInfo
@@ -107,6 +111,7 @@ import com.lanraragi.reader.ui.parseHexColor
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.toHexString
+import com.lanraragi.reader.ui.settings.OfflineCacheLimitEditor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -164,12 +169,15 @@ private enum class SettingsSection(val title: String, val icon: ImageVector) {
 }
 
 class SettingsViewModel(private val container: AppContainer) : ViewModel() {
+    var importPreview by mutableStateOf<ConfigImportPreview?>(null)
+        private set
 
     data class UiState(
         val url: String = "",
         val key: String = "",
         val name: String = "",
         val readerMode: String = "single",
+        val readerOrientationProfile: ReaderOrientationProfile = ReaderOrientationProfile.GLOBAL,
         val multiPageCount: Int = 2,
         val autoDoublePageLandscape: Boolean = true,
         val preloadOnlineCount: Int = 3,
@@ -183,6 +191,15 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val coverPrefetchCount: Int = 12,
         val theme: String = "system",
         val readerFitMode: String = "fitWidth",
+        val readerModePortrait: String? = null,
+        val readerModeLandscape: String? = null,
+        val readingDirectionPortrait: String? = null,
+        val readingDirectionLandscape: String? = null,
+        val readerFitModePortrait: String? = null,
+        val readerFitModeLandscape: String? = null,
+        val doublePageFirstPageAlone: Boolean = false,
+        val doublePageFirstPageAlonePortrait: Boolean? = null,
+        val doublePageFirstPageAloneLandscape: Boolean? = null,
         val readerBackground: String = "black",
         val tapZonesEnabled: Boolean = true,
         val keepScreenOn: Boolean = true,
@@ -199,11 +216,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         val bottomBarActiveColor: String = "#0084FF",
         val authEnabled: Boolean = false,
         val biometricEnabled: Boolean = false,
+        val screenshotProtectionEnabled: Boolean = false,
         val hideInGallery: Boolean = false,
         val blurInRecents: Boolean = false,
         val extraScanDirUris: Set<String> = emptySet(),
         val featureFlags: Map<String, Boolean> = emptyMap(),
-        val offlineCacheLimitGb: Int = 0,
+        val offlineCacheLimitBytes: Long = 0L,
         val downloadConcurrency: Int = 2,
         val offlineUsage: OfflineUsage = OfflineUsage(),
         val isScanning: Boolean = false,
@@ -254,6 +272,15 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     coverPrefetchCount = s.coverPrefetchCount,
                     theme = s.theme,
                     readerFitMode = s.readerFitMode,
+                    readerModePortrait = s.readerModePortrait,
+                    readerModeLandscape = s.readerModeLandscape,
+                    readingDirectionPortrait = s.readingDirectionPortrait,
+                    readingDirectionLandscape = s.readingDirectionLandscape,
+                    readerFitModePortrait = s.readerFitModePortrait,
+                    readerFitModeLandscape = s.readerFitModeLandscape,
+                    doublePageFirstPageAlone = s.doublePageFirstPageAlone,
+                    doublePageFirstPageAlonePortrait = s.doublePageFirstPageAlonePortrait,
+                    doublePageFirstPageAloneLandscape = s.doublePageFirstPageAloneLandscape,
                     readerBackground = s.readerBackground,
                     tapZonesEnabled = s.tapZonesEnabled,
                     keepScreenOn = s.keepScreenOn,
@@ -270,11 +297,12 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                     bottomBarActiveColor = s.bottomBarActiveColor,
                     authEnabled = s.authEnabled,
                     biometricEnabled = s.biometricEnabled,
+                    screenshotProtectionEnabled = s.screenshotProtectionEnabled,
                     hideInGallery = s.hideInGallery,
                     blurInRecents = s.blurInRecents,
                     extraScanDirUris = s.extraScanDirUris,
                     featureFlags = s.featureFlags,
-                    offlineCacheLimitGb = s.offlineCacheLimitGb,
+                    offlineCacheLimitBytes = s.offlineCacheLimitBytes,
                     downloadConcurrency = s.downloadConcurrency,
                 )
             }
@@ -287,7 +315,65 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setReaderMode(mode: String) {
         _state.update { it.copy(readerMode = mode) }
-        viewModelScope.launch { container.settingsRepository.setReaderMode(mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderModeForOrientation(_state.value.readerOrientationProfile, mode) }
+    }
+
+    fun setReaderOrientationProfile(profile: ReaderOrientationProfile) {
+        viewModelScope.launch {
+            val s = container.settingsRepository.settings.first()
+            val mode: String
+            val direction: String
+            val fitMode: String
+            val firstPageAlone: Boolean
+            when (profile) {
+                ReaderOrientationProfile.GLOBAL -> {
+                    mode = s.readerMode
+                    direction = s.readingDirection
+                    fitMode = s.readerFitMode
+                    firstPageAlone = s.doublePageFirstPageAlone
+                }
+                ReaderOrientationProfile.PORTRAIT -> {
+                    mode = s.readerModePortrait ?: s.readerMode
+                    direction = s.readingDirectionPortrait ?: s.readingDirection
+                    fitMode = s.readerFitModePortrait ?: s.readerFitMode
+                    firstPageAlone = s.doublePageFirstPageAlonePortrait ?: s.doublePageFirstPageAlone
+                }
+                ReaderOrientationProfile.LANDSCAPE -> {
+                    mode = s.readerModeLandscape ?: s.readerMode
+                    direction = s.readingDirectionLandscape ?: s.readingDirection
+                    fitMode = s.readerFitModeLandscape ?: s.readerFitMode
+                    firstPageAlone = s.doublePageFirstPageAloneLandscape ?: s.doublePageFirstPageAlone
+                }
+            }
+            _state.update {
+                it.copy(
+                    readerOrientationProfile = profile,
+                    readerMode = mode,
+                    readingDirection = direction,
+                    readerFitMode = fitMode,
+                    doublePageFirstPageAlone = firstPageAlone,
+                )
+            }
+        }
+    }
+
+    fun clearReaderOrientationOverrides(profile: ReaderOrientationProfile) {
+        if (profile == ReaderOrientationProfile.GLOBAL) return
+        viewModelScope.launch {
+            container.settingsRepository.setReaderModeForOrientation(profile, null)
+            container.settingsRepository.setReadingDirectionForOrientation(profile, null)
+            container.settingsRepository.setReaderFitModeForOrientation(profile, null)
+            container.settingsRepository.setFirstPageAloneForOrientation(profile, null)
+            val s = container.settingsRepository.settings.first()
+            _state.update {
+                it.copy(
+                    readerMode = s.readerMode,
+                    readingDirection = s.readingDirection,
+                    readerFitMode = s.readerFitMode,
+                    doublePageFirstPageAlone = s.doublePageFirstPageAlone,
+                )
+            }
+        }
     }
 
     fun setAutoScrollSpeed(s: String) {
@@ -318,7 +404,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setReadingDirection(dir: String) {
         _state.update { it.copy(readingDirection = dir) }
-        viewModelScope.launch { container.settingsRepository.setReadingDirection(dir) }
+        viewModelScope.launch { container.settingsRepository.setReadingDirectionForOrientation(_state.value.readerOrientationProfile, dir) }
     }
 
     fun setDownloadDirUri(uri: String?) {
@@ -353,7 +439,7 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 
     fun setReaderFitMode(mode: String) {
         _state.update { it.copy(readerFitMode = mode) }
-        viewModelScope.launch { container.settingsRepository.setReaderFitMode(mode) }
+        viewModelScope.launch { container.settingsRepository.setReaderFitModeForOrientation(_state.value.readerOrientationProfile, mode) }
     }
 
     fun setReaderBackground(bg: String) {
@@ -441,8 +527,86 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun setBiometricEnabled(enabled: Boolean) {
+        if (enabled && BiometricManager.from(container.context).canAuthenticate(
+                BiometricManager.Authenticators.BIOMETRIC_STRONG,
+            ) != BiometricManager.BIOMETRIC_SUCCESS
+        ) {
+            _state.update { it.copy(message = "此设备未配置可用的强生物认证，未启用生物认证", success = false) }
+            return
+        }
         _state.update { it.copy(biometricEnabled = enabled) }
         viewModelScope.launch { container.settingsRepository.setBiometricEnabled(enabled) }
+    }
+
+    fun setDoublePageFirstPageAlone(enabled: Boolean) {
+        _state.update { it.copy(doublePageFirstPageAlone = enabled) }
+        viewModelScope.launch {
+            container.settingsRepository.setFirstPageAloneForOrientation(_state.value.readerOrientationProfile, enabled)
+        }
+    }
+
+    fun setScreenshotProtectionEnabled(enabled: Boolean) {
+        _state.update { it.copy(screenshotProtectionEnabled = enabled) }
+        viewModelScope.launch { container.settingsRepository.setScreenshotProtectionEnabled(enabled) }
+    }
+
+    fun exportConfig(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val payload = container.settingsRepository.exportNonSensitiveConfig()
+                context.contentResolver.openOutputStream(uri)?.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                    ?: throw IOException("无法写入配置文件")
+                _state.update { it.copy(message = "配置导出成功", success = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "配置导出失败", success = false) }
+            }
+        }
+    }
+
+    fun importConfig(context: Context, uri: Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val payload = context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                    ?: throw IOException("无法读取配置文件")
+                importPreview = container.settingsRepository.previewNonSensitiveConfig(payload)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "配置导入失败", success = false) }
+            }
+        }
+    }
+
+    fun confirmConfigImport() {
+        val preview = importPreview ?: return
+        importPreview = null
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                container.settingsRepository.importNonSensitiveConfig(preview.payload)
+                val imported = container.settingsRepository.settings.first()
+                _state.update {
+                    it.copy(
+                        readerMode = imported.readerMode,
+                        theme = imported.theme,
+                        biometricEnabled = imported.biometricEnabled,
+                        blurInRecents = imported.blurInRecents,
+                        screenshotProtectionEnabled = imported.screenshotProtectionEnabled,
+                        message = "配置导入成功",
+                        success = true,
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "配置导入失败", success = false) }
+            }
+        }
+    }
+
+    fun cancelConfigImport() {
+        importPreview = null
     }
 
     fun setHideInGallery(enabled: Boolean) {
@@ -460,10 +624,20 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
         viewModelScope.launch { container.settingsRepository.setFeatureFlag(key, enabled) }
     }
 
-    fun setOfflineCacheLimitGb(n: Int) {
-        val limit = n.coerceAtLeast(0)
-        _state.update { it.copy(offlineCacheLimitGb = limit) }
-        viewModelScope.launch { container.settingsRepository.setOfflineCacheLimitGb(limit) }
+    fun setOfflineCacheLimitBytes(limit: Long) {
+        if (limit < 0L) return
+        val usable = container.context.filesDir.usableSpace.coerceAtLeast(0L)
+        val current = _state.value.offlineUsage.totalBytes.coerceAtLeast(0L)
+        val capacity = saturatedAdd(usable, current)
+        if (limit > 0L && capacity > 0L && limit > capacity) {
+            _state.update { it.copy(message = "缓存上限超过当前可用磁盘容量", success = false) }
+            return
+        }
+        _state.update { it.copy(offlineCacheLimitBytes = limit, message = null) }
+        viewModelScope.launch {
+            container.settingsRepository.setOfflineCacheLimitBytes(limit)
+            container.offlineCache.enforceConfiguredLimit()
+        }
     }
 
     fun setDownloadConcurrency(n: Int) {
@@ -491,6 +665,8 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
                 _state.update {
                     it.copy(translationUpdating = false, message = "翻译更新完成：$namespaces 个命名空间，$tags 条标签", success = true)
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _state.update { it.copy(translationUpdating = false, message = e.message ?: "翻译更新失败") }
             }
@@ -498,8 +674,16 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
     }
 
     fun clearTranslations() {
-        container.tagTranslationRepository.clearCache()
-        _state.update { it.copy(message = "已清除标签翻译", success = true) }
+        viewModelScope.launch {
+            try {
+                container.tagTranslationRepository.clearCache()
+                _state.update { it.copy(message = "已清除标签翻译", success = true) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = e.message ?: "清除翻译失败", success = false) }
+            }
+        }
     }
 
     fun test() {
@@ -656,7 +840,13 @@ class SettingsViewModel(private val container: AppContainer) : ViewModel() {
 }
 
 @Composable
-fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpenDrawer: () -> Unit = {}) {
+fun SettingsScreen(
+    container: AppContainer,
+    onBack: (() -> Unit)? = null,
+    onOpenDrawer: () -> Unit = {},
+    onOpenDiagnostics: () -> Unit = {},
+    onOpenEhFavorites: () -> Unit = {},
+) {
     val vm: SettingsViewModel = viewModel { SettingsViewModel(container) }
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
@@ -673,6 +863,12 @@ fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpen
             )
             vm.setDownloadDirUri(uri.toString())
         }
+    }
+    val exportConfigLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+        if (uri != null) vm.exportConfig(context, uri)
+    }
+    val importConfigLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importConfig(context, uri)
     }
 
     LaunchedEffect(state.message) {
@@ -716,11 +912,34 @@ fun SettingsScreen(container: AppContainer, onBack: (() -> Unit)? = null, onOpen
                 SettingsSection.STORAGE -> StorageSection(state, vm, context) {
                     downloadDirLauncher.launch(null)
                 }
-                SettingsSection.SECURITY -> SecuritySection(state, vm)
+                SettingsSection.SECURITY -> SecuritySection(
+                    state,
+                    vm,
+                    onExport = { exportConfigLauncher.launch("lanraragi-reader-config.json") },
+                    onImport = { importConfigLauncher.launch(arrayOf("application/json", "text/plain")) },
+                    onOpenDiagnostics = onOpenDiagnostics,
+                    onOpenEhFavorites = onOpenEhFavorites,
+                )
                 SettingsSection.LABS -> LabsSection(state, vm)
                 SettingsSection.ABOUT -> AboutSection()
             }
         }
+    }
+    vm.importPreview?.let { preview ->
+        AlertDialog(
+            onDismissRequest = vm::cancelConfigImport,
+            title = { Text("确认导入配置") },
+            text = {
+                Text(
+                    if (preview.changedFields.isEmpty()) "配置与当前设置一致"
+                    else "将修改 ${preview.changedFields.size} 项：\n${preview.changedFields.joinToString("\n")}",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = vm::confirmConfigImport, enabled = preview.changedFields.isNotEmpty()) { Text("导入") }
+            },
+            dismissButton = { TextButton(onClick = vm::cancelConfigImport) { Text("取消") } },
+        )
     }
 }
 
@@ -754,10 +973,11 @@ private fun InterfaceSection(state: SettingsViewModel.UiState, vm: SettingsViewM
     var bottomBarColorDialog by remember { mutableStateOf(false) }
     var bottomBarActiveColorDialog by remember { mutableStateOf(false) }
     val namespaces = remember {
-        TagRules.NAMESPACE_ORDER.filter { it in TagRules.NAMESPACE_LABELS }
+        TagNamespaceRegistry.allDescriptors(includeHidden = false).map { it.name }
     }
     val lastUpdated by TagTranslationStore.lastUpdated.collectAsState()
     val translations by TagTranslationStore.translations.collectAsState()
+    val translationInfo by TagTranslationStore.info.collectAsState()
     val fabColor = remember(state.floatingButtonColor) {
         parseHexColor(state.floatingButtonColor)?.let { Color(it) } ?: Color(0xFFE94560)
     }
@@ -855,11 +1075,23 @@ private fun InterfaceSection(state: SettingsViewModel.UiState, vm: SettingsViewM
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp),
         )
         Text(
-            if (lastUpdated != null) "已更新：${formatTime(lastUpdated!!)} · ${translations.size} 个命名空间" else "尚未下载翻译库",
+            if (lastUpdated != null) {
+                "已更新：${formatTime(lastUpdated!!)} · ${translationInfo?.namespaceCount ?: translations.size} 个命名空间 · ${translationInfo?.entryCount ?: translations.values.sumOf { it.size }} 条"
+            } else {
+                "尚未下载翻译库"
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
         )
+        translationInfo?.let { info ->
+            Text(
+                "版本：${info.version}\n来源：${info.sourceUrl}\n许可：${info.license}\n署名：${info.attribution}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+            )
+        }
         Button(
             onClick = vm::updateTranslations,
             enabled = !state.translationUpdating,
@@ -972,10 +1204,32 @@ private fun formatTime(millis: Long): String =
     java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
         .format(java.util.Date(millis))
 
+private fun saturatedAdd(left: Long, right: Long): Long =
+    if (Long.MAX_VALUE - left < right) Long.MAX_VALUE else left + right
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        Text("阅读偏好作用范围", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                ReaderOrientationProfile.GLOBAL to "全局",
+                ReaderOrientationProfile.PORTRAIT to "竖屏",
+                ReaderOrientationProfile.LANDSCAPE to "横屏",
+            ).forEach { (profile, label) ->
+                FilterChip(
+                    selected = state.readerOrientationProfile == profile,
+                    onClick = { vm.setReaderOrientationProfile(profile) },
+                    label = { Text(label) },
+                )
+            }
+        }
+        if (state.readerOrientationProfile != ReaderOrientationProfile.GLOBAL) {
+            TextButton(onClick = { vm.clearReaderOrientationOverrides(state.readerOrientationProfile) }) {
+                Text("当前方向跟随全局")
+            }
+        }
         DropdownRow(
             "阅读模式", readerModeLabel(state.readerMode),
             listOf("single" to "单页", "multi" to "多页", "continuous" to "连续"),
@@ -984,6 +1238,7 @@ private fun ReaderSection(state: SettingsViewModel.UiState, vm: SettingsViewMode
         AutoScrollSpeedRow(state.autoScrollSpeed, vm::setAutoScrollSpeed)
         IntDropdownRow("每屏页数", state.multiPageCount, (2..8).toList(), vm::setMultiPageCount)
         SwitchRow("横屏自动双页", state.autoDoublePageLandscape, vm::setAutoDoublePageLandscape)
+        SwitchRow("双页时首封面单独显示", state.doublePageFirstPageAlone, vm::setDoublePageFirstPageAlone)
         DropdownRow(
             "阅读方向", directionLabel(state.readingDirection),
             listOf("ltr" to "左→右", "rtl" to "右→左", "ttb" to "上→下"),
@@ -1331,9 +1586,9 @@ private fun StorageSection(
         }
 
         Spacer(Modifier.height(16.dp))
-        OfflineLimitRow(state.offlineCacheLimitGb, vm::setOfflineCacheLimitGb)
+        OfflineCacheLimitEditor(state.offlineCacheLimitBytes, vm::setOfflineCacheLimitBytes)
         Text(
-            "已用 ${formatBytes(state.offlineUsage.totalBytes)} / ${if (state.offlineCacheLimitGb == 0) "不限" else "${state.offlineCacheLimitGb} GB"}",
+            "已用 ${formatBytes(state.offlineUsage.totalBytes)} / ${if (state.offlineCacheLimitBytes == 0L) "不自动淘汰" else formatBytes(state.offlineCacheLimitBytes)}",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 20.dp, vertical = 2.dp),
@@ -1641,7 +1896,14 @@ private fun SettingsGroupHeader(title: String) {
 }
 
 @Composable
-private fun SecuritySection(state: SettingsViewModel.UiState, vm: SettingsViewModel) {
+private fun SecuritySection(
+    state: SettingsViewModel.UiState,
+    vm: SettingsViewModel,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onOpenDiagnostics: () -> Unit,
+    onOpenEhFavorites: () -> Unit,
+) {
     Column(
         Modifier
             .fillMaxSize()
@@ -1650,8 +1912,19 @@ private fun SecuritySection(state: SettingsViewModel.UiState, vm: SettingsViewMo
     ) {
         SwitchRow("开启密码认证", state.authEnabled, vm::setAuthEnabled)
         SwitchRow("生物认证", state.biometricEnabled, vm::setBiometricEnabled)
+        SwitchRow("禁止截屏", state.screenshotProtectionEnabled, vm::setScreenshotProtectionEnabled)
         SwitchRow("在相册中隐藏下载的图片", state.hideInGallery, vm::setHideInGallery)
         SwitchRow("在任务栏中隐藏应用", state.blurInRecents, vm::setBlurInRecents)
+        Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            OutlinedButton(onClick = onExport, modifier = Modifier.weight(1f)) { Text("导出配置") }
+            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text("导入配置") }
+        }
+        OutlinedButton(onClick = onOpenDiagnostics, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+            Text("诊断信息")
+        }
+        OutlinedButton(onClick = onOpenEhFavorites, modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp)) {
+            Text("E-H 收藏同步")
+        }
         Spacer(Modifier.height(96.dp))
     }
 }
@@ -1705,7 +1978,7 @@ private fun SettingsNavRow(title: String, icon: ImageVector? = null, onClick: ()
 }
 
 @Composable
-private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
+private fun OfflineLimitRow(value: Long, onSelect: (Long) -> Unit) {
     var menu by remember { mutableStateOf(false) }
     var showCustom by remember { mutableStateOf(false) }
     var customText by remember { mutableStateOf("") }
@@ -1718,9 +1991,9 @@ private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
     ) {
         Text("离线缓存上限", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
         Box {
-            TextButton(onClick = { menu = true }) { Text(if (value == 0) "不限" else "$value GB") }
+            TextButton(onClick = { menu = true }) { Text(if (value == 0L) "不自动淘汰" else formatBytes(value)) }
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                listOf(0 to "不限", 2 to "2 GB", 5 to "5 GB", 10 to "10 GB").forEach { (n, label) ->
+                listOf(0L to "不自动淘汰", 512L * 1024 * 1024 to "512 MB", 2L * 1024 * 1024 * 1024 to "2 GB", 5L * 1024 * 1024 * 1024 to "5 GB").forEach { (n, label) ->
                     DropdownMenuItem(
                         text = { Text(label) },
                         onClick = { onSelect(n); menu = false },
@@ -1730,7 +2003,7 @@ private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
                     text = { Text("自定义…") },
                     onClick = {
                         menu = false
-                        customText = value.takeIf { it > 0 }?.toString().orEmpty()
+                        customText = ""
                         customError = false
                         showCustom = true
                     },
@@ -1748,25 +2021,24 @@ private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
                     onValueChange = {
                         customText = it
                         if (customError) {
-                            customError = it.trim().toIntOrNull()?.let { number -> number > 0 } != true
+                            customError = parseCacheLimitBytes(it) == null
                         }
                     },
-                    label = { Text("缓存上限（GB）") },
+                    label = { Text("缓存上限（MB/GB）") },
                     supportingText = if (customError) {
-                        { Text("请输入正整数 GB") }
+                        { Text("请输入正整数，例如 768 MB 或 2 GB") }
                     } else {
                         null
                     },
                     isError = customError,
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                     modifier = Modifier.fillMaxWidth(),
                 )
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        val customValue = customText.trim().toIntOrNull()?.takeIf { it > 0 }
+                        val customValue = parseCacheLimitBytes(customText)
                         if (customValue == null) {
                             customError = true
                         } else {
@@ -1781,6 +2053,14 @@ private fun OfflineLimitRow(value: Int, onSelect: (Int) -> Unit) {
             },
         )
     }
+}
+
+internal fun parseCacheLimitBytes(value: String): Long? {
+    val token = value.trim().uppercase()
+    val match = Regex("^(\\d+)\\s*(MB|GB)?$").matchEntire(token) ?: return null
+    val amount = match.groupValues[1].toLongOrNull()?.takeIf { it > 0L } ?: return null
+    val multiplier = if (match.groupValues[2] == "MB") 1024L * 1024L else 1024L * 1024L * 1024L
+    return runCatching { Math.multiplyExact(amount, multiplier) }.getOrNull()
 }
 
 @Composable

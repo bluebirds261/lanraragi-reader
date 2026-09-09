@@ -1,0 +1,4 @@
+[
+  {"arcid":"abc", "title":"Gallery A", "timestamp":200, "page":3, "pageCount":10},
+  {"arcid":"local_42", "title":"Local archive", "timestamp":100, "page":1, "pageCount":4}
+]

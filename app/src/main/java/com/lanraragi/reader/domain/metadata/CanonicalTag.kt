@@ -4,6 +4,14 @@ import java.text.Normalizer
 
 enum class TagSource { LANRARAGI, EHENTAI, NHENTAI, USER, UNKNOWN }
 
+/**
+ * Stable semantic identity for a tag. Provenance and presentation fields stay on [CanonicalTag].
+ */
+data class CanonicalTagKey(
+    val namespace: String?,
+    val key: String,
+)
+
 data class CanonicalTag(
     val namespace: String?,
     val key: String,
@@ -12,7 +20,18 @@ data class CanonicalTag(
     val source: TagSource = TagSource.UNKNOWN,
     val confidence: Float? = null,
 ) {
-    val full: String = namespace?.let { "$it:$key" } ?: key
+    /**
+     * Canonical identity used when tags from different sources describe the same semantic tag.
+     */
+    val identity: CanonicalTagKey = CanonicalTagKey(
+        namespace = namespace
+            ?.let(::normalize)
+            ?.lowercase()
+            ?.takeIf(String::isNotBlank),
+        key = normalize(key).lowercase(),
+    )
+
+    val full: String = identity.namespace?.let { "$it:${identity.key}" } ?: identity.key
 
     init {
         require(key.isNotBlank()) { "tag key must not be blank" }

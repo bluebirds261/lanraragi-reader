@@ -49,12 +49,14 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.lanraragi.reader.data.model.TagStat
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.TagRules
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.rememberTagText
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -97,32 +99,53 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    /** 防抖后按输入内容对本地标签做前缀匹配补全（最多 10 条）。 */
-    private fun updateSuggestions(q: String) {
+    /** Room 词库负责中英文/namespace 排序，服务器标签在词库未覆盖时补齐。 */
+    private suspend fun updateSuggestions(q: String) {
         val query = q.trim()
         if (query.isEmpty()) {
             _state.update { it.copy(suggestions = emptyList()) }
             return
         }
         val lower = query.lowercase()
+        val namespaceQuery = TagNamespaceRegistry.canonicalNamespace(lower)
         val ranked = _state.value.tags.mapNotNull { tag ->
+            val namespace = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
             val rank = when {
                 // 0 = 标签值前缀命中，1 = 命名空间前缀命中，2 = 完整标签前缀命中
                 tag.text.lowercase().startsWith(lower) -> 0
-                (tag.namespace ?: "").lowercase().startsWith(lower) -> 1
+                !namespaceQuery.isNullOrEmpty() && namespace.startsWith(namespaceQuery) -> 1
                 tag.full.lowercase().startsWith(lower) -> 2
                 else -> null
             } ?: return@mapNotNull null
             rank to tag
         }
-        val suggestions = ranked
+        val serverSuggestions = ranked
             .sortedWith(
                 compareBy<Pair<Int, TagStat>> { it.first }
+                    .thenByDescending {
+                        TagNamespaceRegistry.descriptor(it.second.namespace)?.completionWeight ?: 0
+                    }
                     .thenByDescending { it.second.weight }
                     .thenBy { it.second.full.lowercase() },
             )
             .take(10)
             .map { it.second }
+        val knowledgeSuggestions = try {
+            container.tagKnowledgeRepository.suggestions(query, limit = 10).map { suggestion ->
+                TagStat(
+                    namespace = suggestion.entry.namespace.takeIf(String::isNotBlank),
+                    text = suggestion.entry.tagKey,
+                    weight = suggestion.frequency.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                )
+            }
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyList()
+        }
+        val suggestions = (knowledgeSuggestions + serverSuggestions)
+            .distinctBy { it.full.lowercase() }
+            .take(10)
         _state.update { it.copy(suggestions = suggestions) }
     }
 
@@ -135,9 +158,14 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         if (_state.value.tags.isNotEmpty() || _state.value.tagsLoading) return
         viewModelScope.launch {
             _state.update { it.copy(tagsLoading = true) }
-            runCatching { container.repository.getTags() }
-                .onSuccess { tags -> _state.update { it.copy(tags = tags, tagsLoading = false) } }
-                .onFailure { _state.update { it.copy(tagsLoading = false) } }
+            try {
+                val tags = container.repository.getTags()
+                _state.update { it.copy(tags = tags, tagsLoading = false) }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                _state.update { it.copy(tagsLoading = false) }
+            }
         }
     }
 
@@ -203,19 +231,32 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                 val groups = remember(state.tags) {
                     val byNs = LinkedHashMap<String, MutableList<TagStat>>()
                     state.tags.sortedBy { it.full.lowercase() }.forEach { t ->
-                        val ns = t.namespace?.lowercase() ?: ""
-                        if (ns == "source") return@forEach
+                        val ns = TagNamespaceRegistry.canonicalNamespace(t.namespace).orEmpty()
+                        if (TagNamespaceRegistry.descriptor(ns)?.defaultHidden == true) return@forEach
                         byNs.getOrPut(ns) { mutableListOf() }.add(t)
                     }
                     val ordered = mutableListOf<Pair<String, List<TagStat>>>()
-                    TagRules.NAMESPACE_ORDER.forEach { ns -> byNs.remove(ns)?.let { ordered += ns to it } }
-                    byNs.entries.filter { it.key.isNotEmpty() }.sortedBy { it.key }
+                    TagNamespaceRegistry.allDescriptors(includeHidden = false).forEach { descriptor ->
+                        byNs.remove(descriptor.name)?.let { ordered += descriptor.name to it }
+                    }
+                    byNs.entries.filter { it.key.isNotEmpty() }
+                        .sortedBy { TagNamespaceRegistry.sortKey(it.key) }
                         .forEach { (ns, list) -> ordered += ns to list }
                     byNs[""]?.let { ordered += "" to it }
                     ordered
                 }
                 val hot = remember(state.tags) {
-                    state.tags.sortedByDescending { it.weight }.take(30)
+                    state.tags
+                        .filterNot {
+                            TagNamespaceRegistry.descriptor(it.namespace)?.defaultHidden == true
+                        }
+                        .sortedWith(
+                            compareByDescending<TagStat> {
+                                TagNamespaceRegistry.descriptor(it.namespace)?.completionWeight ?: 0
+                            }.thenByDescending { it.weight }
+                                .thenBy { it.full.lowercase() },
+                        )
+                        .take(30)
                 }
 
                 LazyColumn(

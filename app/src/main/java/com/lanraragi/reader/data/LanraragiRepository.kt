@@ -29,7 +29,10 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
 
-class ApiException(message: String) : Exception(message)
+class ApiException(
+    message: String,
+    val statusCode: Int? = null,
+) : Exception(message)
 
 data class PageResult(
     val items: List<Archive>,
@@ -222,7 +225,7 @@ class LanraragiRepository(
         if (msg.contains("尚未配置") || msg.contains("格式无效")) {
             throw ApiException(msg)
         }
-        throw ApiException(toUserMessage(resp.code()))
+        throw ApiException(toUserMessage(resp.code()), statusCode = resp.code())
     }
 
     // ============ A 系列 ============
@@ -292,6 +295,14 @@ class LanraragiRepository(
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
         JsonHelpers.parseMinionJob(body ?: "{}")
+    }
+
+    /** Full Minion payload, including plugin result.data, for metadata previews. */
+    suspend fun getMinionJobDetail(jobid: String): String = network {
+        val resp = api.getMinionJobDetail(jobid)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        body ?: "{}"
     }
 
     /** A4 轮询任务直至完成/失败(默认最长 120s)。终态 state: finished|failed|inactive。 */

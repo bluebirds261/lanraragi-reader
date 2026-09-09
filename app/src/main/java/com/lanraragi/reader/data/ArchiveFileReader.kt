@@ -5,6 +5,10 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import com.github.junrar.Archive as RarArchive
+import com.lanraragi.reader.data.local.incremental.LocalArchivePageDerivedCache
+import com.lanraragi.reader.data.local.incremental.LocalArtifactRevision
+import com.lanraragi.reader.data.local.incremental.LocalCoverDerivedCache
+import com.lanraragi.reader.data.local.incremental.LocalDerivedCacheFacade
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
@@ -25,6 +29,8 @@ object ArchiveFileReader {
     private const val MAX_SOURCE_FILES = 8
     private const val MAX_SOURCE_BYTES = 512L * 1024 * 1024
     private const val MAX_IMAGE_LISTS = 64
+    private const val DERIVED_CACHE_DIRECTORY = "local_derived_images"
+    private const val MAX_DERIVED_CACHE_BYTES = 64L * 1024 * 1024
 
     private val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "webp", "gif", "bmp")
     private val RAR_MIME_TYPES = setOf(
@@ -80,6 +86,7 @@ object ArchiveFileReader {
     private val activeSourceFiles = mutableMapOf<String, Int>()
     private val pendingSourceDeletes = mutableSetOf<String>()
     private val knownCacheDirectories = ConcurrentHashMap.newKeySet<File>()
+    private val derivedCaches = ConcurrentHashMap<String, LocalDerivedCacheFacade>()
     private val imageListCache = object : LinkedHashMap<String, List<ArchiveEntry>>(16, 0.75f, true) {
         override fun removeEldestEntry(
             eldest: MutableMap.MutableEntry<String, List<ArchiveEntry>>,
@@ -88,12 +95,61 @@ object ArchiveFileReader {
 
     fun isImage(name: String): Boolean = name.substringAfterLast('.', "").lowercase() in IMAGE_EXTENSIONS
 
-    /** Stable key for Coil's bounded disk cache. Source metadata invalidates replaced archives. */
+    /** Stable key for callers that need a local page cache identity. */
     suspend fun imageCacheKey(context: Context, uri: Uri, pageIndex: Int): String =
         withContext(Dispatchers.IO) {
-            val identity = sourceIdentity(context.applicationContext, uri)
-            "local-archive-page-v2:${identity.fingerprint}:$pageIndex"
+            val entry = getImages(context, uri).getOrNull(pageIndex)?.name ?: "missing:$pageIndex"
+            "local-archive-page-v3:${localArtifactRevision(context, uri, entry).value}"
         }
+
+    suspend fun sourceRevision(context: Context, uri: Uri): String = withContext(Dispatchers.IO) {
+        sourceIdentity(context.applicationContext, uri).fingerprint
+    }
+
+    /**
+     * Revision for a materialized local image. It deliberately includes the backing URI, metadata,
+     * and archive entry so a replaced archive or folder page never aliases an older artifact.
+     */
+    suspend fun localArtifactRevision(
+        context: Context,
+        uri: Uri,
+        entryName: String,
+    ): LocalArtifactRevision = withContext(Dispatchers.IO) {
+        val appContext = context.applicationContext
+        val child = localDirectory(uri)?.let { File(it, entryName).takeIf(File::isFile)?.let(Uri::fromFile) }
+            ?: findSafDirectoryImage(appContext, uri, entryName)
+        val target = child ?: uri
+        val metadata = documentMetadata(appContext, target)
+        LocalArtifactRevision(
+            uri = target.toString(),
+            lastModified = metadata.lastModified,
+            size = metadata.size,
+            entry = entryName,
+        )
+    }
+
+    suspend fun getDerivedImage(
+        context: Context,
+        revision: LocalArtifactRevision,
+        cover: Boolean,
+    ): ByteArray? = if (cover) {
+        LocalCoverDerivedCache(derivedCache(context.applicationContext)).get(revision)
+    } else {
+        LocalArchivePageDerivedCache(derivedCache(context.applicationContext)).get(revision)
+    }
+
+    suspend fun putDerivedImage(
+        context: Context,
+        revision: LocalArtifactRevision,
+        cover: Boolean,
+        bytes: ByteArray,
+    ) {
+        if (cover) {
+            LocalCoverDerivedCache(derivedCache(context.applicationContext)).put(revision, bytes)
+        } else {
+            LocalArchivePageDerivedCache(derivedCache(context.applicationContext)).put(revision, bytes)
+        }
+    }
 
     /** Gets image entries in case-insensitive filename order. */
     suspend fun getImages(context: Context, uri: Uri): List<ArchiveEntry> =
@@ -221,6 +277,7 @@ object ArchiveFileReader {
 
     fun clearCache() {
         synchronized(imageListCache) { imageListCache.clear() }
+        derivedCaches.values.forEach(LocalDerivedCacheFacade::clear)
         knownCacheDirectories.forEach { directory ->
             directory.listFiles()?.forEach { file ->
                 val sourcePath = file.absolutePath.removeSuffix(".partial")
@@ -357,6 +414,28 @@ object ArchiveFileReader {
 
     private fun sourceCacheDirectory(context: Context): File =
         File(context.cacheDir, SOURCE_CACHE_DIRECTORY)
+
+    private fun derivedCache(context: Context): LocalDerivedCacheFacade {
+        val directory = File(context.cacheDir, DERIVED_CACHE_DIRECTORY)
+        return derivedCaches.getOrPut(directory.absolutePath) {
+            LocalDerivedCacheFacade(directory, maxBytes = MAX_DERIVED_CACHE_BYTES)
+        }
+    }
+
+    private data class DocumentMetadata(val lastModified: Long, val size: Long)
+
+    private fun documentMetadata(context: Context, uri: Uri): DocumentMetadata {
+        if (uri.scheme == "file") {
+            val file = File(uri.path.orEmpty())
+            return DocumentMetadata(file.lastModified(), file.length())
+        }
+        val document = runCatching { DocumentFile.fromSingleUri(context, uri) }.getOrNull()
+            ?: runCatching { DocumentFile.fromTreeUri(context, uri) }.getOrNull()
+        return DocumentMetadata(
+            lastModified = runCatching { document?.lastModified() }.getOrNull() ?: 0L,
+            size = runCatching { document?.length() }.getOrNull() ?: 0L,
+        )
+    }
 
     private fun sourceIdentity(context: Context, uri: Uri): SourceIdentity {
         if (uri.scheme == "file") {

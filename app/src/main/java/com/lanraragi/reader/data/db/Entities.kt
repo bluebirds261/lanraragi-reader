@@ -1,6 +1,7 @@
 package com.lanraragi.reader.data.db
 
 import androidx.room.Entity
+import androidx.room.Fts4
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
@@ -33,6 +34,9 @@ data class DownloadTaskEntity(
     val retryCount: Int = 0,
     val priority: Int = 0,
     val error: String? = null,
+    val retryAt: Long? = null,
+    val entityTag: String? = null,
+    val lastModified: String? = null,
     val createdAt: Long,
     val updatedAt: Long,
 )
@@ -59,12 +63,23 @@ data class LocalArchiveEntity(
 data class SavedArtifactEntity(
     @PrimaryKey val artifactId: String,
     val archiveId: String,
+    val serverScope: String? = null,
     val filePath: String,
     val revision: String? = null,
     val byteSize: Long = 0,
     val pageCount: Int = 0,
     val pinned: Boolean = false,
     val lastAccessAt: Long,
+)
+
+@Entity(tableName = "progress_outbox")
+data class ProgressTaskEntity(
+    @PrimaryKey val sourceKey: String,
+    val archiveId: String,
+    val serverScope: String? = null,
+    val page: Int,
+    val pageCount: Int = 0,
+    val updatedAt: Long,
 )
 
 @Entity(tableName = "local_metadata")
@@ -76,6 +91,16 @@ data class LocalMetadataEntity(
     val updatedAt: Long,
 )
 
+/** Durable metadata workbench state, including an unapplied patch. */
+@Entity(tableName = "metadata_state")
+data class MetadataStateEntity(
+    @PrimaryKey val sourceKey: String,
+    val snapshotJson: String,
+    val baselineJson: String? = null,
+    val pendingPatchJson: String,
+    val updatedAt: Long,
+)
+
 @Entity(
     tableName = "metadata_scrape_job",
     indices = [Index("sourceKey"), Index("state"), Index(value = ["providerId", "nextRunAt"])],
@@ -83,6 +108,8 @@ data class LocalMetadataEntity(
 data class MetadataScrapeJobEntity(
     @PrimaryKey val jobId: String,
     val sourceKey: String,
+    val archiveId: String? = null,
+    val serverScope: String? = null,
     val providerId: String,
     val input: String? = null,
     val state: String,
@@ -127,6 +154,18 @@ data class TagDictionaryEntity(
     val updatedAt: Long,
 )
 
+/** Search projection; [TagDictionaryEntity] remains the authoritative tag record. */
+@Fts4
+@Entity(tableName = "tag_dictionary_fts")
+data class TagDictionaryFtsEntity(
+    val canonicalKey: String,
+    val namespace: String,
+    val tagKey: String,
+    val translatedName: String,
+    val fullName: String,
+    val intro: String,
+)
+
 @Entity(
     tableName = "tag_frequency",
     primaryKeys = ["namespace", "tagKey", "source"],
@@ -158,6 +197,21 @@ data class EhFavoriteMappingEntity(
     @PrimaryKey val slotIndex: Int,
     val lanraragiCategoryId: String,
     val mode: String = "ONE_WAY_TO_LANRARAGI",
+    val updatedAt: Long,
+)
+
+/** Persisted E-Hentai favorite rows; slot identity is numeric and survives remote renames. */
+@Entity(
+    tableName = "eh_favorite_entry",
+    primaryKeys = ["slotIndex", "gid", "token"],
+    indices = [Index("slotIndex"), Index("linkedLanraragiArchiveId")],
+)
+data class EhFavoriteEntryEntity(
+    val slotIndex: Int,
+    val gid: String,
+    val token: String = "",
+    val sourceUrl: String? = null,
+    val linkedLanraragiArchiveId: String? = null,
     val updatedAt: Long,
 )
 

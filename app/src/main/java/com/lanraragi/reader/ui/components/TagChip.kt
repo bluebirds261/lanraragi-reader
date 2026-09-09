@@ -14,6 +14,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.data.model.Archive
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import kotlinx.coroutines.flow.MutableStateFlow
 
 /** 全局可观察的自定义标签颜色覆盖（namespace -> ARGB Long）。由 AppContainer 从 DataStore 同步。 */
@@ -64,57 +65,24 @@ fun rememberTagText(ns: String, value: String): String {
 object TagRules {
 
     /** 命名空间展示顺序（越靠前越优先）。 */
-    val NAMESPACE_ORDER = listOf(
-        "parody", "character", "group", "artist", "female", "male", "mixed",
-        "language", "cosplayer", "reclass", "temp",
-        "date", "date_added", "series", "category", "event",
-    )
+    val NAMESPACE_ORDER = TagNamespaceRegistry.allDescriptors()
+        .sortedBy { it.displayOrder }
+        .map { it.name }
 
-    /** 命名空间中文名。 */
-    val NAMESPACE_LABELS = mapOf(
-        "parody" to "原作",
-        "character" to "角色",
-        "group" to "社团",
-        "artist" to "作者",
-        "female" to "女性",
-        "male" to "男性",
-        "mixed" to "混合",
-        "language" to "语言",
-        "cosplayer" to "Coser",
-        "reclass" to "重分类",
-        "temp" to "临时",
-        "date" to "日期",
-        "date_added" to "添加日期",
-        "series" to "系列",
-        "category" to "分类",
-        "event" to "活动",
-    )
+    /** Compatibility projection; registry owns the actual namespace metadata. */
+    val NAMESPACE_LABELS: Map<String, String> =
+        TagNamespaceRegistry.allDescriptors().associate { it.name to it.labelZh }
 
-    /** 命名空间颜色（借鉴 EhViewer/JHenTai 深色主题下的标签配色）。 */
-    val NAMESPACE_COLORS = mapOf(
-        "parody" to Color(0xFFEF5350),     // 红
-        "character" to Color(0xFF66BB6A),  // 绿
-        "group" to Color(0xFF42A5F5),      // 蓝
-        "artist" to Color(0xFFFFA726),     // 橙
-        "female" to Color(0xFFEC407A),     // 粉红
-        "male" to Color(0xFF5C9CE6),       // 蓝
-        "mixed" to Color(0xFFFF7043),      // 橙红
-        "language" to Color(0xFFBA68C8),   // 紫
-        "cosplayer" to Color(0xFF26C6DA),  // 青
-        "reclass" to Color(0xFFCE93D8),    // 淡紫
-        "temp" to Color(0xFF9E9E9E),       // 灰
-        "date" to Color(0xFF90A4AE),       // 蓝灰
-        "date_added" to Color(0xFF90A4AE), // 蓝灰
-        "series" to Color(0xFFFFCA28),     // 黄
-        "category" to Color(0xFF90A4AE),   // 蓝灰
-        "event" to Color(0xFF90A4AE),      // 蓝灰
-        "other" to Color(0xFFBDBDBD),      // 灰
-    )
-
+    /** Compatibility projection; registry owns the actual namespace colors. */
+    val NAMESPACE_COLORS: Map<String, Color> =
+        TagNamespaceRegistry.allDescriptors().associate { descriptor ->
+            descriptor.name to descriptor.defaultColorToken.toComposeColor()
+        }
     private val FallbackColor = Color(0xFF9E9E9E)
 
     /** 取命名空间（无命名空间返回空串）。 */
-    fun nsOf(fullTag: String): String = fullTag.substringBefore(':', "").trim().lowercase()
+    fun nsOf(fullTag: String): String =
+        TagNamespaceRegistry.canonicalNamespace(fullTag.substringBefore(':', "")) ?: ""
 
     /** 取标签值（无命名空间时返回整个标签）。 */
     fun valueOf(fullTag: String): String = fullTag.substringAfter(':', fullTag).trim()
@@ -122,16 +90,25 @@ object TagRules {
     /** 标签是否带命名空间。 */
     fun isNamespaced(fullTag: String): Boolean = fullTag.contains(':')
 
-    fun label(ns: String): String = NAMESPACE_LABELS[ns] ?: if (ns.isEmpty()) "其他" else ns
+    fun label(ns: String): String = TagNamespaceRegistry.descriptor(ns)?.labelZh
+        ?: if (ns.isEmpty()) "其他" else ns
 
-    fun color(ns: String): Color = NAMESPACE_COLORS[ns] ?: FallbackColor
+    fun color(ns: String): Color = TagColorStore.overrides.value[ns]
+        ?.let(::Color)
+        ?: TagNamespaceRegistry.descriptor(ns)?.defaultColorToken?.toComposeColor()
+        ?: FallbackColor
 
     /** 把完整标签列表按命名空间分组并排序。 */
-    fun groupTags(tags: List<String>): List<Pair<String, List<String>>> {
+    fun groupTags(
+        tags: List<String>,
+        includeHidden: Boolean = false,
+    ): List<Pair<String, List<String>>> {
         val byNs = LinkedHashMap<String, MutableList<String>>()
         tags.forEach { t ->
             val ns = nsOf(t)
-            if (ns == "source") return@forEach
+            if (!includeHidden && TagNamespaceRegistry.descriptor(ns)?.defaultHidden == true) {
+                return@forEach
+            }
             byNs.getOrPut(ns) { mutableListOf() }.add(t)
         }
         val ordered = mutableListOf<Pair<String, List<String>>>()
@@ -157,6 +134,9 @@ object TagRules {
     fun artistOf(archive: Archive): String? =
         archive.tagList.firstOrNull { nsOf(it) == "artist" }?.let { valueOf(it) }
 }
+
+private fun String.toComposeColor(): Color =
+    parseHexColor(this)?.let(::Color) ?: Color(0xFF9E9E9E)
 
 /** 详情页用的可点击标签（点击按该标签过滤），按命名空间着色。 */
 @Composable

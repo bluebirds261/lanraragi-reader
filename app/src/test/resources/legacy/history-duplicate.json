@@ -1,0 +1,5 @@
+[
+  {"arcid":"dup", "title":"Old title", "timestamp":100, "page":2, "pageCount":8},
+  {"arcid":"dup", "title":"Newest title", "timestamp":300, "page":7, "pageCount":12},
+  {"arcid":"dup", "title":"Stale title", "timestamp":200, "page":4, "pageCount":9}
+]

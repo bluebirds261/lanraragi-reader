@@ -6,12 +6,20 @@ import java.security.MessageDigest
 sealed interface ArchiveIdentity {
     val sourceKey: String
 
-    data class Remote(val arcid: String) : ArchiveIdentity {
+    data class Remote(
+        val arcid: String,
+        val serverScope: String? = null,
+    ) : ArchiveIdentity {
         init {
             require(arcid.isNotBlank()) { "arcid must not be blank" }
         }
 
-        override val sourceKey: String = "remote:${arcid.lowercase()}"
+        override val sourceKey: String = serverScope
+            ?.trim()
+            ?.trimEnd('/')
+            ?.takeIf(String::isNotBlank)
+            ?.let { "remote:${sha256(it)}:${arcid.lowercase()}" }
+            ?: "remote:${arcid.lowercase()}"
     }
 
     data class LocalSaf(val uri: String) : ArchiveIdentity {

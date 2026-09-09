@@ -67,20 +67,21 @@ class MainActivity : FragmentActivity() {
                 container.settingsRepository.settings,
                 isUnlocked
             ) { settings, unlocked ->
-                // 两种情况开启模糊/隐藏：
-                // 1. 用户手动开启了“任务栏模糊”设置
-                // 2. 开启了安全验证，且当前处于锁定状态
                 val authActive = settings.authEnabled || settings.biometricEnabled
-                settings.blurInRecents || (authActive && !unlocked)
-            }.collect { shouldHide ->
+                val maskRecents = settings.blurInRecents || (authActive && !unlocked)
+                maskRecents to settings.screenshotProtectionEnabled
+            }.collect { (maskRecents, screenshotProtection) ->
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                    setRecentsScreenshotEnabled(!shouldHide)
-                } else {
-                    if (shouldHide) {
+                    setRecentsScreenshotEnabled(!maskRecents)
+                    if (screenshotProtection) {
                         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     } else {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                     }
+                } else if (screenshotProtection) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
                 }
             }
         }

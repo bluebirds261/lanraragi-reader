@@ -1,6 +1,9 @@
 package com.lanraragi.reader.ui
 
+import android.os.Build
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.CircularProgressIndicator
@@ -25,6 +28,8 @@ import kotlinx.coroutines.flow.collect
 import com.lanraragi.reader.ui.screens.CategoryBrowseScreen
 import com.lanraragi.reader.ui.screens.CheckinScreen
 import com.lanraragi.reader.ui.screens.DetailScreen
+import com.lanraragi.reader.ui.screens.DiagnosticsScreen
+import com.lanraragi.reader.ui.screens.EhFavoritesSyncScreen
 import com.lanraragi.reader.ui.screens.FavoritesScreen
 import com.lanraragi.reader.ui.screens.HistoryScreen
 import com.lanraragi.reader.ui.screens.LocalDetailScreen
@@ -37,6 +42,11 @@ import com.lanraragi.reader.ui.screens.StatisticsScreen
 import com.lanraragi.reader.ui.screens.StatsScreen
 import com.lanraragi.reader.ui.screens.TankoubonBrowseScreen
 import com.lanraragi.reader.ui.screens.TankReaderScreen
+import com.lanraragi.reader.data.diagnostics.DiagnosticReportContext
+import com.lanraragi.reader.data.diagnostics.DiagnosticReportCodec
+import com.lanraragi.reader.data.diagnostics.DiagnosticProducers
+import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.db.ReaderDatabase
 
 object Routes {
     const val SETUP = "setup"
@@ -54,6 +64,8 @@ object Routes {
     const val CATEGORY = "category"
     const val TANKOUBONS = "tankoubons"
     const val TANK_READER = "tank_reader"
+    const val DIAGNOSTICS = "diagnostics"
+    const val EH_FAVORITES_SYNC = "eh_favorites_sync"
 
     fun detail(arcid: String) = "$DETAIL/$arcid"
     fun reader(arcid: String) = "$READER/$arcid"
@@ -85,6 +97,7 @@ fun rememberAppContainer(): AppContainer {
 @Composable
 fun AppRoot() {
     val container = rememberAppContainer()
+    val startupStartedAt = remember { System.nanoTime() }
     val settings = container.settingsRepository.settings
         .collectAsStateWithLifecycle(initialValue = null).value
 
@@ -97,6 +110,11 @@ fun AppRoot() {
     }
 
     val navController = rememberNavController()
+    LaunchedEffect(Unit) {
+        val elapsedMs = (System.nanoTime() - startupStartedAt) / 1_000_000L
+        container.diagnostics.firstScreenReady(elapsedMs)
+        DiagnosticProducers.reader(container.diagnostics).success("app_ready", elapsedMs)
+    }
     val start = if (s.baseUrl.isBlank()) Routes.SETUP else Routes.MAIN
     var mainTab by rememberSaveable { mutableIntStateOf(0) }
 
@@ -187,5 +205,69 @@ fun AppRoot() {
         composable(Routes.STATISTICS) {
             StatisticsScreen(container, navController)
         }
+        composable(Routes.DIAGNOSTICS) {
+            BackHandler { navigateBackToMain(navController) }
+            var pendingReport by remember { androidx.compose.runtime.mutableStateOf<String?>(null) }
+            val reportContext = diagnosticReportContext(container)
+            val exportLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.CreateDocument("application/json"),
+            ) { uri ->
+                val report = pendingReport
+                pendingReport = null
+                if (uri != null && report != null) {
+                    runCatching {
+                        container.context.contentResolver.openOutputStream(uri)?.use { output ->
+                            output.write(report.toByteArray(Charsets.UTF_8))
+                        } ?: error("无法打开导出目标")
+                    }
+                }
+            }
+            DiagnosticsScreen(
+                diagnostics = container.diagnostics,
+                reportContext = reportContext,
+                onExportToSaf = {
+                    pendingReport = DiagnosticReportCodec.encode(
+                        container.diagnostics.exportReport(
+                            diagnosticReportContext(container),
+                        ),
+                    )
+                    exportLauncher.launch("lanraragi-reader-diagnostics.json")
+                },
+                onBack = { navigateBackToMain(navController) },
+            )
+        }
+        composable(Routes.EH_FAVORITES_SYNC) {
+            BackHandler { navigateBackToMain(navController) }
+            EhFavoritesSyncScreen(container, navController)
+        }
     }
+}
+
+private fun diagnosticReportContext(container: AppContainer): DiagnosticReportContext {
+    val tasks = container.durableDownloadCoordinator.tasks.value
+    val taskSummary = buildMap {
+        put("total", tasks.size.toString())
+        tasks.groupingBy { it.state.name.lowercase() }
+            .eachCount()
+            .toSortedMap()
+            .forEach { (state, count) -> put(state, count.toString()) }
+    }
+    val usage = container.offlineCache.usage.value
+    val packageInfo = container.context.packageManager.getPackageInfo(container.context.packageName, 0)
+    return DiagnosticReportContext(
+        appVersion = packageInfo.versionName ?: "unknown",
+        deviceSummary = mapOf(
+            "manufacturer" to Build.MANUFACTURER,
+            "model" to Build.MODEL,
+            "sdk" to Build.VERSION.SDK_INT.toString(),
+        ),
+        serverScope = ApiClient.config.baseUrl.takeIf(String::isNotBlank),
+        taskSummary = taskSummary,
+        cacheSummary = mapOf(
+            "offlineBytes" to usage.totalBytes.toString(),
+            "offlineArchives" to usage.count.toString(),
+            "localArchives" to container.localScanManager.localArchives.value.size.toString(),
+        ),
+        roomSchemaSummary = mapOf("version" to ReaderDatabase.CURRENT_SCHEMA_VERSION.toString()),
+    )
 }
