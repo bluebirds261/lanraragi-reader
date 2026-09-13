@@ -53,9 +53,32 @@ class DownloadCoordinatorTest {
     fun retryPolicyOnlyRetriesTransientFailures() {
         val policy = DownloadRetryPolicy(baseDelayMs = 100, maxDelayMs = 1_000)
         assertEquals(300L, policy.retryAt(100, 1, DownloadFailure.Network("offline")))
-        assertEquals(700L, policy.retryAt(100, 5, DownloadFailure.Http(429, "limited", 600)))
+        // 429 优先采用服务器给出的 Retry-After（仍在重试上限内）。
+        assertEquals(700L, policy.retryAt(100, 4, DownloadFailure.Http(429, "limited", 600)))
         assertEquals(null, policy.retryAt(100, 0, DownloadFailure.Http(401, "auth")))
         assertEquals(null, policy.retryAt(100, 0, DownloadFailure.Storage("disk")))
+    }
+
+    /** C3：重试次数到达上限后一律不再排重试，避免永久失败的任务无限弹跳。 */
+    @Test
+    fun retryPolicyStopsAtConfiguredRetryLimit() {
+        // maxDelayMs 放大，避免退避被上限截断，从而能精确断言最后一次允许的重试时刻。
+        val policy = DownloadRetryPolicy(baseDelayMs = 100, maxDelayMs = 100_000)
+        assertEquals(DEFAULT_DOWNLOAD_MAX_RETRIES, policy.maxRetries)
+        assertEquals(
+            100L + (100L shl (DEFAULT_DOWNLOAD_MAX_RETRIES - 1)),
+            policy.retryAt(100, DEFAULT_DOWNLOAD_MAX_RETRIES - 1, DownloadFailure.Network("offline")),
+        )
+        assertEquals(null, policy.retryAt(100, DEFAULT_DOWNLOAD_MAX_RETRIES, DownloadFailure.Network("offline")))
+        assertEquals(null, policy.retryAt(100, DEFAULT_DOWNLOAD_MAX_RETRIES + 3, DownloadFailure.Network("offline")))
+        assertEquals(
+            null,
+            policy.retryAt(100, DEFAULT_DOWNLOAD_MAX_RETRIES, DownloadFailure.Http(503, "unavailable")),
+        )
+        assertEquals(
+            null,
+            policy.retryAt(100, DEFAULT_DOWNLOAD_MAX_RETRIES, DownloadFailure.Http(429, "limited", 600)),
+        )
     }
 
     @Test

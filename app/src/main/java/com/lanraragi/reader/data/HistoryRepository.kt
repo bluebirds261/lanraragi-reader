@@ -140,19 +140,3 @@ class UsageRepository(private val context: Context) {
     fun clear() { _usage.value = emptyMap(); runCatching { file.delete() } }
     private fun persist() { runCatching { file.parentFile?.mkdirs(); file.writeText(ApiClient.json.encodeToString(_usage.value)) } }
 }
-
-/** 每日打卡：记录打卡日期（yyyy-MM-dd），持久化到 filesDir/checkin.json。 */
-class CheckinRepository(private val context: Context) {
-    private val file = File(context.filesDir, "checkin.json")
-    private val _dates = MutableStateFlow<List<String>>(emptyList())
-    val dates = _dates.asStateFlow()
-    init { load() }
-    fun load() { runCatching { if (file.exists()) _dates.value = ApiClient.json.decodeFromString(file.readText()) } }
-    fun isCheckedToday(): Boolean = LocalDate.now().toString() in _dates.value
-    suspend fun checkin() {
-        val today = LocalDate.now().toString()
-        if (today !in _dates.value) { _dates.value = _dates.value + today; persist() }
-    }
-    fun clear() { _dates.value = emptyList(); runCatching { file.delete() } }
-    private fun persist() { runCatching { file.parentFile?.mkdirs(); file.writeText(ApiClient.json.encodeToString(_dates.value)) } }
-}

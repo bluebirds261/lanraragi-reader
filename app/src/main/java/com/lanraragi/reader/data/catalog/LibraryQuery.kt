@@ -10,6 +10,7 @@ data class LibraryQuery(
     val requiredCapabilities: Set<LibraryCapability> = emptySet(),
     val newOnly: Boolean = false,
     val untaggedOnly: Boolean = false,
+    val hideCompleted: Boolean = false,
     val sort: LibrarySort = LibrarySort.TITLE,
     val direction: SortDirection = SortDirection.ASC,
     val viewMode: LibraryViewMode = LibraryViewMode.GRID,
@@ -34,6 +35,7 @@ data class LibraryQuery(
             categoryId = q.categoryId,
             newOnly = q.newOnly,
             untaggedOnly = q.untaggedOnly,
+            hideCompleted = q.hideCompleted,
             sort = q.sort,
             direction = q.direction,
         )
@@ -59,6 +61,7 @@ data class RemoteLibraryRequest(
     val categoryId: String?,
     val newOnly: Boolean,
     val untaggedOnly: Boolean,
+    val hideCompleted: Boolean = false,
     val sort: LibrarySort,
     val direction: SortDirection,
 )

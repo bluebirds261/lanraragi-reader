@@ -115,7 +115,12 @@ object NHentaiMetadataProvider : MetadataCandidateProvider {
         .distinctBy { candidate -> candidate.sourceUrl ?: "${candidate.match}:${candidate.sourceId}:${candidate.normalizedTitle}" }
         .toList()
 
-    data class NHentaiGallery internal constructor(
+    /**
+     * nHentai 画廊的精确身份。同 [EHentaiMetadataProvider.EHentaiGallery]：
+     * 构造函数是 internal，因此不能用 data class（会生成公开的 `copy()` 旁路，
+     * Kotlin 2.5 起属于编译错误）。
+     */
+    class NHentaiGallery internal constructor(
         val id: String,
         internal val explicitUrl: Boolean,
     ) {
@@ -129,5 +134,8 @@ object NHentaiMetadataProvider : MetadataCandidateProvider {
     private val SUPPORTED_HOSTS = setOf("nhentai.net", "www.nhentai.net")
     private val GALLERY_PATH = Regex("^/g/([1-9][0-9]{0,8})/?$")
     private val NUMERIC_ID = Regex("[1-9][0-9]{0,8}")
-    private val BRACED_FILE_ID = Regex("(?:^|[\\s_-])\\{([1-9][0-9]{0,8})}")
+    // 末尾的 `}` 必须转义：它闭合的是 `\{`，不是量词。Android 的 java.util.regex 实现
+    // （与 OpenJDK 不同）会因未转义的字面 `}` 抛 PatternSyntaxException: Syntax error in
+    // regexp pattern，而这个对象在 <clinit> 里编译正则，一旦抛错就是「打开元数据工作台即崩」。
+    private val BRACED_FILE_ID = Regex("(?:^|[\\s_-])\\{([1-9][0-9]{0,8})\\}")
 }

@@ -19,6 +19,13 @@ data class Archive(
     val category: String = "",
     val pages: List<String> = emptyList(),
     val toc: List<TocEntry> = emptyList(),
+    /**
+     * 单行本（TANK_ 前缀 arcid）的成员档案数量，由服务端 `build_tank_json` 输出。
+     * 普通档案 JSON 没有该字段 → 0（默认值），因此卡片以此判定「是否为单行本 / 共几卷」。
+     * 追加在构造函数末尾：既有按位置构造 Archive 的调用点不受影响。
+     * 注意 pagecount 对单行本是**成员页数之和**，不是卷数，卷数只认这个字段。
+     */
+    val archive_count: Int = 0,
 ) {
     val tagList: List<String>
         get() = tags.split(',').map { it.trim() }.filter { it.isNotEmpty() }
@@ -99,6 +106,12 @@ data class FilterPreset(
     val categoryId: String = "",
     val newOnly: Boolean = false,
     val untaggedOnly: Boolean = false,
+    /**
+     * 「隐藏读完」也属于筛选条件，必须随预设一起保存：
+     * 否则应用预设后该开关会残留上一次的状态，而高亮又判定「与预设一致」，
+     * 用户看到的列表和预设定义就会对不上（随机抽屉也会继承这个不可见条件）。
+     */
+    val hideCompleted: Boolean = false,
 )
 
 /** `/api/info` 返回的服务器信息(字段以默认值兜底,未知字段忽略)。 */
@@ -131,7 +144,21 @@ data class MinionJob(
     val retries: Int = 0,
     val note: String = "",
     val result: String = "",
-)
+) {
+    /** 终态判定，与 [com.lanraragi.reader.data.LanraragiRepository.pollJobUntilDone] 保持一致。 */
+    val isTerminal: Boolean
+        get() {
+            val s = state.lowercase()
+            return s.contains("finish") || s.contains("done") || s.contains("fail") ||
+                s.contains("error") || s.contains("inactive") || s == "dead" || s.isBlank()
+        }
+
+    val isFailed: Boolean
+        get() {
+            val s = state.lowercase()
+            return s.contains("fail") || s.contains("error") || s == "dead"
+        }
+}
 
 /** 服务器插件信息(`/api/plugins/{type}`)。 */
 @Serializable

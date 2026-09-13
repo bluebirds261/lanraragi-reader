@@ -127,4 +127,6 @@ internal fun normalizeCandidateTitle(value: String?): String? {
 }
 
 private val ARCHIVE_SUFFIX = Regex("(?i)\\.(?:cbz|cbr|cb7|zip|rar|7z|pdf)$")
-private val LEADING_GALLERY_IDENTIFIER = Regex("^(?:\\{[1-9][0-9]*}|\\[[1-9][0-9]*])\\s*")
+// 同上：`}`/`]` 在各自分支里闭合的是转义后的 `\{` / `\[`，必须一并转义，
+// 否则 Android 的 java.util.regex 会在此顶层属性初始化时抛 PatternSyntaxException。
+private val LEADING_GALLERY_IDENTIFIER = Regex("^(?:\\{[1-9][0-9]*\\}|\\[[1-9][0-9]*\\])\\s*")

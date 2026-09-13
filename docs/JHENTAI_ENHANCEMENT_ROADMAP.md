@@ -877,7 +877,7 @@ JHenTai 采用 Apache-2.0。若未来不是“按思路重写”，而是直接�
 集中验证命令基线：
 
 ```powershell
-$env:JAVA_HOME='C:\Users\辰宿列张\.jdks\jbr-21.0.11'
+$env:JAVA_HOME='<JDK 21 安装路径>'
 $env:HTTP_PROXY=''
 $env:HTTPS_PROXY=''
 .\gradlew.bat testDebugUnitTest :app:assembleDebug

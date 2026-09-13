@@ -236,8 +236,7 @@ fun LocalDetailScreen(
                         nativeProviderLoading = true
                         nativeError = null
                         try {
-                            val cookie = if (candidate.providerId == "ehentai") container.ehFavoriteCredentials.currentCookie() else null
-                            val fetched = container.nativeMetadataFetch.fetch(candidate.providerId, id, url, cookie)
+                            val fetched = container.nativeMetadataFetch.fetch(candidate.providerId, id, url)
                             container.metadataRepository.stagePatch(localTarget, displayedMetadata, fetched.toPatch())
                             container.metadataRepository.preview(localTarget, providerMetadataApplyPolicy())
                             providerPatchPending = true

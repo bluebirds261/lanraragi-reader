@@ -186,13 +186,14 @@ class MetadataRepositoryTest {
         )
 
         val state = repository.refresh(target)
+        val latest = requireNotNull(state.latest)
 
-        assertEquals(setOf(MetadataFieldName.TITLE), state.latest!!.userOverrides)
-        assertEquals(titleProvenance, state.latest!!.provenance["title"])
-        assertEquals(tagProvenance, state.latest!!.provenance["tag:${retainedTag.full}"])
-        assertFalse("tag:${removedTag.full}" in state.latest!!.provenance)
-        assertEquals(TagSource.USER, state.latest!!.tags.single().source)
-        assertEquals("server-r2", state.latest!!.revision)
+        assertEquals(setOf(MetadataFieldName.TITLE), latest.userOverrides)
+        assertEquals(titleProvenance, latest.provenance["title"])
+        assertEquals(tagProvenance, latest.provenance["tag:${retainedTag.full}"])
+        assertFalse("tag:${removedTag.full}" in latest.provenance)
+        assertEquals(TagSource.USER, latest.tags.single().source)
+        assertEquals("server-r2", latest.revision)
     }
 
     @Test

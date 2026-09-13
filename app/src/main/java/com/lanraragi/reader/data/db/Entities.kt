@@ -180,41 +180,6 @@ data class TagFrequencyEntity(
     val updatedAt: Long,
 )
 
-@Entity(tableName = "eh_favorite_slot")
-data class EhFavoriteSlotEntity(
-    @PrimaryKey val slotIndex: Int,
-    val remoteName: String,
-    val remoteCount: Int = 0,
-    val color: Long? = null,
-    val updatedAt: Long,
-)
-
-@Entity(
-    tableName = "eh_favorite_mapping",
-    indices = [Index("lanraragiCategoryId")],
-)
-data class EhFavoriteMappingEntity(
-    @PrimaryKey val slotIndex: Int,
-    val lanraragiCategoryId: String,
-    val mode: String = "ONE_WAY_TO_LANRARAGI",
-    val updatedAt: Long,
-)
-
-/** Persisted E-Hentai favorite rows; slot identity is numeric and survives remote renames. */
-@Entity(
-    tableName = "eh_favorite_entry",
-    primaryKeys = ["slotIndex", "gid", "token"],
-    indices = [Index("slotIndex"), Index("linkedLanraragiArchiveId")],
-)
-data class EhFavoriteEntryEntity(
-    val slotIndex: Int,
-    val gid: String,
-    val token: String = "",
-    val sourceUrl: String? = null,
-    val linkedLanraragiArchiveId: String? = null,
-    val updatedAt: Long,
-)
-
 @Entity(tableName = "legacy_import_state")
 data class LegacyImportStateEntity(
     @PrimaryKey val importKey: String,

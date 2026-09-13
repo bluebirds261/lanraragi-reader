@@ -57,22 +57,6 @@ sealed interface DownloadTaskSpec {
         override val label: String = "",
     ) : DownloadTaskSpec
 
-    @Serializable
-    @SerialName("page")
-    data class Page(
-        override val source: DownloadSourceIdentity,
-        override val destination: DownloadDestination,
-        val page: Int,
-        override val expectedRevision: String? = null,
-        override val priority: Int = DEFAULT_PRIORITY,
-        val range: DownloadRange? = null,
-        override val label: String = "",
-    ) : DownloadTaskSpec {
-        init {
-            require(page >= 0) { "page must be zero based" }
-        }
-    }
-
     companion object {
         const val DEFAULT_PRIORITY = 0
     }

@@ -126,7 +126,14 @@ object EHentaiMetadataProvider : MetadataCandidateProvider {
         .distinctBy { candidate -> candidate.sourceUrl ?: "${candidate.match}:${candidate.sourceId}:${candidate.normalizedTitle}" }
         .toList()
 
-    data class EHentaiGallery internal constructor(
+    /**
+     * E-Hentai 画廊的精确身份（gid + token + 站点）。
+     *
+     * 用普通类而不是 `data class`：构造函数是 internal，而 data class 会自动生成**公开**的
+     * `copy()`，等于给外部开了一条绕过构造函数的旁路（Kotlin 2.4 已就该问题告警，2.5 起直接报错）。
+     * 这里只需要一个不可变的载体，`copy()` 全仓无处使用。
+     */
+    class EHentaiGallery internal constructor(
         val gid: String,
         val token: String,
         val host: String,

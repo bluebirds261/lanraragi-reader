@@ -26,46 +26,40 @@ import com.lanraragi.reader.LanraragiApplication
 import com.lanraragi.reader.di.AppContainer
 import kotlinx.coroutines.flow.collect
 import com.lanraragi.reader.ui.screens.CategoryBrowseScreen
-import com.lanraragi.reader.ui.screens.CheckinScreen
 import com.lanraragi.reader.ui.screens.DetailScreen
 import com.lanraragi.reader.ui.screens.DiagnosticsScreen
-import com.lanraragi.reader.ui.screens.EhFavoritesSyncScreen
-import com.lanraragi.reader.ui.screens.FavoritesScreen
 import com.lanraragi.reader.ui.screens.HistoryScreen
 import com.lanraragi.reader.ui.screens.LocalDetailScreen
-import com.lanraragi.reader.ui.screens.NavigationScreen
-import com.lanraragi.reader.ui.screens.OfflineScreen
 import com.lanraragi.reader.ui.screens.ReaderScreen
 import com.lanraragi.reader.ui.screens.SearchScreen
-import com.lanraragi.reader.ui.screens.ServerSetupScreen
 import com.lanraragi.reader.ui.screens.StatisticsScreen
-import com.lanraragi.reader.ui.screens.StatsScreen
 import com.lanraragi.reader.ui.screens.TankoubonBrowseScreen
-import com.lanraragi.reader.ui.screens.TankReaderScreen
+import com.lanraragi.reader.ui.setup.GuideScreen
+import com.lanraragi.reader.ui.setup.OnboardingWizard
+import com.lanraragi.reader.ui.tools.WritebackScreen
 import com.lanraragi.reader.data.diagnostics.DiagnosticReportContext
 import com.lanraragi.reader.data.diagnostics.DiagnosticReportCodec
 import com.lanraragi.reader.data.diagnostics.DiagnosticProducers
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.db.ReaderDatabase
+import com.lanraragi.reader.data.catalog.isTankArchiveId
 
 object Routes {
     const val SETUP = "setup"
+    /** 编辑模式向导：从设置再次进入首启向导（复用同一组件，不改变首启判定）。 */
+    const val WIZARD_EDIT = "wizard_edit"
     const val MAIN = "main"
     const val DETAIL = "detail"
     const val READER = "reader"
     const val SEARCH = "search"
-    const val STATS = "stats"
-    const val OFFLINE = "offline"
-    const val FAVORITES = "favorites"
     const val HISTORY = "history"
-    const val CHECKIN = "checkin"
     const val STATISTICS = "statistics"
-    const val NAVIGATION = "navigation"
+    const val GUIDE = "guide"
     const val CATEGORY = "category"
     const val TANKOUBONS = "tankoubons"
     const val TANK_READER = "tank_reader"
     const val DIAGNOSTICS = "diagnostics"
-    const val EH_FAVORITES_SYNC = "eh_favorites_sync"
+    const val WRITEBACK = "writeback"
 
     fun detail(arcid: String) = "$DETAIL/$arcid"
     fun reader(arcid: String) = "$READER/$arcid"
@@ -115,7 +109,16 @@ fun AppRoot() {
         container.diagnostics.firstScreenReady(elapsedMs)
         DiagnosticProducers.reader(container.diagnostics).success("app_ready", elapsedMs)
     }
-    val start = if (s.baseUrl.isBlank()) Routes.SETUP else Routes.MAIN
+    // 首启向导只在「尚未完成引导」时进入。baseUrl 为空是合法状态（仅本地书架）：
+    // 向导第 4 步的「跳过，先使用本地书架」不写 baseUrl，若这里仍以 baseUrl 为空判定，
+    // 用户每次冷启动都会被弹回向导，永远进不了主界面。
+    //
+    // 用 remember 把首次判定钉死：NavHost 的 graph 以 startDestination 为 key，
+    // 若它在运行中从 SETUP 变成 MAIN（向导收尾会写 onboardingCompleted），整张图会被重建、
+    // 返回栈与 ViewModelStore 一并清空——LibraryViewModel.onCleared 会取消共享的图库请求，
+    // 于是「保存服务器后进入主界面」那一刻图库停在空列表且不报错。
+    // 完成引导后的跳转由向导自己的 navigate(MAIN){popUpTo(SETUP)} 负责，不需要改这里的值。
+    val start = remember { if (s.onboardingCompleted) Routes.MAIN else Routes.SETUP }
     var mainTab by rememberSaveable { mutableIntStateOf(0) }
 
     // E7 深链/分享：消费 DeepLinkBus 中的 arcid，跳转到详情页
@@ -123,38 +126,54 @@ fun AppRoot() {
         com.lanraragi.reader.ui.screens.DeepLinkBus.arcid.collect { arcid ->
             if (!arcid.isNullOrBlank()) {
                 com.lanraragi.reader.ui.screens.DeepLinkBus.arcid.value = null
-                navController.navigate(Routes.detail(arcid))
+                // 深链可能是单行本 id：档案详情端点要求 40 位 arcid，TANK_ 只能进单行本阅读器。
+                if (isTankArchiveId(arcid)) {
+                    navController.navigate(Routes.tankReader(arcid))
+                } else {
+                    navController.navigate(Routes.detail(arcid))
+                }
             }
         }
     }
 
     NavHost(navController = navController, startDestination = start) {
         composable(Routes.SETUP) {
-            ServerSetupScreen(container) {
-                navController.navigate(Routes.MAIN) {
-                    popUpTo(Routes.SETUP) { inclusive = true }
-                }
-            }
+            OnboardingWizard(
+                container = container,
+                onDone = {
+                    navController.navigate(Routes.MAIN) {
+                        popUpTo(Routes.SETUP) { inclusive = true }
+                    }
+                },
+            )
+        }
+
+        // ----------------- 【编辑模式向导（设置 → 引导）】 -----------------
+        // 复用同一 OnboardingWizard：各步初值都来自当前 settings，只有主动改动才写回；
+        // onDone 只做返回，不再 popUpTo(SETUP)（该路由不在当前返回栈中），
+        // markOnboardingCompleted 对已完成引导的用户是幂等空操作。
+        composable(Routes.WIZARD_EDIT) {
+            OnboardingWizard(
+                container = container,
+                onDone = { navController.popBackStack() },
+            )
         }
         composable(Routes.MAIN) {
             MainScreen(container, navController, mainTab) { mainTab = it }
         }
 
-        // ----------------- 【设置 / 导航页面】 -----------------
-        composable(Routes.NAVIGATION) {
-            BackHandler {
-                navigateBackToMain(navController)
-            }
-            NavigationScreen(container, navController, mainTab) { mainTab = it }
+        // ----------------- 【元数据中文化向导（设置 → 工具）】 -----------------
+        composable(Routes.WRITEBACK) {
+            WritebackScreen(container, onBack = { navController.popBackStack() })
         }
 
-        // ----------------- 【下载 / 离线页面】 -----------------
-        composable(Routes.OFFLINE) {
-            BackHandler {
-                navigateBackToMain(navController)
-            }
-            OfflineScreen(container, navController)
+        // ----------------- 【使用指南】 -----------------
+        composable(Routes.GUIDE) {
+            GuideScreen(onBack = { navController.popBackStack() })
         }
+
+        // 【离线缓存页 → 下载页】的路由已于第六轮删除：OfflineScreen 退役后该路由既无
+        // 内部 navigate() 调用方，也没有 navDeepLink/自定义 scheme，外部无法抵达。
 
         composable("${Routes.DETAIL}/{arcid}") { entry ->
             val arcid = entry.arguments?.getString("arcid").orEmpty()
@@ -170,13 +189,11 @@ fun AppRoot() {
                 entry.arguments?.getString("arcid").orEmpty(),
                 navController,
                 initialPage = entry.arguments?.getString("page")?.toIntOrNull(),
+                onBack = { navController.popBackStack() },
             )
         }
         composable(Routes.SEARCH) {
             SearchScreen(container, navController)
-        }
-        composable(Routes.STATS) {
-            StatsScreen(container, navController)
         }
         composable(Routes.CATEGORY) {
             CategoryBrowseScreen(container, navController, null)
@@ -191,16 +208,15 @@ fun AppRoot() {
             TankoubonBrowseScreen(container, navController, entry.arguments?.getString("id"))
         }
         composable("${Routes.TANK_READER}/{id}") { entry ->
-            TankReaderScreen(container, entry.arguments?.getString("id").orEmpty(), navController)
-        }
-        composable(Routes.FAVORITES) {
-            FavoritesScreen(container, navController)
+            ReaderScreen(
+                container = container,
+                tankId = entry.arguments?.getString("id").orEmpty(),
+                navController = navController,
+                onBack = { navController.popBackStack() },
+            )
         }
         composable(Routes.HISTORY) {
             HistoryScreen(container, navController)
-        }
-        composable(Routes.CHECKIN) {
-            CheckinScreen(container, navController)
         }
         composable(Routes.STATISTICS) {
             StatisticsScreen(container, navController)
@@ -235,10 +251,6 @@ fun AppRoot() {
                 },
                 onBack = { navigateBackToMain(navController) },
             )
-        }
-        composable(Routes.EH_FAVORITES_SYNC) {
-            BackHandler { navigateBackToMain(navController) }
-            EhFavoritesSyncScreen(container, navController)
         }
     }
 }

@@ -36,7 +36,8 @@ class AppDataBootstrapperTest {
         assertTrue(imports.all { it.sourceVersion == AppDataBootstrapper.SOURCE_VERSION })
         assertSource(report, AppDataBootstrapper.LOCAL_INDEX_KEY, LegacySourceStatus.IMPORTED, 1)
         assertSource(report, AppDataBootstrapper.HISTORY_KEY, LegacySourceStatus.IMPORTED, 2)
-        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 3)
+        // Every legacy task is a removed "PAGE" task, so nothing is imported.
+        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 0)
         assertSource(report, AppDataBootstrapper.OFFLINE_INDEX_KEY, LegacySourceStatus.IMPORTED, 2)
     }
 
@@ -87,7 +88,8 @@ class AppDataBootstrapperTest {
             committedKeys,
         )
         assertSource(report, AppDataBootstrapper.LOCAL_INDEX_KEY, LegacySourceStatus.IMPORTED, 1)
-        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 3)
+        // All-PAGE download tasks are skipped; the valid source still commits.
+        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 0)
         assertSource(report, AppDataBootstrapper.OFFLINE_INDEX_KEY, LegacySourceStatus.IMPORTED, 2)
     }
 
@@ -115,7 +117,7 @@ class AppDataBootstrapperTest {
             ),
             committedKeys,
         )
-        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 3)
+        assertSource(report, AppDataBootstrapper.DOWNLOAD_TASKS_KEY, LegacySourceStatus.IMPORTED, 0)
         assertSource(report, AppDataBootstrapper.OFFLINE_INDEX_KEY, LegacySourceStatus.IMPORTED, 2)
     }
 
@@ -173,6 +175,8 @@ class AppDataBootstrapperTest {
         )
         write(
             AppDataBootstrapper.DOWNLOAD_TASKS_KEY,
+            // "PAGE" (收藏单页) tasks were removed app-wide; the importer skips them,
+            // so this all-PAGE document is a valid source that commits zero rows.
             """[{"id":"task-a","type":"PAGE"},{"id":"task-b","type":"PAGE"},{"id":"task-c","type":"PAGE"}]""",
         )
         write(

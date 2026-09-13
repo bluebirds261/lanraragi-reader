@@ -129,11 +129,11 @@ private class ServerInterceptor(private val config: ServerConfig) : Interceptor 
                 .build()
             request.newBuilder()
                 .url(newUrl)
-                .header("Authorization", "Bearer ${config.apiKey}")
+                .header("Authorization", authorizationHeader())
                 .build()
         } else {
             request.newBuilder()
-                .header("Authorization", "Bearer ${config.apiKey}")
+                .header("Authorization", authorizationHeader())
                 .build()
         }
 
@@ -151,8 +151,26 @@ private class ServerInterceptor(private val config: ServerConfig) : Interceptor 
         }
     }
 
-    private fun errorResponse(chain: Interceptor.Chain, code: Int, message: String): Response {
-        return Response.Builder()
+    /**
+     * LANraragi 的鉴权头契约是 `Authorization: Bearer <base64(api_key)>`
+     * （openapi.yaml 的 `api_key` securityScheme；服务端逐字节比较
+     * lib/LANraragi/Utils/Login.pm 的 `is_logged_in_api`：
+     * `"Bearer " . encode_base64($key, "")`）。
+     *
+     * 之前这里直接拼接原始 API Key，凡是显式校验 `is_logged_in_api` 的写接口
+     * （进度回传、New 标记、元数据回写、分类增删改、备份恢复、插件/Minion 排队等）
+     * 在设置了网页密码的服务器上都会返回 401。
+     */
+    private fun authorizationHeader(): String {
+        val key = config.apiKey.trim()
+        if (key.isEmpty()) return "Bearer "
+        // java.util.Base64（API 26+，minSdk=26）与 Perl encode_base64 的字母表/填充一致，
+        // 且不像 android.util.Base64 那样需要 Android 运行时，单测可直接运行。
+        val encoded = java.util.Base64.getEncoder().encodeToString(key.toByteArray(Charsets.UTF_8))
+        return "Bearer $encoded"
+    }
+
+    private fun errorResponse(chain: Interceptor.Chain, code: Int, message: String): Response {        return Response.Builder()
             .request(chain.request())
             .protocol(Protocol.HTTP_1_1)
             .code(code)

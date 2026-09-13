@@ -76,6 +76,8 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         val tagsLoading: Boolean = false,
         val history: List<String> = emptyList(),
         val suggestions: List<TagStat> = emptyList(),
+        /** D4 词典归一化映射（输入 token → 库内 tag），供联想区映射 chips 展示。 */
+        val mappings: List<Pair<String, String>> = emptyList(),
     )
 
     private val _state = MutableStateFlow(UiState())
@@ -99,13 +101,21 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    /** Room 词库负责中英文/namespace 排序，服务器标签在词库未覆盖时补齐。 */
+    /** Room 词库负责中英文/namespace 排序，服务器标签在词库未覆盖时补齐；同时生成 D4 词典映射。 */
     private suspend fun updateSuggestions(q: String) {
         val query = q.trim()
         if (query.isEmpty()) {
-            _state.update { it.copy(suggestions = emptyList()) }
+            _state.update { it.copy(suggestions = emptyList(), mappings = emptyList()) }
             return
         }
+        val mappings = try {
+            container.tagTranslationRepository.normalizeSearchPreview(query)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            emptyList()
+        }
+        _state.update { it.copy(mappings = mappings) }
         val lower = query.lowercase()
         val namespaceQuery = TagNamespaceRegistry.canonicalNamespace(lower)
         val ranked = _state.value.tags.mapNotNull { tag ->
@@ -169,12 +179,23 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
         }
     }
 
-    fun submit(query: String) {
+    /**
+     * 提交搜索：[normalize] 为 true 时先经 D4 词典归一化（中文译名/别名 → 库内原文 tag，
+     * 英文原文 → 中文库目标形态）再写回 SearchBus；词库不可用时回退原文。
+     * 已是库内形态的 chips（热门/联想/映射结果）传 normalize = false 直接提交。
+     */
+    fun submit(query: String, normalize: Boolean = true) {
         val q = query.trim()
         if (q.isEmpty()) return
         viewModelScope.launch {
             container.searchHistoryRepository.add(q)
-            SearchBus.query.value = q
+            SearchBus.query.value = if (!normalize) q else try {
+                container.tagTranslationRepository.normalizeSearchQuery(q)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                q
+            }
         }
     }
 
@@ -209,7 +230,7 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                 value = state.query,
                 onValueChange = vm::onQueryChange,
                 placeholder = { Text("搜索标题或标签…") },
-                leadingIcon = { Icon(Icons.Filled.Search, null) },
+                leadingIcon = { Icon(Icons.Filled.Search, "搜索") },
                 trailingIcon = {
                     if (state.query.isNotEmpty()) {
                         IconButton(onClick = { vm.onQueryChange("") }) { Icon(Icons.Filled.Clear, "清除") }
@@ -307,7 +328,8 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                                     FilterChip(
                                         selected = false,
                                         onClick = {
-                                            vm.submit(tag.full)
+                                            // 热门标签已是服务器库内形态，直接提交不归一化
+                                            vm.submit(tag.full, normalize = false)
                                             navController.popBackStack()
                                         },
                                         label = { Text(rememberTagText(TagRules.nsOf(tag.full), TagRules.valueOf(tag.full)), color = rememberTagColor(TagRules.nsOf(tag.full))) },
@@ -355,9 +377,32 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                     }
                 }
             } else {
+                // 词典归一化映射（D4：点击 chip 直接以归一化结果提交；无映射时不显示）
+                val mappings = state.mappings
                 // 联想（由 ViewModel 防抖前缀补全生成）
                 val suggestions = state.suggestions
                 Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+                    if (mappings.isNotEmpty()) {
+                        Text(
+                            "词典映射（点击按库内标签搜索）",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            mappings.forEach { (input, normalized) ->
+                                FilterChip(
+                                    selected = false,
+                                    onClick = {
+                                        vm.submit(normalized, normalize = false)
+                                        navController.popBackStack()
+                                    },
+                                    label = { Text("$input → $normalized") },
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
+                    }
                     Text(
                         "联想（点击搜索）",
                         style = MaterialTheme.typography.labelMedium,
@@ -369,7 +414,8 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                             FilterChip(
                                 selected = false,
                                 onClick = {
-                                    vm.submit(tag.full)
+                                    // 联想结果已是词典/服务器库内形态，直接提交不归一化
+                                    vm.submit(tag.full, normalize = false)
                                     navController.popBackStack()
                                 },
                                 label = { Text(tag.full, color = rememberTagColor(TagRules.nsOf(tag.full))) },

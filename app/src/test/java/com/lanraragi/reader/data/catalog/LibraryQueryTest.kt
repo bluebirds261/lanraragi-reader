@@ -17,6 +17,16 @@ class LibraryQueryTest {
     }
 
     @Test
+    fun hideCompletedPassesThroughToRemoteRequestAndSurvivesNormalization() {
+        assertEquals(false, LibraryQuery().remoteRequest().hideCompleted)
+        assertEquals(true, LibraryQuery(hideCompleted = true).remoteRequest().hideCompleted)
+        assertEquals(
+            true,
+            LibraryQuery(hideCompleted = true, text = " x ").normalized().remoteRequest().hideCompleted,
+        )
+    }
+
+    @Test
     fun mixedRepositoryFiltersDeduplicatesAndPagesDeterministically() = runTest {
         val remote = row("r1", "Beta", listOf("artist:a"))
         val local = row("local", "Alpha", isLocal = true, saved = true)

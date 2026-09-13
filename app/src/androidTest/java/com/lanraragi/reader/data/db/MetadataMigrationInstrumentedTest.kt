@@ -7,6 +7,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -26,7 +27,7 @@ class MetadataMigrationInstrumentedTest {
     }
 
     @Test
-    fun v1ToV8CreatesAllRoadmapTablesAndColumnsAndBackfillsTagSearchIndex() {
+    fun v1ToV9CreatesAllRoadmapTablesAndColumnsAndBackfillsTagSearchIndex() {
         createV1Database()
         SQLiteDatabase.openDatabase(
             context.getDatabasePath(TEST_DB).path,
@@ -95,8 +96,13 @@ class MetadataMigrationInstrumentedTest {
             assertTrue("entityTag" in columns)
             assertTrue("lastModified" in columns)
         }
+        // v8→v9 删除了 EH 收藏同步遗留的三张表，迁移后必须不存在。
         sqlite.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eh_favorite_entry'")
-            .use { cursor -> assertTrue(cursor.moveToFirst()) }
+            .use { cursor -> assertFalse(cursor.moveToFirst()) }
+        sqlite.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eh_favorite_slot'")
+            .use { cursor -> assertFalse(cursor.moveToFirst()) }
+        sqlite.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'eh_favorite_mapping'")
+            .use { cursor -> assertFalse(cursor.moveToFirst()) }
 
         sqlite.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'tag_dictionary_fts'")
             .use { cursor ->
@@ -169,6 +175,7 @@ class MetadataMigrationInstrumentedTest {
             ReaderDatabase.MIGRATION_5_6,
             ReaderDatabase.MIGRATION_6_7,
             ReaderDatabase.MIGRATION_7_8,
+            ReaderDatabase.MIGRATION_8_9,
         )
     }
 

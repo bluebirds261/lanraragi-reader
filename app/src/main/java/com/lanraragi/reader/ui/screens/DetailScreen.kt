@@ -42,14 +42,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
@@ -86,6 +90,7 @@ import androidx.compose.ui.layout.positionInRoot
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -96,6 +101,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import coil.request.ImageRequest
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberLayerBackdrop
@@ -103,8 +109,11 @@ import com.kyant.backdrop.drawBackdrop
 import com.kyant.backdrop.effects.blur
 import com.kyant.backdrop.effects.lens
 import com.kyant.backdrop.effects.vibrancy
+import com.kyant.backdrop.highlight.Highlight
+import com.kyant.backdrop.shadow.Shadow
 import com.kyant.shapes.Capsule
 import com.lanraragi.reader.data.DownloadTaskType
+import com.lanraragi.reader.data.PageThumbQueue
 import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.data.TaskState
 import com.lanraragi.reader.data.api.ApiClient
@@ -118,9 +127,16 @@ import com.lanraragi.reader.data.model.Category
 import com.lanraragi.reader.data.model.PluginInfo
 import com.lanraragi.reader.data.model.Tankoubon
 import com.lanraragi.reader.data.model.TocEntry
+import com.lanraragi.reader.data.metadata.MetadataApplyBlockReason
 import com.lanraragi.reader.data.metadata.MetadataApplyResult
+import com.lanraragi.reader.data.metadata.MetadataFieldName
 import com.lanraragi.reader.data.metadata.MetadataPendingReason
+import com.lanraragi.reader.data.metadata.MetadataSnapshot
+import com.lanraragi.reader.data.metadata.MetadataState
+import com.lanraragi.reader.data.metadata.MetadataStateStatus
+import com.lanraragi.reader.data.metadata.MetadataTagOperation
 import com.lanraragi.reader.data.metadata.matching.MatchCandidate
+import com.lanraragi.reader.data.metadata.matching.MatchEvidence
 import com.lanraragi.reader.data.metadata.matching.MatchResult
 import com.lanraragi.reader.data.metadata.matching.MatchTarget
 import com.lanraragi.reader.data.metadata.matching.MetadataMatchEngine
@@ -134,6 +150,7 @@ import com.lanraragi.reader.data.metadata.plugins.MetadataPluginRequest
 import com.lanraragi.reader.data.metadata.plugins.ServerMetadataPlugin
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.domain.model.ArchiveIdentity
+import com.lanraragi.reader.domain.metadata.CanonicalTag
 import com.lanraragi.reader.ui.AppTopBar
 import com.lanraragi.reader.ui.ArchiveCover
 import com.lanraragi.reader.ui.CategoryManagementSheet
@@ -148,8 +165,10 @@ import com.lanraragi.reader.ui.Routes
 import com.lanraragi.reader.ui.TagAssistChip
 import com.lanraragi.reader.ui.TagRules
 import com.lanraragi.reader.ui.categoryNameError
+import com.lanraragi.reader.ui.components.glass.LiquidGlassFab
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.isProtectedCategoryName
+import com.lanraragi.reader.ui.parseHexColor
 import com.lanraragi.reader.ui.rememberTagColor
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -162,6 +181,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.UUID
+
+
+/** D2 支持精确抓取完整元数据的原生来源（EH/nHentai 走现有 native fetch）。 */
+internal val NATIVE_FETCH_PROVIDERS = setOf("ehentai", "nhentai")
 
 
 class DetailViewModel(
@@ -182,7 +205,7 @@ class DetailViewModel(
         val cacheTaskActive: Boolean = false,
         val message: String? = null,
         val pageUrls: List<String> = emptyList(),
-        val previewColumns: Int = 3,
+        val previewColumns: Int = 4,
         val previewCount: Int = 12,
         val visiblePreviewCount: Int = 12,
         val clearNewOnOpen: Boolean = true,
@@ -197,6 +220,8 @@ class DetailViewModel(
         val metadataCandidates: List<MatchResult> = emptyList(),
         val providerPatchPending: Boolean = false,
         val nativeProviderLoading: Boolean = false,
+        // D2 元数据工作台：关键词重搜进行中。
+        val metadataSearching: Boolean = false,
         // A11 加入卷
         val tanks: List<Tankoubon> = emptyList(),
         val archiveTankoubonIds: Set<String> = emptySet(),
@@ -421,18 +446,14 @@ class DetailViewModel(
         val candidate = result.candidate
         val sourceId = candidate.sourceId ?: return
         val sourceUrl = candidate.sourceUrl ?: return
-        if (candidate.providerId !in setOf("ehentai", "nhentai")) return
+        if (candidate.providerId !in NATIVE_FETCH_PROVIDERS) return
         viewModelScope.launch {
             _state.update { it.copy(nativeProviderLoading = true, message = null) }
             try {
-                val cookie = if (candidate.providerId == "ehentai") {
-                    container.ehFavoriteCredentials.currentCookie()
-                } else null
                 val fetched = container.nativeMetadataFetch.fetch(
                     candidate.providerId,
                     sourceId,
                     sourceUrl,
-                    cookie,
                 )
                 previewFetchedNativeMetadata(fetched)
             } catch (cancelled: CancellationException) {
@@ -529,9 +550,127 @@ class DetailViewModel(
         }
     }
 
+    /*
+     * D2 关键词重搜：把输入词交给离线原生候选解析器重新产出候选
+     * （支持 EH/nHentai 精确链接、gid/token、数字 id、标题内嵌 id 与
+     * 普通标题的“仅供检索参考”建议），按现有匹配引擎重新排名。
+     * 指定来源（EH/nHentai）且存在可精确抓取的候选时，
+     * 直接调用现有 native fetch 拉取完整元数据并纳入预览。
+     */
+    fun searchMetadataCandidates(keyword: String, providerId: String?) {
+        val trimmed = keyword.trim()
+        if (trimmed.isEmpty()) return
+        val provider = providerId?.takeIf { it in NATIVE_FETCH_PROVIDERS }
+        viewModelScope.launch {
+            _state.update { it.copy(metadataSearching = true) }
+            try {
+                val archive = _state.value.archive
+                val snapshot = container.metadataRepository.observe(metadataTarget).value.latest
+                    ?: archive?.toMetadataSnapshot()
+                    ?: return@launch
+                val providers = if (provider != null) {
+                    NativeMetadataProviders.all.filter { it.providerId == provider }
+                } else {
+                    NativeMetadataProviders.all
+                }
+                val input = MetadataCandidateInput(
+                    sourceUrls = listOf(trimmed),
+                    existingTags = emptySet(),
+                    archiveTitle = trimmed,
+                    fileName = trimmed,
+                )
+                val ranked = MetadataMatchEngine.rank(
+                    snapshot.toMatchTarget(archive),
+                    MetadataMatchEngine.fromProviderCandidates(
+                        providers.flatMap { it.findCandidates(input) },
+                    ),
+                )
+                _state.update { it.copy(metadataCandidates = ranked) }
+                if (provider != null) {
+                    ranked.firstOrNull { result ->
+                        result.candidate.providerId == provider &&
+                                result.candidate.patch != null &&
+                                result.candidate.sourceId != null &&
+                                result.candidate.sourceUrl != null
+                    }?.let(::fetchNativeMetadata)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(message = "候选搜索失败：${e.message}") }
+            } finally {
+                _state.update { it.copy(metadataSearching = false) }
+            }
+        }
+    }
+
+    /*
+     * D2 标签合并勾选：按用户勾选过滤候选 patch 的 addTags 后重新入库预览。
+     * 走与候选预览完全一致的 stagePatch → preview → applyPending 写回路径。
+     */
+    fun applyCandidateTagSelection(keepTagKeys: Set<String>) {
+        viewModelScope.launch {
+            val current = container.metadataRepository.observe(metadataTarget).value
+            val patch = current.pendingPatch
+            if (patch == com.lanraragi.reader.domain.metadata.MetadataPatch()) {
+                _state.update { it.copy(message = "没有待应用的候选标签") }
+                return@launch
+            }
+            val removableKeys = patch.removeTags.mapTo(mutableSetOf<String>()) { it.full }
+            val filtered = patch.copy(
+                addTags = patch.addTags.filter { it.full in keepTagKeys }.toSet(),
+                tagProvenance = patch.tagProvenance.filterKeys { it in keepTagKeys || it in removableKeys },
+            )
+            val baseline = current.baseline
+                ?: current.latest
+                ?: _state.value.archive?.toMetadataSnapshot()
+                ?: return@launch
+            container.metadataRepository.stagePatch(metadataTarget, baseline, filtered)
+            container.metadataRepository.preview(metadataTarget, providerMetadataApplyPolicy())
+            _state.update { it.copy(providerPatchPending = true, message = "已按所选标签更新预览") }
+        }
+    }
+
     fun toggleFavorite() {
         viewModelScope.launch {
             container.favoritesRepository.toggle(arcid)
+        }
+    }
+
+    /*
+     * 标记为未读：恢复服务器的“New!”标记，
+     * 并通过库刷新总线通知列表同步。
+     */
+    fun markAsUnread() {
+        if (arcid.startsWith("local_")) {
+            showMessage("本地档案无需标记为未读")
+            return
+        }
+
+        viewModelScope.launch {
+            try {
+                container.repository.setArchiveNew(arcid)
+
+                _state.update {
+                    it.copy(
+                        archive =
+                            it.archive?.copy(
+                                isnew = "true",
+                            ),
+                        message = "已标记为未读",
+                    )
+                }
+
+                LibraryRefreshBus.tick.value++
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update {
+                    it.copy(
+                        message = e.message ?: "标记未读失败",
+                    )
+                }
+            }
         }
     }
 
@@ -700,7 +839,13 @@ class DetailViewModel(
         viewModelScope.launch {
             _state.update { it.copy(tankSheetLoading = true) }
             try {
-                val tanks = container.repository.getTankoubons()
+                /*
+                 * 「加入卷」只需第一页作为可选项（与改动前的无参行为一致，
+                 * 服务端无 page 参数时等于 page 0），这里显式传 0 说明取哪一页：
+                 * 服务端 Tankoubon.pm 按 start = page * archives_per_page 切片。
+                 * 卷墙的翻页由 TankoubonBrowseScreen 负责。
+                 */
+                val tanks = container.repository.getTankoubons(page = 0)
                 val ids = container.repository.getArchiveTankoubons(arcid)
                 _state.update { it.copy(tanks = tanks, archiveTankoubonIds = ids.toSet(), tankSheetLoading = false) }
             } catch (e: CancellationException) {
@@ -974,7 +1119,8 @@ class DetailViewModel(
                 container.thumbnailRepository.refreshCover(arcid)
                 _state.update { it.copy(message = "封面已更新") }
 
-                CoverChangeBus.version.value++
+                // 只让这张封面失效，不牵连全库封面缓存。
+                CoverChangeBus.notifyChanged(arcid)
                 LibraryRefreshBus.tick.value++
             } catch (e: CancellationException) {
                 throw e
@@ -992,13 +1138,33 @@ class DetailViewModel(
     fun generatePageThumbnails() {
         viewModelScope.launch {
             try {
-                container.repository.queuePageThumbnails(arcid)
+                when (val result = container.repository.queuePageThumbnails(arcid)) {
+                    is PageThumbQueue.Queued -> {
+                        _state.update {
+                            it.copy(
+                                message =
+                                    "缩略图生成中，完成后自动可用",
+                            )
+                        }
+                    }
 
-                _state.update {
-                    it.copy(
-                        message =
-                            "已提交生成页缩略图任务",
-                    )
+                    is PageThumbQueue.AlreadyAvailable -> {
+                        _state.update {
+                            it.copy(
+                                message =
+                                    "缩略图已生成",
+                            )
+                        }
+                    }
+
+                    is PageThumbQueue.Failed -> {
+                        _state.update {
+                            it.copy(
+                                message =
+                                    result.message ?: "生成页缩略图失败",
+                            )
+                        }
+                    }
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -1009,6 +1175,24 @@ class DetailViewModel(
                             e.message ?: "生成页缩略图失败",
                     )
                 }
+            }
+        }
+    }
+
+    /**
+     * 预览区首次展示时静默入队服务端页缩略图生成。
+     *
+     * 失败不提示：预览网格在缩略图加载失败时会自动回退整页原图，
+     * 不因生成任务失败而影响预览可用性。
+     */
+    fun ensurePreviewThumbnails() {
+        viewModelScope.launch {
+            try {
+                container.repository.queuePageThumbnails(arcid)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // 静默失败，预览网格按整页原图回退。
             }
         }
     }
@@ -1267,6 +1451,7 @@ private fun GlassOverlayHost(
  * ============================================================ */
 
 @Composable
+@OptIn(ExperimentalFoundationApi::class)
 private fun LiquidGlassVisual(
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
@@ -1278,6 +1463,11 @@ private fun LiquidGlassVisual(
     blurRadius: Dp = 0.dp,
     chromaticAberration: Boolean = true,
     depthEffect: Boolean = true,
+    /*
+     * 长按动作（可空）：为 FAB 双态菜单等提供长按入口。
+     * 传入时改用 combinedClickable，按压反馈仍复用同一个 interactionSource。
+     */
+    onLongClick: (() -> Unit)? = null,
     content: @Composable RowScope.() -> Unit,
 ) {
     val interactionSource =
@@ -1522,13 +1712,27 @@ private fun LiquidGlassVisual(
                     onDrawSurface = {
                     },
                 )
-                .clickable(
-                    enabled = enabled,
-                    interactionSource =
-                        interactionSource,
-                    indication = null,
-                    role = Role.Button,
-                    onClick = onClick,
+                .then(
+                    if (onLongClick != null) {
+                        Modifier.combinedClickable(
+                            enabled = enabled,
+                            interactionSource =
+                                interactionSource,
+                            indication = null,
+                            role = Role.Button,
+                            onLongClick = onLongClick,
+                            onClick = onClick,
+                        )
+                    } else {
+                        Modifier.clickable(
+                            enabled = enabled,
+                            interactionSource =
+                                interactionSource,
+                            indication = null,
+                            role = Role.Button,
+                            onClick = onClick,
+                        )
+                    },
                 )
                 .padding(
                     horizontal = horizontalPadding,
@@ -1838,6 +2042,15 @@ fun DetailScreen(
         mutableStateOf(false)
     }
 
+    /*
+     * FAB 长按菜单状态（UI 规划 4.1）：
+     * 「从第 N 页开始」/「从头阅读」二选一。
+     */
+    var showStartMenu by
+    remember {
+        mutableStateOf(false)
+    }
+
     val context =
         LocalContext.current
 
@@ -1883,6 +2096,31 @@ fun DetailScreen(
             ) {
                 vm.loadMorePreview()
             }
+        }
+    }
+
+    /*
+     * =========================================================
+     * 预览区页缩略图
+     *
+     * 预览网格首次展示（pageUrls 就绪）时静默入队一次
+     * 服务端页缩略图生成；失败静默，网格自行回退整页原图。
+     * 本地/离线档案没有服务端缩略图管线，不请求。
+     * =========================================================
+     */
+    var previewThumbsRequested by
+    remember {
+        mutableStateOf(false)
+    }
+
+    LaunchedEffect(state.pageUrls.isNotEmpty()) {
+        if (
+            !previewThumbsRequested &&
+            !arcid.startsWith("local_") &&
+            state.pageUrls.isNotEmpty()
+        ) {
+            previewThumbsRequested = true
+            vm.ensurePreviewThumbnails()
         }
     }
 
@@ -2308,6 +2546,8 @@ fun DetailScreen(
                                                 },
                                             )
 
+                                            // A11 单行本入口：原先由 `a11_tankoubons` 实验开关门控，
+                                            // 该开关已随「实验室」页移除，入口常驻。
                                             DropdownMenuItem(
                                                 text = {
                                                     Text("加入卷")
@@ -2316,6 +2556,16 @@ fun DetailScreen(
                                                     showEditMenu = false
                                                     vm.loadTanks()
                                                     showTankSheet = true
+                                                },
+                                            )
+
+                                            DropdownMenuItem(
+                                                text = {
+                                                    Text("标记为未读")
+                                                },
+                                                onClick = {
+                                                    showEditMenu = false
+                                                    vm.markAsUnread()
                                                 },
                                             )
 
@@ -2539,10 +2789,10 @@ fun DetailScreen(
                                                     val pageIndex =
                                                         base + col
 
-                                                    LoadingImage(
-                                                        model = url,
-                                                        contentDescription =
-                                                            null,
+                                                    PreviewPageImage(
+                                                        arcid = archive.arcid,
+                                                        page = pageIndex,
+                                                        fallbackModel = url,
                                                         modifier =
                                                             Modifier
                                                                 .weight(1f)
@@ -2633,6 +2883,36 @@ fun DetailScreen(
             showFab &&
             state.archive != null
         ) {
+            /*
+             * 悬浮按钮主色调：
+             * 读取设置的“悬浮按钮颜色”，空或无效时保持默认外观。
+             */
+            val fabAccentColor =
+                settings?.floatingButtonColor
+                    ?.let {
+                        parseHexColor(it)
+                    }
+                    ?.let {
+                        Color(it)
+                    }
+                    ?: LocalContentColor.current
+
+            /*
+             * FAB 双态（UI 规划 4.1）：
+             * 进度取自服务端 metadata 的 progress 字段——与信息区「已读到第 N 页」
+             * 同一个来源，为 1 起页号（同 ReaderScreen 里 meta.progress - 1 的口径）。
+             * Routes.reader(arcid, page) 的 page 是 0 起（ReaderScreen 直接当作
+             * pager 起始下标），因此跳转时传 progress - 1。
+             */
+            val fabProgress = state.archive?.progress ?: 0
+
+            val fabLabel =
+                if (fabProgress > 0) {
+                    "继续阅读 · 第 $fabProgress 页"
+                } else {
+                    "开始阅读"
+                }
+
             CompositionLocalProvider(
                 LocalDetailBackdrop provides
                         detailBackdrop,
@@ -2642,40 +2922,108 @@ fun DetailScreen(
                         .fillMaxSize()
                         .zIndex(110f),
                 ) {
-                    LiquidGlassVisual(
-                        onClick = {
-                            navController.navigate(
-                                Routes.reader(arcid),
-                            )
-                        },
-                        height = 64.dp,
-                        horizontalPadding = 20.dp,
-                        lensHeight = 32.dp,
-                        lensAmount = 64.dp,
-                        blurRadius = 4.dp,
-                        chromaticAberration = true,
-                        depthEffect = true,
-                        modifier =
-                            Modifier
-                                .align(Alignment.BottomEnd)
-                                .padding(
-                                    end = 16.dp,
-                                    bottom = 16.dp,
-                                )
-                                .widthIn(min = 150.dp),
+                    Box(
+                        Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(
+                                end = 16.dp,
+                                bottom = 16.dp,
+                            ),
                     ) {
-                        Icon(
-                            Icons.Filled.PlayArrow,
-                            contentDescription = "开始阅读",
+                        /*
+                         * 阅读按钮统一走共用的液态玻璃 FAB 组件。
+                         *
+                         * 外观 1:1 复现原来的 LiquidGlassVisual(height = 64.dp,
+                         * horizontalPadding = 20.dp, lensHeight = 32.dp,
+                         * lensAmount = 64.dp, blurRadius = 4.dp, 色散 + 深度)：
+                         * 高度由 modifier 传入的 64.dp 决定（组件内部的 56.dp
+                         * 受外层固定高度约束收紧为 64.dp），最小宽度 150.dp，
+                         * 无背景提色（vibrancy）、blur 4.dp、折射 10.dp/64.dp；
+                         * 高光与投影沿用 backdrop 库的默认层
+                         * （Highlight.Default / Shadow.Default，原实现即未传
+                         * highlight/shadow 而落到这两个默认值），无内阴影、
+                         * 无表面着色。颜色仍取 fabAccentColor。
+                         *
+                         * 按下动力学同样 1:1 复现原 LiquidGlassVisual（组件内的
+                         * pressDynamics，缺省即开启，这里显式写出）：
+                         * 视差 ±3.dp、blur×(1-0.25p)、折射×(1+0.5p)、
+                         * 背景 translate(-nx*18, -ny*14) +
+                         * scale(1-0.13p, 1+0.075p)（以按下点为支点）。
+                         * 原调用传的 lensHeight = 32.dp 只是「是否启用折射」的开关，
+                         * 其数值被实现丢弃（refractionHeight 在 LiquidGlassVisual 里
+                         * 写死 10.dp），因此这里 refractionHeight = 10.dp 才是原实现的
+                         * 有效值（而不是照抄 32.dp）；lensAmount = 64.dp 对应
+                         * refractionAmount = 64.dp。原 onDrawSurface = {}
+                         * 的「不绘制表面着色」由 surfaceTint = null 表达
+                         * （activeColor 未传即为空）。
+                         */
+                        LiquidGlassFab(
+                            onClick = {
+                                navController.navigate(
+                                    if (fabProgress > 0) {
+                                        Routes.reader(arcid, fabProgress - 1)
+                                    } else {
+                                        Routes.reader(arcid)
+                                    },
+                                )
+                            },
+                            modifier =
+                                Modifier
+                                    .height(64.dp)
+                                    .widthIn(min = 150.dp),
+                            backdrop = detailBackdrop,
+                            icon = Icons.Filled.PlayArrow,
+                            label = fabLabel,
+                            tint = fabAccentColor,
+                            iconContentDescription = fabLabel,
+                            onLongClick = {
+                                showStartMenu = true
+                            },
+                            pressDynamics = true,
+                            vibrancyEnabled = false,
+                            blurRadius = 4.dp,
+                            refractionHeight = 10.dp,
+                            refractionAmount = 64.dp,
+                            depthEffect = true,
+                            chromaticAberration = true,
+                            highlight = Highlight.Default,
+                            shadow = Shadow.Default,
+                            innerShadow = null,
+                            surfaceTint = null,
                         )
 
-                        Text(
-                            "开始阅读",
-                            style =
-                                MaterialTheme
-                                    .typography
-                                    .labelLarge,
-                        )
+                        DropdownMenu(
+                            expanded = showStartMenu,
+                            onDismissRequest = {
+                                showStartMenu = false
+                            },
+                        ) {
+                            if (fabProgress > 0) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text("从第 $fabProgress 页开始")
+                                    },
+                                    onClick = {
+                                        showStartMenu = false
+                                        navController.navigate(
+                                            Routes.reader(arcid, fabProgress - 1),
+                                        )
+                                    },
+                                )
+                            }
+
+                            DropdownMenuItem(
+                                text = {
+                                    Text("从头阅读")
+                                },
+                                onClick = {
+                                    showStartMenu = false
+                                    navController.navigate(
+                                        Routes.reader(arcid, 0),
+                                    )
+                                },
+                            )
+                        }
                     }
                 }
             }
@@ -2729,16 +3077,24 @@ fun DetailScreen(
         if (showMetadataSheet) {
             val initialMetadata = metadataState.latest
                 ?: state.archive?.toMetadataSnapshot()
-                ?: com.lanraragi.reader.data.metadata.MetadataSnapshot()
-            MetadataWorkbenchSheet(
+                ?: MetadataSnapshot()
+            MetadataScrapeWorkbenchSheet(
                 initial = initialMetadata,
                 state = metadataState,
                 candidates = state.metadataCandidates,
+                nativeProviderLoading = state.nativeProviderLoading,
+                metadataSearching = state.metadataSearching,
+                plugins = state.plugins,
+                pluginsLoading = state.pluginsLoading,
+                pluginRunning = state.pluginRunning,
+                onSearch = vm::searchMetadataCandidates,
+                onLoadPlugins = vm::loadPlugins,
+                onRunPlugin = vm::runPlugin,
                 onPreviewCandidate = vm::previewMetadataCandidate,
                 onFetchCandidate = vm::fetchNativeMetadata,
-                nativeProviderLoading = state.nativeProviderLoading,
                 onPreview = vm::previewMetadata,
                 onApply = vm::applyMetadata,
+                onApplyTagSelection = vm::applyCandidateTagSelection,
                 onDiscard = vm::discardMetadataPatch,
                 onDismiss = { showMetadataSheet = false },
             )
@@ -2908,6 +3264,658 @@ private fun PluginsSheet(
             }
         }
     }
+}
+
+
+/*
+ * ============================================================
+ * D2 元数据工作台（升级版）
+ *
+ * 相比旧版工作台新增：
+ *  - 刮削来源选择行：E-Hentai / nHentai / 服务器插件；
+ *  - 关键词重搜：输入词交给现有离线候选解析器，精确标识直接 native fetch；
+ *  - 候选列表带封面缩略图与匹配来源说明；
+ *  - 结果 diff「新旧对照」：标题 / 简介 / 标签按命名空间分组，
+ *    新增高亮、将被移除的标签划线标注；
+ *  - 已有标签与候选标签按命名空间去重合并展示，新标签可勾选保留后写回。
+ *
+ * 写回仍走既有链路：stagePatch → preview → applyPending。
+ * ============================================================
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@Composable
+internal fun MetadataScrapeWorkbenchSheet(
+    initial: MetadataSnapshot,
+    state: MetadataState,
+    candidates: List<MatchResult>,
+    nativeProviderLoading: Boolean,
+    metadataSearching: Boolean,
+    plugins: List<PluginInfo>,
+    pluginsLoading: Boolean,
+    pluginRunning: Boolean,
+    onSearch: (keyword: String, providerId: String?) -> Unit,
+    onLoadPlugins: () -> Unit,
+    onRunPlugin: (PluginInfo) -> Unit,
+    onPreviewCandidate: (MatchResult) -> Unit,
+    onFetchCandidate: (MatchResult) -> Unit,
+    onPreview: (MetadataEditSubmission) -> Unit,
+    onApply: (approveRebasedSnapshot: Boolean) -> Unit,
+    onApplyTagSelection: (Set<String>) -> Unit,
+    onDiscard: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var sourceFilter by remember { mutableStateOf<String?>(null) }
+    var keyword by remember { mutableStateOf(initial.title.orEmpty()) }
+    var title by remember(initial) { mutableStateOf(initial.title.orEmpty()) }
+    var tags by remember(initial) {
+        mutableStateOf(initial.tags.sortedBy(CanonicalTag::full).joinToString(",") { it.raw })
+    }
+    var summary by remember(initial) { mutableStateOf(initial.summary.orEmpty()) }
+    var includeTitle by remember { mutableStateOf(false) }
+    var includeTags by remember { mutableStateOf(false) }
+    var includeSummary by remember { mutableStateOf(false) }
+    val busy = state.status == MetadataStateStatus.LOADING || state.status == MetadataStateStatus.SAVING
+    val plan = state.plan
+    val nonRebaseBlocks = plan?.blockReasons.orEmpty() -
+        MetadataApplyBlockReason.BASE_CHANGED_REVIEW_REQUIRED
+    // Local SAF metadata is persisted through Room and deliberately carries
+    // TARGET_IS_NOT_REMOTE as an audit marker; it must not disable its local
+    // save action. All other planner blocks remain actionable for the UI.
+    val actionableBlocks = if (state.isRemote) {
+        nonRebaseBlocks
+    } else {
+        nonRebaseBlocks - MetadataApplyBlockReason.TARGET_IS_NOT_REMOTE
+    }
+    val canApply = plan?.diff?.hasEffectiveChanges == true && actionableBlocks.isEmpty() && !busy
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text("元数据工作台", style = MaterialTheme.typography.titleLarge)
+
+            // —— 刮削来源选择行 ——
+            Text("刮削来源", style = MaterialTheme.typography.titleMedium)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = sourceFilter == null,
+                    onClick = { sourceFilter = null },
+                    label = { Text("全部") },
+                )
+                FilterChip(
+                    selected = sourceFilter == "ehentai",
+                    onClick = { sourceFilter = "ehentai" },
+                    label = { Text("E-Hentai") },
+                )
+                FilterChip(
+                    selected = sourceFilter == "nhentai",
+                    onClick = { sourceFilter = "nhentai" },
+                    label = { Text("nHentai") },
+                )
+                FilterChip(
+                    selected = sourceFilter == "plugin",
+                    onClick = {
+                        sourceFilter = "plugin"
+                        onLoadPlugins()
+                    },
+                    label = { Text("服务器插件") },
+                )
+            }
+
+            if (sourceFilter == "plugin") {
+                MetadataPluginPicker(
+                    plugins = plugins,
+                    loading = pluginsLoading,
+                    running = pluginRunning,
+                    busy = busy,
+                    onRun = onRunPlugin,
+                )
+            } else {
+                // —— 关键词重搜（全部 / E-Hentai / nHentai）——
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    OutlinedTextField(
+                        value = keyword,
+                        onValueChange = { keyword = it },
+                        label = { Text("关键词") },
+                        enabled = !busy,
+                        singleLine = true,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(
+                        onClick = { onSearch(keyword, sourceFilter) },
+                        enabled = !busy && !metadataSearching && keyword.isNotBlank(),
+                    ) {
+                        Text(if (metadataSearching) "搜索中…" else "搜索")
+                    }
+                }
+                Text(
+                    "支持 EH / nHentai 链接、gid/token、数字 id 或标题关键词；精确标识会直接抓取完整元数据。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            HorizontalDivider()
+
+            // —— 匹配候选列表 ——
+            Text("匹配候选", style = MaterialTheme.typography.titleMedium)
+            val visibleCandidates = when (sourceFilter) {
+                "ehentai" -> candidates.filter { it.candidate.providerId == "ehentai" }
+                "nhentai" -> candidates.filter { it.candidate.providerId == "nhentai" }
+                else -> candidates
+            }
+            if (visibleCandidates.isEmpty()) {
+                Text(
+                    if (metadataSearching) "候选搜索中…" else "暂无候选，可修改关键词后重新搜索",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            } else {
+                visibleCandidates.forEach { result ->
+                    MetadataCandidateRow(
+                        result = result,
+                        busy = busy,
+                        nativeProviderLoading = nativeProviderLoading,
+                        onPreview = { onPreviewCandidate(result) },
+                        onFetch = { onFetchCandidate(result) },
+                    )
+                }
+            }
+
+            HorizontalDivider()
+
+            // —— 手动编辑（既有功能保留）——
+            SelectableWorkbenchField("标题", includeTitle, { includeTitle = it }) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    enabled = includeTitle && !busy,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            SelectableWorkbenchField("标签", includeTags, { includeTags = it }) {
+                OutlinedTextField(
+                    value = tags,
+                    onValueChange = { tags = it },
+                    enabled = includeTags && !busy,
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            SelectableWorkbenchField("简介", includeSummary, { includeSummary = it }) {
+                OutlinedTextField(
+                    value = summary,
+                    onValueChange = { summary = it },
+                    enabled = includeSummary && !busy,
+                    minLines = 3,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = onDiscard, enabled = state.hasPendingPatch && !busy) {
+                    Text("放弃待应用修改")
+                }
+                TextButton(
+                    onClick = {
+                        onPreview(
+                            MetadataEditSubmission(
+                                title = title.takeIf { includeTitle },
+                                tags = tags.takeIf { includeTags },
+                                summary = summary.takeIf { includeSummary },
+                            ),
+                        )
+                    },
+                    enabled = (includeTitle || includeTags || includeSummary) && !busy,
+                ) {
+                    Text("生成预览")
+                }
+            }
+
+            // —— 结果 diff：新旧对照 ——
+            plan?.let { currentPlan ->
+                HorizontalDivider()
+                Text("应用预览（新旧对照）", style = MaterialTheme.typography.titleMedium)
+                if (currentPlan.baseChanged) {
+                    Text(
+                        "服务器元数据已变化；保存时会基于最新内容重新合并。",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                currentPlan.diff.fields.forEach { change ->
+                    Column(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                        Text(
+                            "${metadataFieldLabel(change.field)}（旧 → 新）",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        if (!change.before.isNullOrEmpty()) {
+                            Text(
+                                "旧：${change.before}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Text("新：${change.after.orEmpty()}", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                if (currentPlan.diff.tags.isNotEmpty()) {
+                    Text(
+                        "标签（按命名空间）",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    currentPlan.diff.tags
+                        .groupBy { it.tag.identity.namespace.orEmpty() }
+                        .entries
+                        .sortedBy { (ns, _) ->
+                            TagRules.NAMESPACE_ORDER.indexOf(ns).let { if (it < 0) Int.MAX_VALUE else it }
+                        }
+                        .forEach { (ns, changes) ->
+                            Text(
+                                TagRules.label(ns),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = rememberTagColor(ns),
+                                modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                            )
+                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                changes.forEach { change ->
+                                    if (change.operation == MetadataTagOperation.ADD) {
+                                        Text(
+                                            "+ ${change.tag.raw}",
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            color = MaterialTheme.colorScheme.primary,
+                                        )
+                                    } else {
+                                        Text(
+                                            "− ${change.tag.raw}",
+                                            style = MaterialTheme.typography.bodyMedium.copy(
+                                                textDecoration = TextDecoration.LineThrough,
+                                            ),
+                                            color = MaterialTheme.colorScheme.error,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                }
+                currentPlan.diff.conflicts.forEach { conflict ->
+                    Text(
+                        conflict.explanation ?: "${conflict.key} 未应用",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                if (!currentPlan.diff.hasEffectiveChanges && currentPlan.diff.conflicts.isEmpty()) {
+                    Text("没有需要应用的变化")
+                }
+                state.error?.let { Text(it.message, color = MaterialTheme.colorScheme.error) }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = onDismiss) { Text("关闭") }
+                    TextButton(
+                        onClick = { onApply(currentPlan.baseChanged) },
+                        enabled = canApply,
+                    ) {
+                        Text(if (currentPlan.baseChanged) "确认重合并并保存" else "确认保存")
+                    }
+                }
+            }
+
+            // —— 标签合并：已有 + 候选按命名空间去重，勾选保留后写回 ——
+            if (state.pendingPatch.addTags.isNotEmpty()) {
+                HorizontalDivider()
+                Text("标签合并", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    "已与现有标签按命名空间去重合并；取消勾选的新标签不会写回。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                var selectedAdds by remember(state.pendingPatch) {
+                    mutableStateOf<Set<String>>(state.pendingPatch.addTags.map { it.full }.toSet())
+                }
+                val existingKeys = initial.canonicalTags.keys
+                mergeCandidateTagRows(initial.tags, state.pendingPatch.addTags).forEach { (ns, rows) ->
+                    Text(
+                        TagRules.label(ns),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = rememberTagColor(ns),
+                        modifier = Modifier.padding(top = 6.dp, bottom = 2.dp),
+                    )
+                    rows.forEach { row ->
+                        Row(
+                            Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Checkbox(
+                                checked = row.tag.full in selectedAdds,
+                                onCheckedChange = { checked ->
+                                    selectedAdds = if (checked) {
+                                        selectedAdds + row.tag.full
+                                    } else {
+                                        selectedAdds - row.tag.full
+                                    }
+                                },
+                                enabled = !busy,
+                            )
+                            Text(
+                                if (row.isNew) "${row.tag.raw}（新增）" else "${row.tag.raw}（已有）",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = if (row.isNew) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurface
+                                },
+                            )
+                        }
+                    }
+                }
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(
+                        onClick = { onApplyTagSelection(selectedAdds) },
+                        enabled = !busy,
+                    ) {
+                        Text("按所选标签更新预览")
+                    }
+                }
+            }
+
+            if (plan == null) {
+                state.error?.let { Text(it.message, color = MaterialTheme.colorScheme.error) }
+            }
+            if (state.status == MetadataStateStatus.SAVED && !state.hasPendingPatch) {
+                Text("元数据已保存", color = MaterialTheme.colorScheme.primary)
+            }
+            Spacer(Modifier.height(16.dp))
+        }
+    }
+}
+
+
+/** 工作台内嵌的服务器插件选择区（复用 PluginsSheet 同一条插件执行路径）。 */
+@Composable
+private fun MetadataPluginPicker(
+    plugins: List<PluginInfo>,
+    loading: Boolean,
+    running: Boolean,
+    busy: Boolean,
+    onRun: (PluginInfo) -> Unit,
+) {
+    Text(
+        "服务器插件将在当前档案上执行，结果会加入候选并进入应用预览；也可以继续使用「编辑 → 运行服务器插件」原入口。",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    when {
+        loading && plugins.isEmpty() -> {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(
+                    Modifier
+                        .width(14.dp)
+                        .height(14.dp),
+                    strokeWidth = 2.dp,
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("插件加载中…", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+
+        plugins.isEmpty() -> {
+            Text(
+                "暂无可用插件",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        else -> {
+            plugins.forEach { plugin ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(enabled = !busy && !running) { onRun(plugin) }
+                        .padding(vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            plugin.name.ifBlank { plugin.namespace },
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        if (plugin.name.isNotBlank() && plugin.namespace.isNotBlank()) {
+                            Text(
+                                plugin.namespace,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    if (running) {
+                        CircularProgressIndicator(
+                            Modifier
+                                .width(14.dp)
+                                .height(14.dp),
+                            strokeWidth = 2.dp,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+/** 匹配候选行：封面缩略图 + 标题 + 来源/评分/依据 + 预览与抓取操作。 */
+@Composable
+private fun MetadataCandidateRow(
+    result: MatchResult,
+    busy: Boolean,
+    nativeProviderLoading: Boolean,
+    onPreview: () -> Unit,
+    onFetch: () -> Unit,
+) {
+    val candidate = result.candidate
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        val coverUrl = candidateCoverUrl(candidate)
+        if (coverUrl != null) {
+            LoadingImage(
+                model = coverUrl,
+                contentDescription = "候选封面",
+                modifier = Modifier
+                    .width(56.dp)
+                    .height(76.dp)
+                    .clip(RoundedCornerShape(6.dp)),
+            )
+        } else {
+            Box(
+                Modifier
+                    .width(56.dp)
+                    .height(76.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Filled.Image,
+                    contentDescription = "候选封面占位",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                candidate.title ?: candidate.sourceUrl ?: candidate.sourceId ?: candidate.providerId,
+                style = MaterialTheme.typography.bodyLarge,
+                maxLines = 2,
+            )
+            Text(
+                "${providerLabel(candidate.providerId)} · ${(result.score * 100).toInt()}% · " +
+                    result.evidence.joinToString("、", transform = ::matchEvidenceLabel),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (result.lowConfidence) {
+                    MaterialTheme.colorScheme.error
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Row {
+                if (candidate.patch != null) {
+                    TextButton(onClick = onPreview, enabled = !busy) { Text("纳入应用预览") }
+                }
+                if (candidate.providerId in NATIVE_FETCH_PROVIDERS &&
+                    candidate.sourceId != null &&
+                    candidate.sourceUrl != null
+                ) {
+                    TextButton(
+                        onClick = onFetch,
+                        enabled = !busy && !nativeProviderLoading,
+                    ) {
+                        Text(if (nativeProviderLoading) "抓取中…" else "抓取完整元数据")
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun SelectableWorkbenchField(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row {
+            Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+            Text(label, modifier = Modifier.padding(top = 12.dp))
+        }
+        content()
+    }
+}
+
+
+private fun providerLabel(providerId: String): String = when (providerId) {
+    "ehentai" -> "E-Hentai"
+    "nhentai" -> "nHentai"
+    else -> "插件：$providerId"
+}
+
+/**
+ * 候选封面缩略图：nHentai 的公开封面直链可由数字 id 推出；
+ * E-Hentai 的封面地址无法由 gid/token 推出，展示占位图。
+ */
+private fun candidateCoverUrl(candidate: MatchCandidate): String? {
+    val id = candidate.sourceId ?: return null
+    return when (candidate.providerId) {
+        "nhentai" -> if (Regex("[1-9][0-9]{0,8}").matches(id)) "https://nhentai.net/g/$id/cover.jpg" else null
+        else -> null
+    }
+}
+
+private fun metadataFieldLabel(field: MetadataFieldName): String = when (field) {
+    MetadataFieldName.TITLE -> "标题"
+    MetadataFieldName.SUMMARY -> "简介"
+    MetadataFieldName.SOURCE_URL -> "来源"
+    MetadataFieldName.TAGS -> "标签"
+}
+
+private fun matchEvidenceLabel(evidence: MatchEvidence): String = when (evidence) {
+    MatchEvidence.URL -> "来源地址"
+    MatchEvidence.SOURCE_TAG -> "来源标识"
+    MatchEvidence.FILENAME_ID -> "文件名 ID"
+    MatchEvidence.TITLE_EXACT -> "标题一致"
+    MatchEvidence.TAG_INTERSECTION -> "标签交集"
+    MatchEvidence.COVER_HASH -> "封面哈希"
+    MatchEvidence.FUZZY_TITLE -> "标题相似"
+}
+
+private data class MergedCandidateTag(val tag: CanonicalTag, val isNew: Boolean)
+
+/** 已有标签与候选标签按命名空间去重合并（同一 full 键只保留一条），供勾选保留。 */
+private fun mergeCandidateTagRows(
+    existing: Set<CanonicalTag>,
+    adds: Set<CanonicalTag>,
+): List<Pair<String, List<MergedCandidateTag>>> {
+    val existingKeys = existing.mapTo(mutableSetOf<String>()) { it.full }
+    return (existing.asSequence() + adds.asSequence())
+        .distinctBy { it.full }
+        .groupBy { it.identity.namespace.orEmpty() }
+        .entries
+        .sortedBy { (ns, _) ->
+            TagRules.NAMESPACE_ORDER.indexOf(ns).let { if (it < 0) Int.MAX_VALUE else it }
+        }
+        .map { (ns, tags) -> ns to tags.map { MergedCandidateTag(it, it.full !in existingKeys) } }
+}
+
+
+/**
+ * 预览网格单元格：远程档案优先加载服务端页缩略图
+ * （`GET api/archives/{id}/thumbnail?page=N`，缓存键 `pagethumb:arcid:page`
+ * 与阅读器时间线共享）；
+ * 缩略图加载失败时回退整页原图 model；
+ * 本地/离线档案（arcid 以 local_ 开头）没有服务端缩略图管线，直接用整页原图。
+ */
+@Composable
+private fun PreviewPageImage(
+    arcid: String,
+    page: Int,
+    fallbackModel: Any?,
+    modifier: Modifier = Modifier,
+    contentScale: androidx.compose.ui.layout.ContentScale =
+            androidx.compose.ui.layout.ContentScale.Crop,
+) {
+    val context =
+        LocalContext.current
+
+    var thumbFailed by
+    remember(page) {
+        mutableStateOf(false)
+    }
+
+    /*
+     * 缩略图请求用 remember 固定实例：
+     * LoadingImage 以 model 判等管理加载态，避免重组时重复发起请求。
+     */
+    val thumbModel =
+        remember(arcid, page) {
+            ImageRequest.Builder(context)
+                .data(ApiClient.pageThumbnailUrl(arcid, page))
+                .memoryCacheKey("pagethumb:$arcid:$page")
+                .diskCacheKey("pagethumb:$arcid:$page")
+                .build()
+        }
+
+    val useServerThumb =
+        !arcid.startsWith("local_") &&
+                !thumbFailed
+
+    LoadingImage(
+        model = if (useServerThumb) thumbModel else fallbackModel,
+        contentDescription =
+            null,
+        modifier = modifier,
+        contentScale =
+            contentScale,
+        onError = {
+            if (!thumbFailed) {
+                thumbFailed = true
+            }
+        },
+    )
 }
 
 
@@ -3319,7 +4327,7 @@ private fun TankSheet(
                 }
             } else if (tanks.isEmpty()) {
                 Text(
-                    "暂无单行本\n请在导航页「单行本」中创建",
+                    "暂无单行本\n请在设置页「浏览 → 单行本」点右上「+」新建",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

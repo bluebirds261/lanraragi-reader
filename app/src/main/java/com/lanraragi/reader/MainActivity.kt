@@ -37,8 +37,10 @@ import androidx.fragment.app.FragmentActivity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.lanraragi.reader.ui.AppRoot
+import com.lanraragi.reader.ui.SplashCoverOverlay
 import com.lanraragi.reader.ui.screens.DeepLinkBus
 import com.lanraragi.reader.ui.theme.LanraragiReaderTheme
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
@@ -96,11 +98,18 @@ class MainActivity : FragmentActivity() {
                 else -> isSystemInDarkTheme()
             }
 
-            LanraragiReaderTheme(darkTheme = darkTheme) {
+            LanraragiReaderTheme(
+                darkTheme = darkTheme,
+                dynamicColor = settings?.dynamicColor == true,
+            ) {
                 val authEnabled = settings?.authEnabled == true
                 val biometricEnabled = settings?.biometricEnabled == true
                 val needsAuth = authEnabled || biometricEnabled
 
+                // 开屏封面（若已设置）盖在最上层：冷启动约 2 秒后淡出、点按可跳过。
+                // 放在这个位置是为了让它同时盖住「设置加载中的 logo 占位」与「身份验证占位页」，
+                // 避免先闪一下 logo 再出现封面。
+                Box(Modifier.fillMaxSize()) {
                 when {
                     // 设置尚未加载：显示 logo 淡入 splash
                     settings == null -> {
@@ -157,13 +166,16 @@ class MainActivity : FragmentActivity() {
                     }
 
                     else -> {
-                    // E7 深链/分享：解析 intent 中的 archive URL
-                    LaunchedEffect(Unit) {
-                        val arcid = extractArcIdFromIntent(intent)
-                        if (arcid != null) DeepLinkBus.arcid.value = arcid
+                        // E7 深链/分享：解析 intent 中的 archive URL
+                        LaunchedEffect(Unit) {
+                            val arcid = extractArcIdFromIntent(intent)
+                            if (arcid != null) DeepLinkBus.arcid.value = arcid
+                        }
+                        AppRoot()
                     }
-                    AppRoot()
                 }
+
+                    SplashCoverOverlay(container)
                 }
             }
         }
@@ -257,6 +269,18 @@ class MainActivity : FragmentActivity() {
         super.onStop()
         // 离开应用时立即重新锁定，确保下次切回时第一时间隐藏内容
         isUnlocked.value = false
+        // 阅读进度兜底回传：切后台后进程可能被系统回收，来不及走阅读器的退出路径，
+        // 这里在应用级作用域补推一次（失败保留在 outbox，下次启动继续重试）。
+        val container = (application as LanraragiApplication).container
+        container.applicationScope.launch {
+            try {
+                container.progressWriter.flush()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // 忽略：待回传任务仍留在 outbox。
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {

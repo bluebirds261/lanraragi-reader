@@ -1,15 +1,17 @@
 [versions]
 agp = "9.4.0"
 kotlin = "2.4.10"
-coreKtx = "1.13.1"
-lifecycle = "2.8.6"
+# 下列版本与「实际解析结果」对齐（原先声明的值会被传递依赖抬高，声明与落地不一致，
+# 排查依赖问题时容易误判）。改动后 `:app:dependencies` 里这些模块不再出现 `x -> y`。
+coreKtx = "1.16.0"
+lifecycle = "2.9.4"
 activityCompose = "1.9.2"
 composeBom = "2026.08.00"
 navigationCompose = "2.8.2"
 retrofit = "2.11.0"
 okhttp = "4.12.0"
-kotlinxSerialization = "1.7.2"
-coroutines = "1.8.1"
+kotlinxSerialization = "1.7.3"
+coroutines = "1.9.0"
 coil = "2.7.0"
 datastore = "1.1.1"
 documentfile = "1.0.1"
@@ -19,10 +21,13 @@ junrar = "7.5.5"
 room = "2.8.4"
 ksp = "2.3.10"
 junit = "4.13.2"
-coroutinesTest = "1.8.1"
+coroutinesTest = "1.9.0"
 androidxTestCore = "1.6.1"
 androidxTestExtJunit = "1.2.1"
 androidxTestRunner = "1.6.2"
+# Compose Multiplatform 液态玻璃组件（Maven Central: io.github.kyant0）
+kyantBackdrop = "2.0.1"
+kyantShapes = "1.2.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -32,6 +37,8 @@ androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lif
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
 androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 androidx-ui = { group = "androidx.compose.ui", name = "ui" }
+# 版本由 Compose BOM 统一管理，这里不写 version。
+androidx-foundation = { group = "androidx.compose.foundation", name = "foundation" }
 androidx-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
 androidx-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
 androidx-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
@@ -58,6 +65,8 @@ androidx-test-core-ktx = { group = "androidx.test", name = "core-ktx", version.r
 androidx-test-ext-junit-ktx = { group = "androidx.test.ext", name = "junit-ktx", version.ref = "androidxTestExtJunit" }
 androidx-test-runner = { group = "androidx.test", name = "runner", version.ref = "androidxTestRunner" }
 androidx-room-testing = { group = "androidx.room", name = "room-testing", version.ref = "room" }
+kyant-backdrop = { group = "io.github.kyant0", name = "backdrop", version.ref = "kyantBackdrop" }
+kyant-shapes = { group = "io.github.kyant0", name = "shapes", version.ref = "kyantShapes" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

@@ -11,9 +11,14 @@ local.properties
 # ========== IDE 配置(含机器相关的绝对路径,不共享) ==========
 .idea/
 *.iml
+# Android Studio / IntelliJ 的本地索引与 APK 分析缓存
+.idea/caches/
+.idea/libraries/
+*.apk.idsig
 
 # ========== Kotlin 编译会话缓存 ==========
 .kotlin/
+.kotlin/**
 
 # ========== 打包产物与签名文件 ==========
 *.apk
@@ -30,6 +35,15 @@ hs_err_pid*.log
 replay_pid*.log
 *.hprof
 *.dump
+
+# ========== 本地构建日志与验收临时目录（打包源码时不应进包） ==========
+/build-*.log
+/deps-*.txt
+/dependency-*.txt
+.verify/
+# 打包源码时生成的中间产物（只忽略仓库根目录下的压缩包，测试夹具里的 zip 不受影响）
+/dist/
+/*.zip
 
 # ========== 原生构建产物 ==========
 .externalNativeBuild/

@@ -65,9 +65,9 @@ class MetadataSnapshotCodecTest {
             """{"version":1,"snapshot":{"tags":[{"key":"tag","raw":"tag","source":"FUTURE"}]}}""",
         )
 
-        assertTrue(unsupported.message!!.contains("Unsupported metadata snapshot version: 2"))
+        assertTrue(unsupported.message.orEmpty().contains("Unsupported metadata snapshot version: 2"))
         assertEquals("Invalid persisted metadata snapshot", malformed.message)
-        assertTrue(invalidDomain.message!!.contains("Unknown metadata tag source: FUTURE"))
+        assertTrue(invalidDomain.message.orEmpty().contains("Unknown metadata tag source: FUTURE"))
         assertTrue(malformed.cause != null)
         assertTrue(invalidDomain.cause == null)
     }

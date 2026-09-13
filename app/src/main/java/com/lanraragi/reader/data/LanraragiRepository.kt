@@ -2,6 +2,7 @@ package com.lanraragi.reader.data
 
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.api.LanraragiApi
+import com.lanraragi.reader.data.api.MinionJobDetail
 import com.lanraragi.reader.data.api.toUserMessage
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
@@ -23,8 +24,8 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.URLEncoder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.decodeFromJsonElement
@@ -38,6 +39,35 @@ data class PageResult(
     val items: List<Archive>,
     val total: Int?,
 )
+
+/**
+ * 页缩略图入队结果（POST /api/archives/{id}/files/thumbnails）。
+ * 服务器契约：200 = 所有页缩略图已存在（force=0 时）；202 = 已入队（新任务，
+ * 或复用同档案进行中的任务并返回该任务 ID）；其余 = 失败。
+ */
+sealed class PageThumbQueue {
+    /** 202：任务已入队或正在进行，用 [jobId] 轮询 [LanraragiRepository.minionPageThumbProgress]。 */
+    data class Queued(val jobId: String) : PageThumbQueue()
+
+    /** 200：所有页缩略图已存在，可直接用 [LanraragiRepository.pageThumbnailUrl] 加载。 */
+    object AlreadyAvailable : PageThumbQueue()
+
+    /** 非 2xx 或网络异常；[message] 为用户可读错误（可能为 null）。 */
+    data class Failed(val message: String?) : PageThumbQueue()
+}
+
+/**
+ * A7 重复检测入队结果（POST /api/minion/find_duplicates/queue）。
+ * 服务器契约：200 = 已入队并返回任务 ID（`{operation, success, job}`）；
+ * 其余 = 失败（服务器不支持该任务类型 / 鉴权失败 / Minion 后端不可用等）。
+ */
+sealed class DuplicateDetectionQueue {
+    /** 任务已入队，[jobId] 可配合 [LanraragiRepository.getMinionJob] / minionJobDetail 轮询进度。 */
+    data class Queued(val jobId: String) : DuplicateDetectionQueue()
+
+    /** 非 2xx 或网络异常；[message] 为用户可读错误（可能为 null）。 */
+    data class Failed(val message: String?) : DuplicateDetectionQueue()
+}
 
 class LanraragiRepository(
     private val api: LanraragiApi,
@@ -59,6 +89,7 @@ class LanraragiRepository(
         categoryId: String? = null,
         newonly: Boolean? = null,
         untaggedonly: Boolean? = null,
+        hideCompleted: Boolean = false,
     ): PageResult = network {
         val resp = api.getArchives(
             start = page,
@@ -68,6 +99,7 @@ class LanraragiRepository(
             category = categoryId?.takeIf { it.isNotBlank() },
             newonly = if (newonly == true) "true" else null,
             untaggedonly = if (untaggedonly == true) "true" else null,
+            hidecompleted = if (hideCompleted) "true" else null,
         )
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
@@ -305,6 +337,105 @@ class LanraragiRepository(
         body ?: "{}"
     }
 
+    /**
+     * GET /api/minion/{jobid}/detail（🔑）：完整任务信息，含 notes（页缩略图任务在此带进度）。
+     * 请求失败抛 [ApiException]；响应体解析失败时返回空默认对象（照 parseMinionJob 风格）。
+     */
+    suspend fun minionJobDetail(jobId: String): MinionJobDetail = network {
+        val resp = api.getMinionJobDetail(jobId)
+        val body = resp.body()?.string()
+        ensureSuccess(resp, body)
+        val el = runCatching { ApiClient.json.parseToJsonElement(body ?: "{}") }.getOrNull()
+        if (el == null) {
+            MinionJobDetail()
+        } else {
+            runCatching { ApiClient.json.decodeFromJsonElement<MinionJobDetail>(el) }
+                .getOrDefault(MinionJobDetail())
+        }
+    }
+
+    /**
+     * 轮询便捷方法：从任务 notes 提取 (progress, pages)，无则返回 null。
+     * 失败（网络/任务不存在/notes 无进度数据）返回 null；协程取消时向上抛出。
+     * 0.9.81 page_thumbnails 的 notes 实际结构为
+     * `{ "<页号1起>": "processed", ..., "total_pages": N, "id": "<arcid>" }`，
+     * progress = 已标记 "processed" 的页数；同时兼容 openapi 文本所述的
+     * notes.progress / notes.pages 结构。
+     */
+    suspend fun minionPageThumbProgress(jobId: String): Pair<Int, Int>? = try {
+        pageThumbProgressFromNotes(minionJobDetail(jobId).notes)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (_: Exception) {
+        null
+    }
+
+    private fun pageThumbProgressFromNotes(notes: JsonObject?): Pair<Int, Int>? {
+        if (notes == null) return null
+        val totalPages = (notes["total_pages"] as? JsonPrimitive)?.content?.toIntOrNull()
+        if (totalPages != null && totalPages > 0) {
+            val processed = notes.count { (key, value) ->
+                key.toIntOrNull() != null && value is JsonPrimitive && value.content == "processed"
+            }
+            return processed to totalPages
+        }
+        val progress = (notes["progress"] as? JsonPrimitive)?.content?.toIntOrNull()
+        val pages = (notes["pages"] as? JsonPrimitive)?.content?.toIntOrNull()
+        return if (progress != null && pages != null) progress to pages else null
+    }
+
+    /**
+     * A7 重复检测入队（POST /api/minion/find_duplicates/queue，🔑）。
+     * 契约要求 args 为必填 query 参数（JSON 数组字符串）；服务器 find_duplicates 任务
+     * 取 args[0] 为封面哈希汉明距离阈值，官方前端默认 "[5]"，此处 [threshold] 默认一致。
+     * 不抛业务异常：失败返回 [DuplicateDetectionQueue.Failed]；协程取消时向上抛出。
+     */
+    suspend fun queueDuplicateDetection(threshold: Int = 5): DuplicateDetectionQueue = try {
+        network {
+            val resp = api.queueDuplicateDetection(args = "[${threshold.coerceAtLeast(0)}]")
+            val body = resp.body()?.string()
+            if (!resp.isSuccessful) {
+                val msg = resp.message()
+                val failMessage =
+                    if (msg.contains("尚未配置") || msg.contains("格式无效")) msg else toUserMessage(resp.code())
+                DuplicateDetectionQueue.Failed(failMessage)
+            } else {
+                val root = runCatching {
+                    body?.let(ApiClient.json::parseToJsonElement) as? JsonObject
+                }.getOrNull()
+                val jobId = (root?.get("job") as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+                if (jobId != null) {
+                    notifyJobQueued(jobId, DUPLICATE_JOB_LABEL)
+                    DuplicateDetectionQueue.Queued(jobId)
+                } else {
+                    DuplicateDetectionQueue.Failed(null)
+                }
+            }
+        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        DuplicateDetectionQueue.Failed(e.message)
+    }
+
+    /**
+     * 服务器 Minion 任务入队回调：任何成功入队的异步任务都会在这里上报一次，
+     * 由 [com.lanraragi.reader.data.JobTracker] 统一登记并在下载页「服务器任务」区展示进度。
+     * A4/A7/A8/A10 四项异步能力的进度统一出口——此前没有任何地方调用 JobTracker.track，
+     * 导致该区域永远为空。
+     */
+    var onJobQueued: ((jobid: String, label: String) -> Unit)? = null
+
+    private fun notifyJobQueued(jobid: String, label: String) {
+        try {
+            onJobQueued?.invoke(jobid, label)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // 进度展示属尽力而为，绝不能影响入队本身。
+        }
+    }
+
     /** A4 轮询任务直至完成/失败(默认最长 120s)。终态 state: finished|failed|inactive。 */
     suspend fun pollJobUntilDone(
         jobid: String,
@@ -326,13 +457,47 @@ class LanraragiRepository(
         return null
     }
 
-    /** A5 生成页码缩略图 / 重建全库缩略 / 以指定页作封面。 */
-    suspend fun queuePageThumbnails(arcid: String, force: Boolean = false) {
+    /**
+     * A5 整本页缩略图入队（POST /api/archives/{id}/files/thumbnails，参数 force 为 query）。
+     * 服务器读取 `param('force')` 并与字符串 "true" 精确比较，故此处发送 "true"/不发送。
+     * 不抛业务异常：失败返回 [PageThumbQueue.Failed]；协程取消时向上抛出。
+     */
+    suspend fun queuePageThumbnails(arcid: String, force: Boolean = false): PageThumbQueue = try {
         network {
             val resp = api.queuePageThumbnails(arcid, if (force) "true" else null)
-            ensureSuccess(resp, resp.body()?.string())
+            val body = resp.body()?.string()
+            if (!resp.isSuccessful) {
+                val msg = resp.message()
+                val failMessage =
+                    if (msg.contains("尚未配置") || msg.contains("格式无效")) msg else toUserMessage(resp.code())
+                PageThumbQueue.Failed(failMessage)
+            } else {
+                val root = runCatching {
+                    body?.let(ApiClient.json::parseToJsonElement) as? JsonObject
+                }.getOrNull()
+                val jobId = (root?.get("job") as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+                if (jobId != null) {
+                    notifyJobQueued(jobId, PAGE_THUMB_JOB_LABEL)
+                    PageThumbQueue.Queued(jobId)
+                } else {
+                    PageThumbQueue.AlreadyAvailable
+                }
+            }
         }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        PageThumbQueue.Failed(e.message)
     }
+
+    /**
+     * 每页缩略图 URL（GET api/archives/{id}/thumbnail?page=N）。
+     * [page] 为 0 起页号；服务器端 page 参数为 1 起（0 = 封面），这里与
+     * [ApiClient.pageThumbnailUrl] 一致地 +1 转换（0.9.81 extract_thumbnail：
+     * `$filelist[page > 0 ? page - 1 : 0]`，官方阅读器亦按 0 基 +1 取用）。
+     * 返回占位 host URL，经 ServerInterceptor 改写为真实服务器并附加鉴权头。
+     */
+    fun pageThumbnailUrl(arcid: String, page: Int): String = ApiClient.pageThumbnailUrl(arcid, page)
 
     suspend fun regenAllThumbnails() {
         network {
@@ -348,23 +513,46 @@ class LanraragiRepository(
         }
     }
 
-    /** A6 随机档案(可限制在指定分类或过滤内,空则取第一本)。 */
-    suspend fun getRandomArchive(categoryId: String? = null): Archive? = network {
-        val resp = api.getRandomArchives(category = categoryId, count = 1)
+    /**
+     * A6 随机搜索(`/api/search/random`)：在给定筛选/分类范围内随机取 count 本。
+     * 响应结构与 `/api/search` 相同（`{ data: [...], recordsTotal }`），返回解析后的档案列表。
+     */
+    suspend fun searchRandom(
+        count: Int,
+        category: String? = null,
+        filter: String? = null,
+        newOnly: Boolean = false,
+        untaggedOnly: Boolean = false,
+        hideCompleted: Boolean = false,
+    ): List<Archive> = network {
+        val resp = api.getRandomArchives(
+            category = category?.takeIf { it.isNotBlank() },
+            filter = filter?.takeIf { it.isNotBlank() },
+            count = count.coerceAtLeast(1),
+            newonly = if (newOnly) "true" else null,
+            untaggedonly = if (untaggedOnly) "true" else null,
+            hidecompleted = if (hideCompleted) "true" else null,
+        )
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
-        JsonHelpers.parseRandomArchives(body ?: "[]").firstOrNull()?.takeIf { it.arcid.isNotBlank() }
-            ?: runCatching {
-                // 兜底:服务器形态差异导致空解析时,从图库列表取样
-                val (items, _) = getArchives(page = 0, categoryId = categoryId)
-                items.firstOrNull { it.arcid.isNotBlank() }
-            }.getOrNull()
+        JsonHelpers.parseRandomArchives(body ?: "[]")
     }
 
     /** A7 新标记管理。 */
     suspend fun clearArchiveNew(arcid: String) {
         network {
             val resp = api.clearArchiveNew(arcid)
+            ensureSuccess(resp, resp.body()?.string())
+        }
+    }
+
+    /**
+     * A11 全库清除「New」标记：单次服务器调用（DELETE /api/database/isnew），
+     * 不受客户端当前已加载页数限制。
+     */
+    suspend fun clearAllNew() {
+        network {
+            val resp = api.clearAllNew()
             ensureSuccess(resp, resp.body()?.string())
         }
     }
@@ -397,11 +585,9 @@ class LanraragiRepository(
         val resp = api.usePluginAsync(arcid, pluginNamespace, arg, null)
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
-        val jobid = runCatching {
-            val el = ApiClient.json.parseToJsonElement(body ?: "") as? kotlinx.serialization.json.JsonObject
-            (el?.get("job") as? kotlinx.serialization.json.JsonPrimitive)?.content
-        }.getOrNull()?.takeIf { it.isNotBlank() }
-        jobid ?: throw ApiException("未获得插件任务 ID")
+        val jobid = parseJobId(body) ?: throw ApiException("未获得插件任务 ID")
+        notifyJobQueued(jobid, PLUGIN_JOB_LABEL)
+        jobid
     }
 
     /** A10 Shinobu 状态(原始文本,通常为 JSON)。 */
@@ -444,19 +630,12 @@ class LanraragiRepository(
 
     // ============ A11 单行本 ============
 
-    suspend fun getTankoubons(): List<Tankoubon> = network {
-        val resp = api.getTankoubons()
+    /** A11 单行本列表（page 透传给服务端分页）。 */
+    suspend fun getTankoubons(page: Int? = null): List<Tankoubon> = network {
+        val resp = api.getTankoubons(page = page)
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
         JsonHelpers.parseTankoubons(body ?: "[]")
-    }
-
-    suspend fun getTankoubon(id: String): Tankoubon = network {
-        val resp = api.getTankoubon(id)
-        val body = resp.body()?.string()
-        ensureSuccess(resp, body)
-        runCatching { ApiClient.json.decodeFromString<Tankoubon>(body ?: "{}") }
-            .getOrDefault(Tankoubon(id = id))
     }
 
     /** A11 档案所属单行本 ID 列表。 */
@@ -588,12 +767,9 @@ class LanraragiRepository(
             val body = resp.body?.string()
             if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
                 ?: toUserMessage(resp.code))
-            val jobid = runCatching {
-                val el = ApiClient.json.parseToJsonElement(body ?: "") as? kotlinx.serialization.json.JsonObject
-                val p = (el?.get("job") ?: el?.get("id") ?: el?.get("jobid")) as? kotlinx.serialization.json.JsonPrimitive
-                p?.content
-            }.getOrNull()?.takeIf { it.isNotBlank() }
-            jobid ?: throw ApiException("未获得备份任务 ID")
+            val jobid = parseJobId(body) ?: throw ApiException("未获得备份任务 ID")
+            notifyJobQueued(jobid, BACKUP_JOB_LABEL)
+            jobid
         }
     }
 
@@ -608,9 +784,15 @@ class LanraragiRepository(
         }
     }
 
-    /** A8 上传备份 JSON 触发恢复(重操作,UI 需强确认)。 */
-    suspend fun restoreBackup(jsonText: String) {
-        network {
+    /**
+     * A8 上传备份 JSON 触发恢复(重操作,UI 需强确认)。
+     *
+     * 服务器把恢复排进 Minion 队列后立刻返回，真正的整库覆盖发生在后台；
+     * 因此这里返回 jobid，由调用方用 [pollJobUntilDone] 等到终态再报成功，
+     * 否则「恢复成功」会先于实际执行（甚至在实际失败时）弹出。
+     */
+    suspend fun restoreBackup(jsonText: String): String {
+        return network {
             val bodyBytes = jsonText.toByteArray()
             val bodyStream = bodyBytes.toRequestBody("application/json".toMediaType())
             val mb = MultipartBody.Builder().setType(MultipartBody.FORM)
@@ -622,7 +804,24 @@ class LanraragiRepository(
                 val body = resp.body?.string()
                 if (!resp.isSuccessful) throw ApiException(body?.trim()?.takeIf { it.isNotBlank() }
                     ?: toUserMessage(resp.code))
+                val jobid = parseJobId(body) ?: throw ApiException("未获得恢复任务 ID")
+                notifyJobQueued(jobid, RESTORE_JOB_LABEL)
+                jobid
             }
         }
     }
+
+    /** 从 `{operation, success, job}` 形状的应答里取 minion 任务 ID。 */
+    private fun parseJobId(body: String?): String? = runCatching {
+        val el = ApiClient.json.parseToJsonElement(body ?: "") as? JsonObject
+        val p = (el?.get("job") ?: el?.get("id") ?: el?.get("jobid")) as? JsonPrimitive
+        p?.content
+    }.getOrNull()?.takeIf { it.isNotBlank() }
 }
+
+// 下载页「服务器任务」区的任务名（JobTracker 展示用）。
+private const val PAGE_THUMB_JOB_LABEL = "整本页缩略图生成"
+private const val DUPLICATE_JOB_LABEL = "重复检测"
+private const val PLUGIN_JOB_LABEL = "插件批量执行"
+private const val BACKUP_JOB_LABEL = "数据库备份"
+private const val RESTORE_JOB_LABEL = "数据库恢复"

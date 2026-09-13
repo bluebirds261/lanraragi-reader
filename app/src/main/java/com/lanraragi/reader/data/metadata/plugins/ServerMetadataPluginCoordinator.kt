@@ -359,15 +359,12 @@ private fun String.toJobState(): ServerPluginJobState = when (trim().lowercase()
 /** LANraragi 0.9.81 details may wrap the plugin payload as `result.data`. */
 private fun parsePluginJobDetail(body: String): PluginMetadataResult {
     val root = runCatching { ApiClient.json.parseToJsonElement(body) as? JsonObject }.getOrNull()
-    val nestedData = (root?.get("result") as? JsonObject)?.get("data") as? JsonObject
-    return if (nestedData == null) {
-        PluginResultParser.parseJobDetail(body)
-    } else {
-        // The shared parser preserves all plugin-owned unknown fields in raw.
-        val result = root?.get("result") as JsonObject
-        val error = result["error"] ?: root?.get("error")
-        PluginResultParser.parseSyncResponse("{\"data\":$nestedData,\"error\":${error ?: "null"}}")
-    }
+        ?: return PluginResultParser.parseJobDetail(body)
+    val result = root["result"] as? JsonObject ?: return PluginResultParser.parseJobDetail(body)
+    val nestedData = result["data"] as? JsonObject ?: return PluginResultParser.parseJobDetail(body)
+    // The shared parser preserves all plugin-owned unknown fields in raw.
+    val error = result["error"] ?: root["error"]
+    return PluginResultParser.parseSyncResponse("{\"data\":$nestedData,\"error\":${error ?: "null"}}")
 }
 
 private fun parseQueueJobId(body: String): String {

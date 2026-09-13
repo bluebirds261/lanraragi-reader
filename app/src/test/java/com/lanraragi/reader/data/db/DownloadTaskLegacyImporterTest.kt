@@ -19,6 +19,8 @@ class DownloadTaskLegacyImporterTest {
         val entries = importer.decode(fixture("download-tasks-valid.json"), importedAt = 123L)
 
         assertEquals(3, entries.size)
+        // "PAGE" (收藏单页) tasks were removed app-wide and are skipped on import.
+        assertFalse(entries.any { it.taskId == "removed-page" })
         val waiting = entries[0]
         assertEquals("waiting-cache", waiting.taskId)
         assertEquals("OFFLINE_CACHE", waiting.type)
@@ -74,9 +76,10 @@ class DownloadTaskLegacyImporterTest {
     fun skipsMalformedEntriesAndKeepsFirstDuplicateDeterministically() {
         val result = importer.decodeResult(
             """[
-                {"id":"duplicate","type":"PAGE","arcid":"first","state":"DONE"},
+                {"id":"removed-page","type":"PAGE","arcid":"gone","state":"DONE"},
+                {"id":"duplicate","type":"OFFLINE_CACHE","arcid":"first","state":"DONE"},
                 {"id":"duplicate","type":"ARCHIVE_FILE","arcid":"second","state":"DONE"},
-                {"id":"","type":"PAGE"},
+                {"id":"","type":"OFFLINE_CACHE"},
                 {"id":"unknown","type":"OTHER"}
             ]""",
             importedAt = 9L,
@@ -84,15 +87,15 @@ class DownloadTaskLegacyImporterTest {
 
         assertTrue(result.validDocument)
         assertEquals(1, result.entries.size)
-        assertEquals("PAGE", result.entries.single().type)
+        assertEquals("OFFLINE_CACHE", result.entries.single().type)
         assertEquals("first", result.entries.single().archiveId)
-        assertEquals(2, result.skippedEntries)
+        assertEquals(3, result.skippedEntries)
     }
 
     @Test
     fun preservesOnlyExplicitByteProgressAndUsesInjectedNonNegativeTime() {
         val result = importer.decodeResult(
-            """[{"id":"bytes","type":"PAGE","state":"DONE","bytesDownloaded":7,"expectedBytes":-10,"progress":0.9}]""",
+            """[{"id":"bytes","type":"OFFLINE_CACHE","state":"DONE","bytesDownloaded":7,"expectedBytes":-10,"progress":0.9}]""",
             importedAt = -99L,
         ).entries.single()
 
@@ -106,7 +109,7 @@ class DownloadTaskLegacyImporterTest {
     @Test
     fun redactsPotentialSecretsInLegacyFailureText() {
         val result = importer.decode(
-            """[{"id":"secret","type":"PAGE","state":"FAILED","error":"api key abc"}]""",
+            """[{"id":"secret","type":"OFFLINE_CACHE","state":"FAILED","error":"api key abc"}]""",
             importedAt = 1L,
         ).single()
 

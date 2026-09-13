@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.rememberScrollState
@@ -36,6 +37,8 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -85,6 +88,10 @@ class TankoubonBrowseViewModel(private val container: AppContainer) : ViewModel(
         val members: List<Archive> = emptyList(),
         val membersLoading: Boolean = false,
         val message: String? = null,
+        // 卷墙分页（顺手修复 2）：page 为服务端 0 起页号（Tankoubon.pm: start = page * archives_per_page）。
+        val page: Int = 0,
+        val loadingMore: Boolean = false,
+        val hasMore: Boolean = false,
     )
 
     private val repository = container.repository
@@ -95,16 +102,55 @@ class TankoubonBrowseViewModel(private val container: AppContainer) : ViewModel(
         loadTanks()
     }
 
+    /** 卷墙首屏/重载：固定取第 0 页并重置分页游标。 */
     fun loadTanks() {
         viewModelScope.launch {
             _state.update { it.copy(loading = true, error = null) }
             try {
-                val tanks = repository.getTankoubons()
-                _state.update { it.copy(tanks = tanks, loading = false) }
+                val tanks = repository.getTankoubons(page = 0)
+                _state.update {
+                    it.copy(
+                        tanks = tanks,
+                        page = 0,
+                        // 第 0 页为空即为空库，无需显示「加载更多」。
+                        hasMore = tanks.isNotEmpty(),
+                        loading = false,
+                    )
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 _state.update { it.copy(loading = false, error = e.message ?: "加载单行本失败") }
+            }
+        }
+    }
+
+    /**
+     * 追加下一页：返回空页即认为已到末页（服务端逐页返回数组，末页可能少于每页条数，
+     * 少于每页条数不代表出错，只以"是否还有下一页"为准）；新增项按 id 去重后追加。
+     */
+    fun loadMore() {
+        val snapshot = _state.value
+        if (snapshot.loading || snapshot.loadingMore || !snapshot.hasMore || snapshot.selected != null) return
+        viewModelScope.launch {
+            _state.update { it.copy(loadingMore = true) }
+            try {
+                val next = snapshot.page + 1
+                val more = repository.getTankoubons(page = next)
+                _state.update { current ->
+                    val merged = (current.tanks + more).distinctBy { it.id }
+                    current.copy(
+                        tanks = merged,
+                        page = next,
+                        hasMore = more.isNotEmpty() && merged.size > current.tanks.size,
+                        loadingMore = false,
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 失败时保持当前游标与 hasMore，用户可以再次点「加载更多」重试。
+                _state.update { it.copy(loadingMore = false, message = e.message ?: "加载更多单行本失败") }
             }
         }
     }
@@ -200,6 +246,7 @@ fun TankoubonBrowseScreen(
     val state by vm.state.collectAsStateWithLifecycle()
 
     var showManage by remember { mutableStateOf(false) }
+    val snackbarHostState = remember { SnackbarHostState() }
 
     val goBack: () -> Unit = {
         if (state.selected != null) vm.closeTank() else navController.popBackStack()
@@ -211,8 +258,16 @@ fun TankoubonBrowseScreen(
         }
     }
 
+    // VM 的一次性提示（分页失败、新建/重命名/删除/移出失败）统一用 Snackbar 展示。
+    LaunchedEffect(state.message) {
+        val text = state.message ?: return@LaunchedEffect
+        snackbarHostState.showSnackbar(text)
+        vm.clearMessage()
+    }
+
     Scaffold(
         modifier = Modifier.edgeSwipeBack { goBack() },
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             AppTopBar(
                 title = state.selected?.name ?: "单行本",
@@ -232,8 +287,15 @@ fun TankoubonBrowseScreen(
                 state.selected == null && state.loading && state.tanks.isEmpty() -> LoadingBox()
                 state.selected == null && state.error != null && state.tanks.isEmpty() ->
                     ErrorBox(state.error!!, onRetry = vm::loadTanks)
-                state.selected == null && state.tanks.isEmpty() -> EmptyBox("暂无单行本")
-                state.selected == null -> TankWall(state.tanks, vm::openTank)
+                state.selected == null && state.tanks.isEmpty() ->
+                    EmptyBox("暂无单行本\n点右上「+」新建，或在档案详情页点「加入卷」")
+                state.selected == null -> TankWall(
+                    tanks = state.tanks,
+                    hasMore = state.hasMore,
+                    loadingMore = state.loadingMore,
+                    onOpen = vm::openTank,
+                    onLoadMore = vm::loadMore,
+                )
                 state.membersLoading && state.members.isEmpty() -> LoadingBox()
                 state.error != null && state.members.isEmpty() -> ErrorBox(state.error!!, onRetry = { state.selected?.let { vm.openTank(it.id) } })
                 state.members.isEmpty() -> EmptyBox("该卷暂无档案\n（在档案详情页点「加入卷」添加）")
@@ -254,7 +316,13 @@ fun TankoubonBrowseScreen(
 }
 
 @Composable
-private fun TankWall(tanks: List<Tankoubon>, onOpen: (String) -> Unit) {
+private fun TankWall(
+    tanks: List<Tankoubon>,
+    hasMore: Boolean,
+    loadingMore: Boolean,
+    onOpen: (String) -> Unit,
+    onLoadMore: () -> Unit,
+) {
     LazyVerticalGrid(
         columns = GridCells.Fixed(2),
         modifier = Modifier.fillMaxSize(),
@@ -280,6 +348,29 @@ private fun TankWall(tanks: List<Tankoubon>, onOpen: (String) -> Unit) {
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                     )
+                }
+            }
+        }
+
+        // 卷墙分页尾部：还有下一页时铺满整行的「加载更多」；加载中显示进度圈。
+        if (hasMore) {
+            val fullRowSpan:
+                androidx.compose.foundation.lazy.grid.LazyGridItemSpanScope.() -> GridItemSpan =
+                { GridItemSpan(maxLineSpan) }
+
+            item(
+                key = "tank-load-more",
+                span = fullRowSpan,
+            ) {
+                Box(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (loadingMore) {
+                        CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+                    } else {
+                        TextButton(onClick = onLoadMore) { Text("加载更多") }
+                    }
                 }
             }
         }

@@ -2,15 +2,22 @@ package com.lanraragi.reader.data
 
 import android.content.Context
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import com.lanraragi.reader.data.tags.knowledge.EhTagTranslationImportRequest
 import com.lanraragi.reader.data.tags.knowledge.EhTagTranslationParser
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeRepository
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeSnapshot
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeSourceMetadata
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeUpdate
+import com.lanraragi.reader.data.tags.knowledge.normalizeText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
@@ -21,7 +28,9 @@ import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 借鉴 JHenTai 的 EhTagTranslation 标签翻译模块：从 EhTagTranslation/Database 下载
@@ -69,6 +78,11 @@ class TagTranslationRepository(
         .readTimeout(180, TimeUnit.SECONDS)
         .build()
 
+    // D4 归一化索引缓存：以 TagTranslationStore.translations 的实例身份判断失效
+    // （update/clearCache/publish 都会重新发布该 StateFlow），词库变化后下一次查询自动重建。
+    @Volatile private var normalizationIndex: NormalizationIndex? = null
+    @Volatile private var normalizationIndexSource: Any? = null
+
     /** 启动时从本地缓存加载翻译数据。 */
     fun load() {
         runCatching {
@@ -82,6 +96,7 @@ class TagTranslationRepository(
 
     /** Hydrates the legacy display adapter from the active Room dictionary. */
     suspend fun loadKnowledge() {
+        maybeAutoUpdate()
         val snapshot = knowledgeRepository?.current() ?: return
         publish(snapshot, readMetadata())
     }
@@ -167,8 +182,243 @@ class TagTranslationRepository(
             throw cancelled
         }
         TagTranslationStore.clear()
+        normalizationIndex = null
+        normalizationIndexSource = null
         runCatching { file.delete() }
         runCatching { metadataFile.delete() }
+    }
+
+    // ==================== D4 翻译驱动搜索匹配 ====================
+
+    /**
+     * D4 分词归一化：逐 token 查词典；中文译名命中 → 原文 tag（含命名空间优先）；
+     * 英文原文命中（残留英文 tag 库）→ 中文（库目标形态）。无命中原样返回。
+     * 命名空间前缀（含中文标签如「作者:」）统一折算为英文 canonical 形式。
+     */
+    suspend fun normalizeSearchQuery(query: String): String {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return query
+        maybeAutoUpdate()
+        val index = normalizationIndex()
+        if (index.allEntries.isEmpty()) return query
+        return trimmed.split(SEARCH_TOKEN_SEPARATOR)
+            .filter(String::isNotEmpty)
+            .joinToString(" ") { token -> normalizeSearchToken(token, index) }
+    }
+
+    /**
+     * D4 归一化预览：返回 (输入token, 归一化结果) 列表，供联想 UI。
+     * 仅包含发生映射的 token；无任何映射时返回空列表。
+     */
+    suspend fun normalizeSearchPreview(query: String): List<Pair<String, String>> {
+        val trimmed = query.trim()
+        if (trimmed.isEmpty()) return emptyList()
+        maybeAutoUpdate()
+        val index = normalizationIndex()
+        if (index.allEntries.isEmpty()) return emptyList()
+        return trimmed.split(SEARCH_TOKEN_SEPARATOR)
+            .filter(String::isNotEmpty)
+            .mapNotNull { token ->
+                val normalized = normalizeSearchToken(token, index)
+                if (normalized == token) null else token to normalized
+            }
+    }
+
+    /** 单 token 归一化：原文精确（含命名空间与裸名）→ 中文译名→原文 → 英文前缀兜底 → 原样。 */
+    private fun normalizeSearchToken(rawToken: String, index: NormalizationIndex): String {
+        val token = rawToken.trim().removeSurrounding("\"").trim()
+        if (token.isEmpty()) return rawToken
+        var namespace: String? = null
+        var value = token
+        val colon = token.indexOf(':')
+        if (colon > 0) {
+            val rawNamespace = normalizeText(token.substring(0, colon))
+            val canonical = TagNamespaceRegistry.allDescriptors()
+                .firstOrNull { it.labelZh == rawNamespace }?.name
+                ?: TagNamespaceRegistry.canonicalNamespace(rawNamespace)
+            if (canonical != null) {
+                namespace = canonical.lowercase(Locale.ROOT)
+                value = token.substring(colon + 1).trim().removeSurrounding("\"").trim()
+            }
+        }
+        val valueKey = normalizeText(value).lowercase(Locale.ROOT)
+        if (valueKey.isEmpty()) return rawToken
+
+        // 1) 原文 tag 精确（含命名空间 female:x 与裸名；fullName 作为英文别名兜底）：
+        //    英文原文命中（残留英文 tag 库）→ 中文（库目标形态）；词典无中文条目时保留原文。
+        val exactEntries = if (namespace != null) {
+            index.originals["$namespace:$valueKey"].orEmpty()
+        } else {
+            index.originals[valueKey].orEmpty()
+        }
+        val aliasEntries = if (exactEntries.isEmpty()) {
+            index.aliases[valueKey].orEmpty()
+                .let { list -> namespace?.let { ns -> list.filter { it.namespace == ns } } ?: list }
+        } else {
+            emptyList()
+        }
+        val originalHit = pickByFrequency(exactEntries + aliasEntries, index.frequencies)
+        if (originalHit != null) {
+            val translated = originalHit.translatedName ?: return rawToken
+            return if (namespace != null) "$namespace:$translated" else translated
+        }
+
+        // 2) 中文译名 → 原文 tag（含命名空间优先：输出带命名空间的库内原文形态）。
+        val translatedEntries = index.translated[normalizeText(value)].orEmpty()
+            .let { list -> namespace?.let { ns -> list.filter { it.namespace == ns } } ?: list }
+        pickByFrequency(translatedEntries, index.frequencies)?.let { hit ->
+            return if (hit.namespace.isBlank()) hit.tagKey else "${hit.namespace}:${hit.tagKey}"
+        }
+
+        // 3) 英文 → 中文兜底：原文未精确命中时按 tagKey 前缀匹配（≥2 字符），取词频最高者的中文译名。
+        if (valueKey.length >= 2) {
+            val prefixHit = pickByFrequency(
+                index.allEntries.asSequence()
+                    .filter { it.tagKey.startsWith(valueKey) }
+                    .filter { namespace == null || it.namespace == namespace }
+                    .toList(),
+                index.frequencies,
+            )
+            if (prefixHit?.translatedName != null) {
+                return if (namespace != null) "$namespace:${prefixHit.translatedName}" else prefixHit.translatedName
+            }
+        }
+        return rawToken
+    }
+
+    /** 多次命中取词频最高；无词频数据时按命名空间补全权重与字典序稳定兜底。 */
+    private fun pickByFrequency(
+        entries: List<NormalizationEntry>,
+        frequencies: Map<String, Long>,
+    ): NormalizationEntry? = entries.maxWithOrNull(
+        compareBy(
+            { frequencies["${it.namespace}:${it.tagKey}"] ?: 0L },
+            { TagNamespaceRegistry.descriptor(it.namespace)?.completionWeight ?: 0 },
+            { it.namespace },
+            { it.tagKey },
+        ),
+    )
+
+    private suspend fun normalizationIndex(): NormalizationIndex {
+        val source = TagTranslationStore.translations.value
+        normalizationIndex?.let { cached ->
+            if (normalizationIndexSource === source) return cached
+        }
+        val snapshot = knowledgeRepository?.current()
+        val index = buildNormalizationIndex(snapshot, source)
+        normalizationIndex = index
+        normalizationIndexSource = source
+        return index
+    }
+
+    /** Room 词库快照优先（含词频/fullName）；无快照时退回旧版紧凑映射（仅译名）。 */
+    private fun buildNormalizationIndex(
+        snapshot: TagKnowledgeSnapshot?,
+        compact: Map<String, Map<String, String>>,
+    ): NormalizationIndex {
+        val originals = HashMap<String, MutableList<NormalizationEntry>>()
+        val translated = HashMap<String, MutableList<NormalizationEntry>>()
+        val aliases = HashMap<String, MutableList<NormalizationEntry>>()
+        val frequencies = HashMap<String, Long>()
+        val all = mutableListOf<NormalizationEntry>()
+
+        fun addEntry(namespace: String, tagKey: String, translatedName: String?, fullName: String?) {
+            val ns = namespace.trim().lowercase(Locale.ROOT)
+            val key = normalizeText(tagKey).lowercase(Locale.ROOT)
+            // "namespace" 伪命名空间是各命名空间自身的译名行，参与检索归一化会误映射，排除。
+            if (ns.isEmpty() || key.isEmpty() || ns == META_NAMESPACE) return
+            val entry = NormalizationEntry(
+                namespace = ns,
+                tagKey = key,
+                translatedName = translatedName?.let(::normalizeText)?.takeIf(String::isNotBlank),
+            )
+            all += entry
+            originals.getOrPut(key) { mutableListOf() }.add(entry)
+            originals.getOrPut("$ns:$key") { mutableListOf() }.add(entry)
+            entry.translatedName?.let { name ->
+                translated.getOrPut(name) { mutableListOf() }.add(entry)
+            }
+            fullName?.let(::normalizeText)?.takeIf(String::isNotBlank)?.let { alias ->
+                aliases.getOrPut(alias.lowercase(Locale.ROOT)) { mutableListOf() }.add(entry)
+            }
+        }
+
+        if (snapshot != null && snapshot.dictionary.isNotEmpty()) {
+            snapshot.dictionary.forEach {
+                addEntry(it.namespace, it.tagKey, it.translatedName, it.fullName)
+            }
+            snapshot.frequencies.forEach { freq ->
+                val ns = freq.namespace.trim().lowercase(Locale.ROOT)
+                val key = normalizeText(freq.tagKey).lowercase(Locale.ROOT)
+                if (ns.isNotEmpty() && key.isNotEmpty()) {
+                    frequencies.merge("$ns:$key", freq.count, Long::plus)
+                }
+            }
+        } else {
+            compact.forEach { (namespace, tags) ->
+                tags.forEach { (tag, name) -> addEntry(namespace, tag, name, null) }
+            }
+        }
+        return NormalizationIndex(originals, translated, aliases, all, frequencies)
+    }
+
+    // ==================== D3 词库自动更新 ====================
+
+    /** D3 自动更新检查每进程只执行一次；后台刷新静默失败，下次启动重试。 */
+    private val autoUpdateTriggered = AtomicBoolean(false)
+    private val autoUpdateScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 开关状态的内存镜像（由下面的单向流维护），避免每次查询都读一次 DataStore。 */
+    private val autoUpdateEnabled = AtomicBoolean(false)
+    private val autoUpdateObserverStarted = AtomicBoolean(false)
+
+    /**
+     * 自动更新读取开关用；与 AppContainer 的实例共享同一 DataStore
+     * （settingsDataStore 为 top-level preferencesDataStore 单例委托），AppContainer 不可改时的最小接入点。
+     */
+    private val settingsRepository: SettingsRepository by lazy { SettingsRepository(context) }
+
+    /**
+     * 自动更新触发点：挂在首次对外查询（loadKnowledge / normalize*）上。
+     * 开关开启且最后一次更新距今超过 7 天（从未更新视为过期）时后台刷新，静默失败。
+     *
+     * 注意：闩只在「开关已打开」后才落。原先的写法在读取开关之前就落闩，
+     * 于是用户在本次进程内打开开关不会触发任何刷新，必须重启 App 才生效。
+     * 这里改为订阅开关：开关关闭时不落闩，开关变为打开时重新武装闩并立即评估一次。
+     */
+    private fun maybeAutoUpdate() {
+        if (!autoUpdateObserverStarted.compareAndSet(false, true)) {
+            if (autoUpdateEnabled.get()) runAutoUpdateIfDue()
+            return
+        }
+        autoUpdateScope.launch {
+            settingsRepository.settings
+                .map { it.tagTranslationAutoUpdate }
+                .distinctUntilChanged()
+                .collect { enabled ->
+                    autoUpdateEnabled.set(enabled)
+                    // 每次「打开」都重新武装，保证本次进程内立刻生效。
+                    if (enabled) autoUpdateTriggered.set(false)
+                    if (enabled) runAutoUpdateIfDue()
+                }
+        }
+    }
+
+    private fun runAutoUpdateIfDue() {
+        if (!autoUpdateTriggered.compareAndSet(false, true)) return
+        autoUpdateScope.launch {
+            try {
+                val lastUpdated = TagTranslationStore.lastUpdated.value
+                val stale = lastUpdated == null ||
+                    System.currentTimeMillis() - lastUpdated > AUTO_UPDATE_INTERVAL_MS
+                if (!stale) return@launch
+                update()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // 静默失败：自动更新不打扰用户。
+            }
+        }
     }
 
     private fun publish(snapshot: TagKnowledgeSnapshot, metadata: TranslationMetadata? = null) {
@@ -248,8 +498,36 @@ class TagTranslationRepository(
         return result
     }
 
+    /** D4 归一化索引的单条词典记录（namespace/tagKey 均已折算为小写 canonical 形式）。 */
+    private data class NormalizationEntry(
+        val namespace: String,
+        val tagKey: String,
+        val translatedName: String?,
+    )
+
+    /**
+     * D4 搜索归一化索引：原文 tag（含命名空间与裸名两套键）、中文译名、英文别名（fullName）
+     * 三个精确键，加全量记录（供前缀兜底扫描）与 tag_frequency 词频合计。
+     */
+    private class NormalizationIndex(
+        val originals: Map<String, List<NormalizationEntry>>,
+        val translated: Map<String, List<NormalizationEntry>>,
+        val aliases: Map<String, List<NormalizationEntry>>,
+        val allEntries: List<NormalizationEntry>,
+        val frequencies: Map<String, Long>,
+    )
+
     private companion object {
         const val TAG_DATABASE_LICENSE = "Refer to the upstream EhTagTranslation/Database terms"
         const val TAG_DATABASE_ATTRIBUTION = "EhTagTranslation/Database contributors"
+
+        /** db.text.json 中存放命名空间自身译名的伪命名空间。 */
+        const val META_NAMESPACE = "namespace"
+
+        /** D3 自动更新间隔：词库最后一次更新距今超过 7 天视为过期。 */
+        const val AUTO_UPDATE_INTERVAL_MS = 7L * 24 * 60 * 60 * 1000
+
+        /** D4 分词分隔符：按空白分词。 */
+        val SEARCH_TOKEN_SEPARATOR = Regex("\\s+")
     }
 }

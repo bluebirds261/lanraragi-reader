@@ -39,18 +39,35 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.model.ServerStats
 import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
+import com.lanraragi.reader.ui.EmptyBox
+import com.lanraragi.reader.ui.ErrorBox
+import com.lanraragi.reader.ui.LoadingBox
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.rememberTagText
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
 // 女性 tag 粉色系：低权重浅粉 → 高权重深粉。
 private val FemaleLight = Color(0xFFF8BBD0)
 private val FemaleDark = Color(0xFFC2185B)
 
-/** 统计页：只统计「女性：XX」类型 tag，圆形渐变词云 + 排名横柱图，中文显示。 */
+/** 分区级加载/错误/空态的统一占位高度，避免状态块把整页撑满。 */
+internal val SectionStateHeight = 180.dp
+
+/** 统计页：纵向单页三分区 —— 本地使用统计 / 服务器统计 / 标签词云，各分区独立加载互不影响。 */
 @Composable
 fun StatisticsScreen(container: AppContainer, navController: NavController) {
     Scaffold(
@@ -61,25 +78,80 @@ fun StatisticsScreen(container: AppContainer, navController: NavController) {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun StatisticsContent(container: AppContainer, modifier: Modifier = Modifier) {
-    var tags by remember { mutableStateOf<List<TagStat>>(emptyList()) }
-    var topN by remember { mutableIntStateOf(10) }
+    Column(
+        modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
+    ) {
+        // 第一区：本地使用统计（原统计页内容）。
+        SectionHeader("本地使用统计")
+        LocalUsageStatsSection(container)
 
-    LaunchedEffect(Unit) {
-        tags = runCatching { container.repository.getTags() }.getOrDefault(emptyList())
+        Spacer(Modifier.height(28.dp))
+
+        // 第二区：服务器统计（并入原无入口的 StatsScreen）。
+        SectionHeader("服务器统计")
+        ServerStatsSection(container)
+
+        Spacer(Modifier.height(28.dp))
+
+        // 第三区：标签词云（接入原孤儿 TagStatsScreen 的内容）。
+        SectionHeader("标签词云")
+        TagStatsContent(container)
     }
+}
+
+/** 各分区的小标题。 */
+@Composable
+private fun SectionHeader(title: String) {
+    Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+    Spacer(Modifier.height(12.dp))
+}
+
+/** 第一区：本地使用统计 —— 女性 Tag 词云与热度排行，数据取自仓库标签数据，独立加载/错误/空态。 */
+@Composable
+private fun LocalUsageStatsSection(container: AppContainer) {
+    var tags by remember { mutableStateOf<List<TagStat>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var retryKey by remember { mutableIntStateOf(0) }
+
+    LaunchedEffect(retryKey) {
+        loading = true
+        error = null
+        try {
+            tags = container.repository.getTags()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            error = e.message ?: "加载失败"
+        }
+        loading = false
+    }
+
+    when {
+        loading -> LoadingBox(Modifier.fillMaxWidth().height(SectionStateHeight))
+        error != null -> ErrorBox(error!!, onRetry = { retryKey++ }, modifier = Modifier.fillMaxWidth().height(SectionStateHeight))
+        else -> FemaleTagStatsBody(tags)
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FemaleTagStatsBody(tags: List<TagStat>) {
+    var topN by remember { mutableIntStateOf(10) }
 
     // 只统计 female namespace 的 tag，按权重降序。
     val femaleTags = remember(tags) {
         tags.filter { it.namespace?.lowercase() == "female" }.sortedByDescending { it.weight }
     }
+    if (femaleTags.isEmpty()) {
+        EmptyBox("暂无女性 Tag 数据", Modifier.fillMaxWidth().height(SectionStateHeight))
+        return
+    }
     val maxWeight = (femaleTags.maxOfOrNull { it.weight } ?: 0).coerceAtLeast(1)
 
-    Column(
-        modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
-    ) {
+    Column {
         // 顶部统计卡片
         Card(Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
             Column(Modifier.padding(20.dp)) {
@@ -182,6 +254,83 @@ fun StatisticsContent(container: AppContainer, modifier: Modifier = Modifier) {
                 Spacer(Modifier.width(10.dp))
                 Text(tag.weight.toString(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+    }
+}
+
+/** 服务器统计 VM（自原 StatsScreen 迁入，逻辑不变）。 */
+class StatsViewModel(private val container: AppContainer) : ViewModel() {
+    data class UiState(
+        val loading: Boolean = true,
+        val stats: ServerStats? = null,
+        val error: String? = null,
+    )
+
+    private val _state = MutableStateFlow(UiState())
+    val state = _state.asStateFlow()
+
+    init {
+        load()
+    }
+
+    fun load() {
+        viewModelScope.launch {
+            _state.update { it.copy(loading = true, error = null) }
+            try {
+                val stats = container.repository.getStats()
+                _state.update { it.copy(loading = false, stats = stats) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                _state.update { it.copy(loading = false, error = e.message ?: "加载失败") }
+            }
+        }
+    }
+}
+
+/** 第二区：服务器统计 —— 档案总数/标签数走 repository.getStats()，累计阅读页数与服务器名/版本取自 ApiClient 缓存的 /api/info。 */
+@Composable
+private fun ServerStatsSection(container: AppContainer) {
+    val vm: StatsViewModel = viewModel { StatsViewModel(container) }
+    val state by vm.state.collectAsStateWithLifecycle()
+    val serverInfo by ApiClient.config.serverInfo.collectAsStateWithLifecycle()
+
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(
+            "数据来源：LANraragi 服务器",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        when {
+            state.loading -> LoadingBox(Modifier.fillMaxWidth().height(SectionStateHeight))
+            state.error != null -> ErrorBox(state.error!!, onRetry = vm::load, modifier = Modifier.fillMaxWidth().height(SectionStateHeight))
+            state.stats != null -> {
+                val s = state.stats!!
+                val info = serverInfo
+                StatCard("档案总数", s.total_archives.toString())
+                StatCard("累计阅读页数", info?.total_pages_read?.toString() ?: "未知")
+                StatCard("标签数", s.tags_count.toString())
+                Text(
+                    if (info == null) {
+                        "服务器：未知（尚未获取到服务器信息）"
+                    } else {
+                        "服务器：${info.name.ifBlank { "（未命名）" }} · 版本：${info.version_name.ifBlank { info.version }.ifBlank { "未知" }}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatCard(label: String, value: String) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp)) {
+            Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
+            Text(value, style = MaterialTheme.typography.headlineMedium)
         }
     }
 }

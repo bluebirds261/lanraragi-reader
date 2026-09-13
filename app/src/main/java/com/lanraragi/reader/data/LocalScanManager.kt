@@ -268,7 +268,9 @@ class LocalScanManager(
             title = entity.title.ifBlank { "未知画廊" },
             tags = if (unavailable) "local,unavailable" else "local,$kind",
             pagecount = entity.pageCount.coerceAtLeast(0),
-            dateadded = entity.lastVerifiedAt,
+            // Archive.dateadded 全链路按「epoch 秒」解释（ArchiveCard 渲染时 *1000），
+            // lastVerifiedAt 是毫秒，必须换算，否则会显示成 +57000 年。
+            dateadded = entity.lastVerifiedAt / 1000L,
             summary = entity.uri,
         )
     }

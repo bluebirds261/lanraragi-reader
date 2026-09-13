@@ -21,13 +21,20 @@
       "priority": 2
     },
     {
-      "id": "failed-page",
-      "type": "PAGE",
+      "id": "failed-file",
+      "type": "ARCHIVE_FILE",
       "arcid": "archive-c",
       "title": "Archive C",
       "state": "FAILED",
       "error": "remote timeout",
       "percent": 120
+    },
+    {
+      "id": "removed-page",
+      "type": "PAGE",
+      "arcid": "archive-d",
+      "title": "Archive D",
+      "state": "DONE"
     }
   ]
 }

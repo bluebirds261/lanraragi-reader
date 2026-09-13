@@ -76,16 +76,17 @@ class NativeMetadataProvidersTest {
         )
 
         val exact = candidates.first()
+        val patch = requireNotNull(exact.patch)
         assertEquals(MetadataCandidateMatch.EXPLICIT_SOURCE_URL, exact.match)
         assertEquals("7788", exact.sourceId)
         assertEquals("https://e-hentai.org/g/7788/Token9", exact.sourceUrl)
-        assertEquals("ehentai", exact.patch?.sourceUrl?.provenance?.providerId)
-        assertEquals(400L, exact.patch?.sourceUrl?.provenance?.fetchedAt)
-        val sourceTag = exact.patch?.addTags?.single()
-        assertEquals(TagSource.EHENTAI, sourceTag?.source)
+        assertEquals("ehentai", patch.sourceUrl?.provenance?.providerId)
+        assertEquals(400L, patch.sourceUrl?.provenance?.fetchedAt)
+        val sourceTag = patch.addTags.single()
+        assertEquals(TagSource.EHENTAI, sourceTag.source)
         assertEquals(
-            exact.patch?.sourceUrl?.provenance,
-            sourceTag?.full?.let { exact.patch?.tagProvenance?.get(it) },
+            patch.sourceUrl?.provenance,
+            sourceTag.full.let { patch.tagProvenance[it] },
         )
     }
 

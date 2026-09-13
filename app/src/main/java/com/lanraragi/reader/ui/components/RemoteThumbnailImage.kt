@@ -24,6 +24,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coil.request.ImageRequest
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.catalog.isTankArchiveId
 import com.lanraragi.reader.data.assets.CoverModel
 import com.lanraragi.reader.data.assets.CoverState
 import com.lanraragi.reader.di.AppContainer
@@ -31,9 +32,9 @@ import com.lanraragi.reader.di.AppContainer
 /**
  * Renders a remote archive cover through the 200/202-aware thumbnail repository.
  *
- * When the experimental flag is disabled this deliberately keeps the legacy
- * URL path as a kill switch. No server fallback response is cached while the
- * flag is enabled; a client placeholder is shown until a real 200 is ready.
+ * 缩略图仓库（200 直出 / 202 排队轮询）原先是 `a5_thumbnails` 实验开关控制、
+ * 关闭时退回遗留直连 URL；该开关已随「实验室」页一并移除，仓库路径现在是唯一路径。
+ * 仓库路径不缓存服务端的兜底响应：真实 200 就绪前显示客户端占位图。
  */
 @Composable
 fun RemoteThumbnailImage(
@@ -46,10 +47,15 @@ fun RemoteThumbnailImage(
     enabled: Boolean? = null,
     onError: (() -> Unit)? = null,
 ) {
-    val configuredEnabled by container.thumbnailEnabled.collectAsStateWithLifecycle()
-    val useRepository = enabled ?: configuredEnabled
+    // 单行本（TANK_xxx）的封面走 `/api/tankoubons/{id}/thumbnail`，不是档案缩略图端点：
+    // 档案缩略图仓库会用 `/api/archives/TANK_xxx/thumbnail`（no_fallback），
+    // 服务端查不到对应文件，只会排一个注定失败的缩略图任务。因此 tank 一律走遗留直连路径。
+    val isTank = isTankArchiveId(arcid)
+    val useRepository = (enabled ?: true) && !isTank
     val serverKey by ApiClient.config.serverKey.collectAsStateWithLifecycle()
-    val legacyCoverVersion by CoverChangeBus.version.collectAsStateWithLifecycle()
+    // 只订阅「本档案」的封面版本号：换别的档案的封面不该让这张图重新下载。
+    val coverVersions by CoverChangeBus.versions.collectAsStateWithLifecycle()
+    val legacyCoverVersion = coverVersions[arcid] ?: 0
     val coverFlow = remember(arcid, serverKey) {
         container.thumbnailRepository.retainCover(arcid)
     }
@@ -67,7 +73,8 @@ fun RemoteThumbnailImage(
     }
 
     if (!useRepository) {
-        val legacyModel = fallbackModel ?: (ApiClient.thumbnailUrl(arcid) +
+        val base = if (isTank) ApiClient.tankoubonThumbnailUrl(arcid) else ApiClient.thumbnailUrl(arcid)
+        val legacyModel = fallbackModel ?: (base +
             if (legacyCoverVersion > 0) "?v=$legacyCoverVersion" else "")
         LoadingImage(
             model = legacyModel,

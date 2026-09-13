@@ -67,7 +67,7 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
 
-    implementation("androidx.compose.foundation:foundation")
+    implementation(libs.androidx.foundation)
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
@@ -97,8 +97,10 @@ dependencies {
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.room.testing)
 
-    implementation("io.github.kyant0:backdrop:2.0.1")
-    implementation("io.github.kyant0:shapes:1.2.0")
+    // 液态玻璃（Compose Multiplatform，Maven Central）：版本集中在 libs.versions.toml，
+    // 避免出现「声明 1.2.0、实际解析 1.2.1」这类不一致。
+    implementation(libs.kyant.backdrop)
+    implementation(libs.kyant.shapes)
     debugImplementation(libs.androidx.ui.tooling)
 
 

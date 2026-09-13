@@ -18,6 +18,13 @@ data class LibraryEntry(
     val isSaved: Boolean = false,
     val capabilities: ArchiveCapabilities = ArchiveCapabilities.forIdentity(identity),
     val localUri: String? = null,
+    /**
+     * 单行本（[ArchiveIdentity.Tankoubon]）的成员档案数量；普通档案与本地档案恒为 0。
+     * 对齐服务端 `build_tank_json` 的 `archive_count`，最终经
+     * LibraryScreen 的 legacy 映射（toLegacyArchive）落到 [com.lanraragi.reader.data.model.Archive.archive_count]
+     * 供卡片渲染「单行本 · N 卷」。追加在末尾以保持既有位置构造兼容。
+     */
+    val volumeCount: Int = 0,
 ) {
     val source: LibrarySource
         get() = if (identity is ArchiveIdentity.LocalSaf) LibrarySource.LOCAL else LibrarySource.REMOTE
@@ -101,8 +108,11 @@ class MixedLibraryRepository(
                 LibrarySort.DATE_ADDED -> a.dateAdded.compareTo(b.dateAdded)
                 else -> a.tags.firstOrNull()?.lowercase().orEmpty().compareTo(b.tags.firstOrNull()?.lowercase().orEmpty())
             }
-            val stable = primary.takeIf { it != 0 } ?: a.sourceKey.compareTo(b.sourceKey)
-            return if (q.direction == SortDirection.ASC) stable else -stable
+            // 并列时返回 0：Kotlin 的 sortedWith 是稳定排序，于是保持「服务器返回顺序」。
+            // 原先并列会退回按 sourceKey(arcid) 排，而服务端 sortby=date_added/lastread 的
+            // 排序键并不在档案 JSON 里（例如 date_added 只在标签中），一旦解析不到就全为 0，
+            // 客户端这一下重排会把服务端已经算好的顺序整个打乱——用户看到的就是「排序规则没生效」。
+            return if (q.direction == SortDirection.ASC) primary else -primary
         }
         return Comparator { a, b -> compare(a, b) }
     }

@@ -1,10 +1,8 @@
 package com.lanraragi.reader.di
 
 import android.content.Context
-import com.lanraragi.reader.data.CheckinRepository
 import com.lanraragi.reader.data.DownloadManager
 import com.lanraragi.reader.data.FavoritesRepository
-import com.lanraragi.reader.data.FeatureFlags
 import com.lanraragi.reader.data.HistoryRepository
 import com.lanraragi.reader.data.JobTracker
 import com.lanraragi.reader.data.LanraragiRepository
@@ -22,11 +20,13 @@ import com.lanraragi.reader.data.OfflineCacheManager
 import com.lanraragi.reader.data.PendingProgressStore
 import com.lanraragi.reader.data.SearchHistoryRepository
 import com.lanraragi.reader.data.SettingsRepository
+import com.lanraragi.reader.data.SplashCoverStore
 import com.lanraragi.reader.data.TagTranslationRepository
 import com.lanraragi.reader.data.tags.knowledge.RoomTagKnowledgeStore
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeRepository
 import com.lanraragi.reader.data.UsageRepository
 import com.lanraragi.reader.data.api.ApiClient
+import com.lanraragi.reader.data.refreshServerInfo
 import com.lanraragi.reader.data.assets.OkHttpThumbnailGateway
 import com.lanraragi.reader.data.assets.ThumbnailRepository
 import com.lanraragi.reader.data.db.ReaderDatabase
@@ -37,15 +37,10 @@ import com.lanraragi.reader.data.download.SavedArtifactRepository
 import com.lanraragi.reader.data.download.DownloadCoordinator
 import com.lanraragi.reader.data.download.LanraragiDownloadRunnerFactory
 import com.lanraragi.reader.data.diagnostics.DiagnosticsFacade
-import com.lanraragi.reader.data.favorites.EhFavoriteCredentialStore
-import com.lanraragi.reader.data.favorites.EhFavoriteCategorySyncService
-import com.lanraragi.reader.data.favorites.EhFavoritesRepository
-import com.lanraragi.reader.data.favorites.EhentaiFavoriteGateway
-import com.lanraragi.reader.data.favorites.LanraragiEhFavoriteGateway
-import com.lanraragi.reader.data.favorites.LanraragiEhFavoriteArchiveLinkGateway
-import com.lanraragi.reader.data.favorites.RoomEhFavoriteStore
+import com.lanraragi.reader.data.diagnostics.LogcatCrashCapture
 import com.lanraragi.reader.data.history.RoomProgressTaskStore
 import com.lanraragi.reader.data.reader.OutboxProgressWriter
+import com.lanraragi.reader.data.ServerCapabilities
 import com.lanraragi.reader.data.reader.ProgressWriter
 import com.lanraragi.reader.data.reader.RepositoryProgressTransport
 import com.lanraragi.reader.data.catalog.LanraragiLibraryRemoteGateway
@@ -81,10 +76,6 @@ class AppContainer(val context: Context) {
     val runtimeSettingsReady = applicationScope.async(Dispatchers.IO) {
         settingsRepository.applyToRuntime()
     }
-    val thumbnailEnabled = settingsRepository.settings
-        .map { FeatureFlags.isEnabled(it, FeatureFlags.THUMBNAILS) }
-        .distinctUntilChanged()
-        .stateIn(applicationScope, SharingStarted.Eagerly, false)
     val favoritesRepository = FavoritesRepository(context)
     val repository = LanraragiRepository(ApiClient.api)
     val metadataRepository = MetadataRepository(
@@ -102,6 +93,8 @@ class AppContainer(val context: Context) {
     val durableDownloadTaskStore = RoomDownloadTaskStore(readerDatabase)
     val savedArtifactRepository = SavedArtifactRepository(RoomSavedArtifactStore(readerDatabase))
     val diagnostics = DiagnosticsFacade()
+    /** 崩溃日志抓取：注册全局未捕获异常处理器，开关由 captureLogcat 设置驱动。 */
+    val logcatCrashCapture = LogcatCrashCapture(context)
     /** Durable coordinator is process-scoped; runners are registered by feature adapters. */
     val durableDownloadCoordinator = DownloadCoordinator(
         scope = applicationScope,
@@ -129,25 +122,18 @@ class AppContainer(val context: Context) {
     val progressWriter: ProgressWriter = OutboxProgressWriter(
         store = RoomProgressTaskStore(readerDatabase),
         transport = RepositoryProgressTransport(repository),
+        scope = applicationScope,
+        // A3 能力门控：服务端未开启进度记录时不回传（/info 未就绪时保持乐观）。
+        progressSupported = { ServerCapabilities(ApiClient.config.serverInfo.value).supportsProgress },
     )
     val libraryRepository = MixedLibraryRepository(
-        remote = LanraragiLibraryRemoteGateway(repository),
+        remote = LanraragiLibraryRemoteGateway(
+            repository,
+            serverConfigured = { ApiClient.config.isConfigured },
+        ),
         local = RoomLibraryLocalGateway(readerDatabase),
     )
     val libraryRequests = LibraryRequestCoordinator(applicationScope, libraryRepository)
-    val ehFavoriteStore = RoomEhFavoriteStore(readerDatabase.ehFavoriteDao())
-    val ehFavoriteCredentials = EhFavoriteCredentialStore(context)
-    val ehFavoritesRepository = EhFavoritesRepository(
-        store = ehFavoriteStore,
-        accountConnector = ehFavoriteCredentials,
-        gateway = EhentaiFavoriteGateway(),
-    )
-    val ehFavoriteCategorySync = EhFavoriteCategorySyncService(
-        mappings = ehFavoriteStore,
-        snapshots = ehFavoriteStore,
-        categoryGateway = LanraragiEhFavoriteGateway(repository),
-        archiveLinks = LanraragiEhFavoriteArchiveLinkGateway(repository),
-    )
     /** Process-scoped owner for remote cover generation and per-archive cache revisions. */
     val thumbnailRepository = ThumbnailRepository(
         gateway = OkHttpThumbnailGateway(),
@@ -159,6 +145,7 @@ class AppContainer(val context: Context) {
         applicationScope,
         context,
         durableDownloadCoordinator,
+        settingsRepository,
     )
     val offlineCache = OfflineCacheManager(
         context,
@@ -171,6 +158,8 @@ class AppContainer(val context: Context) {
         appDataBootstrap,
     )
     val tagTranslationRepository = TagTranslationRepository(context, tagKnowledgeRepository)
+    /** 开屏封面：用户在设置里从图库选的一张图片（私有目录副本）。 */
+    val splashCoverStore = SplashCoverStore(context)
     val searchHistoryRepository = SearchHistoryRepository(context)
     val historyRepository = HistoryRepository(
         context,
@@ -178,7 +167,6 @@ class AppContainer(val context: Context) {
         applicationScope,
         appDataBootstrap,
     )
-    val checkinRepository = CheckinRepository(context)
     val usageRepository = UsageRepository(context)
     val localLibraryIndexer = LocalLibraryIndexer(context, readerDatabase)
     val localScanManager = LocalScanManager(
@@ -192,6 +180,19 @@ class AppContainer(val context: Context) {
     val pendingProgress = PendingProgressStore(context)
 
     init {
+        // A3 启动时读一次 `/api/info` 做能力探测：服务器名/版本/server_tracks_progress/
+        // total_pages_read 供统计页展示与后续能力门控使用。此前只在向导与设置页的连接动作里刷新，
+        // 冷启动后 serverInfo 一直是 null，统计页的「累计阅读页数」永远显示「未知」。
+        applicationScope.launch {
+            runtimeSettingsReady.await()
+            if (ApiClient.config.isConfigured) refreshServerInfo(repository)
+        }
+
+        // 所有服务器 Minion 异步任务（A4 整本页缩略图 / A7 重复检测 / A8 插件批量 / A10 备份恢复）
+        // 入队后统一登记到 JobTracker，作为下载页「服务器任务」区的唯一数据源。
+        // 此前没有任何地方调用 track()，该区域永远为空。
+        repository.onJobQueued = { jobid, label -> jobTracker.track(jobid, label) }
+
         // 启动时加载本地缓存的标签翻译数据。
         tagTranslationRepository.load()
         applicationScope.launch {
@@ -219,6 +220,26 @@ class AppContainer(val context: Context) {
                 .collect { concurrency ->
                     downloadManager.setMaxConcurrent(concurrency)
                     durableDownloadCoordinator.setMaxConcurrent(concurrency)
+                }
+        }
+
+        // C3 重试上限同样由 DataStore 单一来源驱动：变更实时应用到协调器，无需重建。
+        applicationScope.launch {
+            settingsRepository.settings
+                .map { it.downloadMaxRetries }
+                .distinctUntilChanged()
+                .collect { retries ->
+                    durableDownloadCoordinator.setMaxRetries(retries)
+                }
+        }
+
+        // 崩溃日志抓取由 DataStore 单一来源驱动，实时跟随开关。
+        applicationScope.launch {
+            settingsRepository.settings
+                .map { it.captureLogcat }
+                .distinctUntilChanged()
+                .collect { enabled ->
+                    logcatCrashCapture.setEnabled(enabled)
                 }
         }
 
@@ -255,10 +276,6 @@ class AppContainer(val context: Context) {
         // F4: 启动时执行收藏仓库的版本迁移（settings 的迁移由 applyToRuntime 触发）。
         applicationScope.launch {
             favoritesRepository.migrateIfNeeded()
-        }
-        applicationScope.launch {
-            appDataBootstrap.await()
-            ehFavoritesRepository.loadCached()
         }
     }
 }

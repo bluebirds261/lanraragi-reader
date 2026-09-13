@@ -4,7 +4,6 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
-import androidx.room.Transaction
 import androidx.room.Upsert
 import kotlinx.coroutines.flow.Flow
 
@@ -220,41 +219,6 @@ interface TagKnowledgeDao {
 
     @Insert
     fun replaceSearchIndexSync(entries: List<TagDictionaryFtsEntity>)
-}
-
-@Dao
-interface EhFavoriteDao {
-    @Query("SELECT * FROM eh_favorite_slot ORDER BY slotIndex")
-    fun observeSlots(): Flow<List<EhFavoriteSlotEntity>>
-
-    @Query("SELECT * FROM eh_favorite_mapping")
-    fun observeMappings(): Flow<List<EhFavoriteMappingEntity>>
-
-    @Query("SELECT * FROM eh_favorite_entry ORDER BY slotIndex, gid, token")
-    fun observeEntries(): Flow<List<EhFavoriteEntryEntity>>
-
-    @Upsert
-    suspend fun upsertSlots(slots: List<EhFavoriteSlotEntity>)
-
-    @Upsert
-    suspend fun upsertEntries(entries: List<EhFavoriteEntryEntity>)
-
-    @Query("DELETE FROM eh_favorite_entry")
-    suspend fun deleteAllEntries()
-
-    /** Replaces the remote snapshot without exposing a half-written slot/entry set. */
-    @Transaction
-    suspend fun replaceSnapshot(slots: List<EhFavoriteSlotEntity>, entries: List<EhFavoriteEntryEntity>) {
-        upsertSlots(slots)
-        deleteAllEntries()
-        if (entries.isNotEmpty()) upsertEntries(entries)
-    }
-
-    @Upsert
-    suspend fun upsertMapping(mapping: EhFavoriteMappingEntity)
-
-    @Query("DELETE FROM eh_favorite_mapping WHERE slotIndex = :slotIndex")
-    suspend fun deleteMapping(slotIndex: Int)
 }
 
 @Dao

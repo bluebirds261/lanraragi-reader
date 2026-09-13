@@ -18,13 +18,10 @@ import androidx.room.RoomDatabase
         TagDictionaryEntity::class,
         TagDictionaryFtsEntity::class,
         TagFrequencyEntity::class,
-        EhFavoriteSlotEntity::class,
-        EhFavoriteMappingEntity::class,
-        EhFavoriteEntryEntity::class,
         ProgressTaskEntity::class,
         LegacyImportStateEntity::class,
     ],
-    version = 8,
+    version = 9,
     exportSchema = true,
 )
 abstract class ReaderDatabase : RoomDatabase() {
@@ -37,11 +34,10 @@ abstract class ReaderDatabase : RoomDatabase() {
     abstract fun metadataStateDao(): MetadataStateDao
     abstract fun metadataDao(): MetadataDao
     abstract fun tagKnowledgeDao(): TagKnowledgeDao
-    abstract fun ehFavoriteDao(): EhFavoriteDao
     abstract fun legacyImportStateDao(): LegacyImportStateDao
 
     companion object {
-        const val CURRENT_SCHEMA_VERSION = 8
+        const val CURRENT_SCHEMA_VERSION = 9
 
         val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
             override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
@@ -124,10 +120,18 @@ abstract class ReaderDatabase : RoomDatabase() {
             }
         }
 
+        val MIGRATION_8_9 = object : androidx.room.migration.Migration(8, 9) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS `eh_favorite_entry`")
+                db.execSQL("DROP TABLE IF EXISTS `eh_favorite_mapping`")
+                db.execSQL("DROP TABLE IF EXISTS `eh_favorite_slot`")
+            }
+        }
+
         fun build(context: Context): ReaderDatabase = Room.databaseBuilder(
             context.applicationContext,
             ReaderDatabase::class.java,
             "reader.db",
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9).build()
     }
 }

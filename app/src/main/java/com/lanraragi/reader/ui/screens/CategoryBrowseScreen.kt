@@ -53,6 +53,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import com.lanraragi.reader.data.catalog.isTankArchiveId
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.Category
 import com.lanraragi.reader.di.AppContainer
@@ -452,7 +453,15 @@ private fun CategoryArchiveGrid(
             items(state.archives, key = { it.arcid }) { archive ->
                 ArchiveCard(
                     archive = archive,
-                    onClick = { navController.navigate(Routes.detail(archive.arcid)) },
+                    // 分类结果同样受 groupby_tanks 影响：单行本只能进单行本阅读器
+                    // （档案详情端点要求 40 位 arcid）。
+                    onClick = {
+                        if (isTankArchiveId(archive.arcid)) {
+                            navController.navigate(Routes.tankReader(archive.arcid))
+                        } else {
+                            navController.navigate(Routes.detail(archive.arcid))
+                        }
+                    },
                     thumbnailContainer = container,
                 )
             }

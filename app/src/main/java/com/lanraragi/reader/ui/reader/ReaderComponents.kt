@@ -69,13 +69,18 @@ fun ReaderSheets(
     if (pageMenuVisible) pageMenu()
 }
 
+/**
+ * 阅读器沉浸式（UI 规划 5.7）：进入阅读路由时隐藏状态栏与导航栏，退出时原样恢复。
+ * 只作用于承载阅读器的 Activity 窗口；阅读器内基于 insets 的 chrome
+ * （statusBarsPadding / navigationBarsPadding）会随 insets 归零自动让位。
+ */
 @Composable
 fun ReaderRouteEffects(context: Context, view: View) {
     DisposableEffect(view) {
         val window = context.findActivity()?.window
         val controller = window?.let { WindowInsetsControllerCompat(it, view) }
-        controller?.hide(WindowInsetsCompat.Type.statusBars())
-        onDispose { controller?.show(WindowInsetsCompat.Type.statusBars()) }
+        controller?.hide(WindowInsetsCompat.Type.systemBars())
+        onDispose { controller?.show(WindowInsetsCompat.Type.systemBars()) }
     }
 }
 

@@ -29,6 +29,7 @@ interface LanraragiApi {
         @Query("category") category: String? = null,
         @Query("newonly") newonly: String? = null,
         @Query("untaggedonly") untaggedonly: String? = null,
+        @Query("hidecompleted") hidecompleted: String? = null,
     ): Response<ResponseBody>
 
     /** 获取档案完整元数据（含 pages 列表、tags、progress 等）。 */
@@ -111,6 +112,18 @@ interface LanraragiApi {
     @GET("api/minion/{jobid}/detail")
     suspend fun getMinionJobDetail(@Path("jobid") jobid: String): Response<ResponseBody>
 
+    /**
+     * A7 重复检测任务入队（POST api/minion/find_duplicates/queue，🔑）。
+     * 契约 `POST /minion/{jobname}/queue`：args 为必填 query 参数（JSON 数组字符串，
+     * 服务器 decode_json 后展开为任务参数），priority 可选；find_duplicates 任务取
+     * args[0] 为封面哈希汉明距离阈值。成功返回 `{operation, success, job}`。
+     */
+    @POST("api/minion/find_duplicates/queue")
+    suspend fun queueDuplicateDetection(
+        @Query("args") args: String,
+        @Query("priority") priority: Int? = null,
+    ): Response<ResponseBody>
+
     /** A5 某档案页生成页码缩略图(入队任务)。 */
     @POST("api/archives/{id}/files/thumbnails")
     suspend fun queuePageThumbnails(
@@ -144,6 +157,13 @@ interface LanraragiApi {
     /** A7 清除“新”标记。 */
     @DELETE("api/archives/{id}/isnew")
     suspend fun clearArchiveNew(@Path("id") id: String): Response<ResponseBody>
+
+    /**
+     * A11 一次清除全库的「New」标记（契约 `clearNewAll`，DELETE /api/database/isnew）。
+     * 逐本调用 [clearArchiveNew] 只能覆盖当前已加载/已选中的档案，全库清 New 必须走这个端点。
+     */
+    @DELETE("api/database/isnew")
+    suspend fun clearAllNew(): Response<ResponseBody>
 
     /** A9 插件列表。 */
     @GET("api/plugins/{type}")
@@ -197,10 +217,6 @@ interface LanraragiApi {
     /** A11 单行本列表。 */
     @GET("api/tankoubons")
     suspend fun getTankoubons(@Query("page") page: Int? = null): Response<ResponseBody>
-
-    /** A11 单个单行本。 */
-    @GET("api/tankoubons/{id}")
-    suspend fun getTankoubon(@Path("id") id: String): Response<ResponseBody>
 
     /** A11 整卷阅读数据。 */
     @GET("api/tankoubons/{id}/full")

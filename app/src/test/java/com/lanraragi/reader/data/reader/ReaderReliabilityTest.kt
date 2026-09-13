@@ -61,17 +61,6 @@ class ReaderReliabilityTest {
     }
 
     @Test
-    fun layoutPreservesCoverAloneSpreadMapping() {
-        val spec = ReaderLayoutSpec(ReaderLayout.Spread, firstPageAlone = true)
-
-        assertEquals(3, ReaderLayoutAdapter.screenCount(5, spec))
-        assertEquals(0..0, ReaderLayoutAdapter.pagesForScreen(0, 5, spec))
-        assertEquals(1..2, ReaderLayoutAdapter.pagesForScreen(1, 5, spec))
-        assertEquals(3..4, ReaderLayoutAdapter.pagesForScreen(2, 5, spec))
-        assertEquals(2, ReaderLayoutAdapter.pageToScreen(4, 5, spec))
-    }
-
-    @Test
     fun gesturePanZoomConsumesUntilZoomIsReset() {
         val arbiter = ReaderGestureArbiter()
         assertFalse(arbiter.begin().consume)

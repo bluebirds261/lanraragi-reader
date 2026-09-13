@@ -12,12 +12,16 @@ import androidx.room.withTransaction
 
 /** Room bridge for durable task specs; the legacy DownloadManager remains a compatibility facade. */
 class RoomDownloadTaskStore(private val database: ReaderDatabase) : DownloadTaskStore {
-    override suspend fun loadAll(): List<DurableDownloadTask> = database.downloadTaskDao()
-        .loadByStates(DurableDownloadState.entries.map { it.name })
-        .mapNotNull(::decode)
+    override suspend fun loadAll(): List<DurableDownloadTask> {
+        val rows = database.downloadTaskDao().loadByStates(DurableDownloadState.entries.map { it.name })
+        // Single-page favorite ("收藏单页") tasks no longer exist; purge their persisted rows
+        // ("Page" from the durable encoder, "PAGE" from the legacy importer) so no dead task stays.
+        rows.filter(::isRemovedPageRow).forEach { database.downloadTaskDao().delete(it.taskId) }
+        return rows.filterNot(::isRemovedPageRow).mapNotNull(::decode)
+    }
 
     override fun observeAll(): Flow<List<DurableDownloadTask>> = database.downloadTaskDao()
-        .observeAll().map { rows -> rows.mapNotNull(::decode) }
+        .observeAll().map { rows -> rows.filterNot(::isRemovedPageRow).mapNotNull(::decode) }
 
     override suspend fun insert(task: DurableDownloadTask) = database.downloadTaskDao().upsert(encode(task))
 
@@ -38,6 +42,9 @@ class RoomDownloadTaskStore(private val database: ReaderDatabase) : DownloadTask
             updated
         }
     }
+
+    private fun isRemovedPageRow(entity: DownloadTaskEntity): Boolean =
+        entity.type.equals("page", ignoreCase = true)
 
     private fun encode(task: DurableDownloadTask): DownloadTaskEntity = DownloadTaskEntity(
         taskId = task.id,

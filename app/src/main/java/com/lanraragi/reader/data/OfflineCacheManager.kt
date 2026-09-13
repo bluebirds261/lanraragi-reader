@@ -1,5 +1,6 @@
 package com.lanraragi.reader.data
 
+import android.net.Uri
 import androidx.room.withTransaction
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.api.LanraragiApi
@@ -18,6 +19,9 @@ import com.lanraragi.reader.data.download.SavedArtifactRepository
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.data.model.CachedArchive
 import com.lanraragi.reader.data.model.OfflineIndex
+import com.lanraragi.reader.data.storage.StorageRoot
+import com.lanraragi.reader.data.storage.StorageRootState
+import com.lanraragi.reader.data.storage.storageUnavailableReason
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Deferred
@@ -36,15 +40,18 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import okhttp3.Request
 import java.io.File
-import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 
 /** 离线缓存占用统计：总字节数 + 已索引档案数量。 */
 data class OfflineUsage(val totalBytes: Long = 0, val count: Int = 0)
 
 /**
- * 离线缓存：把档案的封面 + 每一页图片下载到应用私有目录，
- * 从而在无网络时也能阅读。索引持久化到 filesDir/offline/index.json。
+ * 离线缓存：把档案的封面 + 原始文件保存到可配置的存储根（C6），从而在无网络时也能阅读。
+ *
+ * - 批量产物（原档/封面/元数据）经 [StorageRoot] 写入：默认根 = `filesDir/offline`（历史路径不变），
+ *   自定义根 = 用户授权的 SAF tree。
+ * - 索引 `index.json` 仍是元数据，永远存放在默认内部目录（保证可写、不占用户空间）。
+ * - 入队前有存储门禁：授权失效/介质移除/目录不可写时拒绝写入并报告"存储不可用"。
  */
 class OfflineCacheManager(
     private val context: android.content.Context,
@@ -57,7 +64,17 @@ class OfflineCacheManager(
     private val appDataBootstrap: Deferred<AppDataBootstrapReport>? = null,
 ) {
 
-    private val offlineDir = File(context.filesDir, "offline")
+    private companion object {
+        const val INDEX_FILE_NAME = "index.json"
+        const val ARCHIVE_FILE_NAME = "original.archive"
+        const val COVER_FILE_NAME = "cover.img"
+        const val META_FILE_NAME = "meta.json"
+        const val PENDING_META_FILE_NAME = "meta.pending.json"
+    }
+
+    /** 默认内部目录：index.json 与历史版本数据的落点，路径保持不变。 */
+    private val defaultOfflineDir = File(context.filesDir, "offline")
+    private val indexFile = File(defaultOfflineDir, INDEX_FILE_NAME)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _index = MutableStateFlow(OfflineIndex())
@@ -72,6 +89,9 @@ class OfflineCacheManager(
     /** 最近一次被 LRU 淘汰的 arcid，供详情页提示“缓存已被替换”。 */
     val lastEvicted = MutableStateFlow<String?>(null)
 
+    /** 存储根单一权威状态（degraded / lastError 观察点），直接转发 SettingsRepository。 */
+    val storageState: StateFlow<StorageRootState> get() = settingsRepository.storageRootState
+
     private var lastTouchPersistAt = 0L
     private val roomMirrorRevision = MutableStateFlow(0L)
     private val finalizingTasks = ConcurrentHashMap.newKeySet<String>()
@@ -85,9 +105,8 @@ class OfflineCacheManager(
 
     fun loadIndex() {
         val loaded = runCatching {
-            val f = File(offlineDir, "index.json")
-            if (f.exists()) {
-                _index.value = ApiClient.json.decodeFromString(f.readTextAtomically())
+            if (indexFile.exists()) {
+                _index.value = ApiClient.json.decodeFromString(indexFile.readTextAtomically())
                 true
             } else {
                 false
@@ -107,14 +126,50 @@ class OfflineCacheManager(
 
     fun progressFor(arcid: String): Float? = _progress.value[arcid]
 
+    /**
+     * 页图文件的默认目录路径（历史 API；当前页图不单独落盘）。
+     * 仅默认存储根下可能存在真实文件；自定义 SAF 根时应改用 [archiveUri] 等访问器。
+     */
     fun pageFile(arcid: String, page: Int): File {
         touch(arcid)
-        return File(File(offlineDir, arcid), "pages/${page.toString().padStart(4, '0')}.img")
+        return File(File(defaultOfflineDir, arcid), "pages/${page.toString().padStart(4, '0')}.img")
     }
 
-    fun coverFile(arcid: String): File = File(offlineDir, "$arcid/cover.img")
+    /**
+     * 封面文件的默认目录路径（历史 API，保持语义不变：默认根下指向真实文件）。
+     * 自定义 SAF 根时文件在 SAF 目录内，调用方应迁移到 [coverUri]（UI 批次处理）。
+     */
+    fun coverFile(arcid: String): File = File(defaultOfflineDir, "$arcid/$COVER_FILE_NAME")
 
-    fun archiveFile(arcid: String): File = File(offlineDir, "$arcid/original.archive")
+    /**
+     * 原档文件的默认目录路径（历史 API，保持语义不变：默认根下指向真实文件）。
+     * 自定义 SAF 根时文件在 SAF 目录内，调用方应迁移到 [archiveUri] / [archiveReady]。
+     */
+    fun archiveFile(arcid: String): File = File(defaultOfflineDir, "$arcid/$ARCHIVE_FILE_NAME")
+
+    // ---- URI 访问器：供 PageSource / 封面加载在自定义存储根下迁移使用（下一 UI 批次接线） ----
+
+    /** 原档可读（存在且非空），自动兼顾默认根与自定义根。 */
+    suspend fun archiveReady(arcid: String): Boolean {
+        val root = settingsRepository.storageRootState.value.root
+        val rel = "$arcid/$ARCHIVE_FILE_NAME"
+        if (root.exists(rel) && root.sizeOf(rel) > 0L) return true
+        val legacy = File(defaultOfflineDir, rel)
+        return legacy.isFile && legacy.length() > 0L
+    }
+
+    /** 原档引用：自定义根返回 `content://` 文档 URI，默认根返回 `file://` URI；不可用返回 `null`。 */
+    suspend fun archiveUri(arcid: String): Uri? = storageUriOf("$arcid/$ARCHIVE_FILE_NAME")
+
+    /** 封面引用：自定义根返回 `content://` 文档 URI，默认根返回 `file://` URI；不可用返回 `null`。 */
+    suspend fun coverUri(arcid: String): Uri? = storageUriOf("$arcid/$COVER_FILE_NAME")
+
+    private suspend fun storageUriOf(relPath: String): Uri? {
+        val path = settingsRepository.storageRootState.value.root.pathOf(relPath)
+            ?: File(defaultOfflineDir, relPath).takeIf(File::isFile)?.absolutePath
+            ?: return null
+        return if (path.startsWith("content://")) Uri.parse(path) else Uri.fromFile(File(path))
+    }
 
     /** 启动离线缓存任务：提交到统一下载队列，下载原始文件 + 元数据。 */
     fun startCache(archive: Archive, repository: LanraragiRepository) {
@@ -126,15 +181,29 @@ class OfflineCacheManager(
         if (!startingCaches.add(arcid)) return
         scope.launch {
             try {
-                val destination = archiveFile(arcid)
-                destination.parentFile?.mkdirs()
-                pendingMetadataFile(arcid).writeTextAtomically(ApiClient.json.encodeToString(archive))
+                // C6 存储门禁：授权失效/目录不可写时不产生任何批量产物。
+                val state = settingsRepository.storageRootState.value
+                val rejection = state.storageUnavailableReason()
+                if (rejection != null) {
+                    settingsRepository.reportStorageFailure(rejection)
+                    return@launch
+                }
+                val root = state.root
+                val destinationPath = root.ensureFile("$arcid/$ARCHIVE_FILE_NAME")
+                if (destinationPath == null) {
+                    settingsRepository.reportStorageFailure("无法在存储根创建离线档案文件")
+                    return@launch
+                }
+                root.writeFile(
+                    "$arcid/$PENDING_META_FILE_NAME",
+                    ApiClient.json.encodeToString(archive).byteInputStream(),
+                )
                 val source = DownloadSourceIdentity(arcid, ApiClient.config.baseUrl)
                 val saved = savedArtifactRepository.findBySource(source)
-                val reused = saved?.takeIf { File(it.path).isFile && File(it.path).length() > 0L }?.let { artifact ->
+                val reused = saved?.takeIf { artifactUsable(it) }?.let { artifact ->
                     try {
                         com.lanraragi.reader.data.download.SavedArtifactExporter(context.contentResolver)
-                            .export(artifact, DownloadDestination(destination.absolutePath))
+                            .export(artifact, DownloadDestination(destinationPath))
                         finalizeDurableCache(arcid)
                         true
                     } catch (cancelled: CancellationException) {
@@ -147,7 +216,7 @@ class OfflineCacheManager(
                     downloadManager.enqueue(
                         DownloadTaskSpec.Cache(
                             source = source,
-                            destination = DownloadDestination(destination.absolutePath),
+                            destination = DownloadDestination(destinationPath),
                             label = archive.title.ifBlank { arcid },
                         ),
                     )
@@ -156,6 +225,18 @@ class OfflineCacheManager(
                 startingCaches.remove(arcid)
             }
         }
+    }
+
+    /** 已保存原档仍可用（默认根 = 本地文件；自定义根 = 可打开的 SAF 文档）。 */
+    private suspend fun artifactUsable(artifact: SavedArtifact): Boolean {
+        val path = artifact.path
+        if (path.startsWith("content://")) {
+            return runCatching {
+                context.contentResolver.openInputStream(Uri.parse(path))?.use { it.read() >= 0 } == true
+            }.getOrDefault(false)
+        }
+        val file = File(path)
+        return file.isFile && file.length() > 0L
     }
 
     /** Completes cache metadata/index work after the durable archive runner publishes the file. */
@@ -168,12 +249,19 @@ class OfflineCacheManager(
                     .toMap()
                 tasks.asSequence()
                     .filter { it.type == DownloadTaskType.OFFLINE_CACHE && it.state == TaskState.DONE }
-                    .filter { pendingMetadataFile(it.arcid).isFile || !isCached(it.arcid) }
                     .forEach { task ->
                         if (finalizingTasks.add(task.id)) {
                             scope.launch {
                                 try {
-                                    finalizeDurableCache(task.arcid)
+                                    val root = settingsRepository.storageRootState.value.root
+                                    val hasPending = root.exists("${task.arcid}/$PENDING_META_FILE_NAME")
+                                    if (hasPending || !isCached(task.arcid)) {
+                                        finalizeDurableCache(task.arcid)
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    // 收尾失败（如存储不可写）不使进程崩溃；索引保持原状，等下次触发重试。
                                 } finally {
                                     finalizingTasks.remove(task.id)
                                 }
@@ -185,11 +273,14 @@ class OfflineCacheManager(
     }
 
     private suspend fun finalizeDurableCache(arcid: String) {
-        val archiveFile = archiveFile(arcid)
-        require(archiveFile.isFile && archiveFile.length() > 0L) { "离线档案文件不可用" }
-        val pending = pendingMetadataFile(arcid)
+        val root = settingsRepository.storageRootState.value.root
+        val archiveRel = "$arcid/$ARCHIVE_FILE_NAME"
+        val archiveSize = root.sizeOf(archiveRel)
+        require(root.exists(archiveRel) && archiveSize > 0L) { "离线档案文件不可用" }
+        val pendingRel = "$arcid/$PENDING_META_FILE_NAME"
+        val pendingJson = root.readFile(pendingRel)?.use { it.bufferedReader().readText() }
         val archive = runCatching {
-            ApiClient.json.decodeFromString<Archive>(pending.readTextAtomically())
+            ApiClient.json.decodeFromString<Archive>(pendingJson ?: "")
         }.getOrNull() ?: Archive(arcid = arcid, title = arcid)
         val readyCover = when (val state = thumbnailRepository.awaitCover(arcid)) {
             is CoverState.Ready -> state
@@ -197,7 +288,7 @@ class OfflineCacheManager(
             is CoverState.Generating -> state.lastGood
             is CoverState.Unrequested -> null
         }
-        val coverOk = readyCover?.let { download(it.resource.value, coverFile(arcid)) } == true
+        val coverOk = readyCover?.let { downloadTo(root, it.resource.value, "$arcid/$COVER_FILE_NAME") } == true
         val cached = CachedArchive(
             arcid = arcid,
             title = archive.title,
@@ -207,117 +298,45 @@ class OfflineCacheManager(
             isLocal = false,
             lastAccess = System.currentTimeMillis(),
         )
-        File(archiveFile.parentFile, "meta.json")
-            .writeTextAtomically(ApiClient.json.encodeToString(cached))
+        root.writeFile("$arcid/$META_FILE_NAME", ApiClient.json.encodeToString(cached).byteInputStream())
         val source = DownloadSourceIdentity(arcid, ApiClient.config.baseUrl)
         val existingArtifact = savedArtifactRepository.findBySource(source)
         savedArtifactRepository.put(
             SavedArtifact(
                 artifactKey = artifactKey(arcid),
                 source = source,
-                path = archiveFile.absolutePath,
-                revision = "offline:${archiveFile.length()}:${archiveFile.lastModified()}",
-                byteSize = archiveFile.length(),
+                path = root.pathOf(archiveRel) ?: archiveRel,
+                revision = "offline:$archiveSize:${root.lastModifiedOf(archiveRel)}",
+                byteSize = archiveSize,
                 pinned = existingArtifact?.pinned == true,
                 lastAccessAtEpochMs = cached.lastAccess,
             ),
         )
         addToIndex(cached)
-        pending.delete()
+        root.delete(pendingRel)
         enforceLimit()
     }
 
-    private fun pendingMetadataFile(arcid: String): File = File(offlineDir, "$arcid/meta.pending.json")
     private fun artifactKey(arcid: String): String = com.lanraragi.reader.data.download.SavedArtifactIdentity.key(
         DownloadSourceIdentity(arcid, ApiClient.config.baseUrl),
     )
 
-    /** 实际执行整本缓存：下载封面 + 原始文件 + 写 meta.json + 加入索引。 */
-    private suspend fun performCache(
-        archive: Archive,
-        repository: LanraragiRepository,
-        onProgress: (Float?) -> Unit,
-    ) {
-        val arcid = archive.arcid
-        _progress.update { it + (arcid to 0f) }
-        try {
-            val dir = File(offlineDir, arcid)
-            dir.mkdirs()
-
-            // 1. 下载封面
-            val readyCover = when (val state = thumbnailRepository.awaitCover(arcid)) {
-                is CoverState.Ready -> state
-                is CoverState.Failed -> state.lastGood
-                is CoverState.Generating -> state.lastGood
-                is CoverState.Unrequested -> null
-            }
-            val coverOk = readyCover?.let { download(it.resource.value, coverFile(arcid)) } == true
-
-            // 2. 完成下载前只写入临时文件，阅读器不会把半个压缩包误认为有效离线资源。
-            val archiveFile = archiveFile(arcid)
-            val partialArchiveFile = File(archiveFile.parentFile, "${archiveFile.name}.part")
-            partialArchiveFile.delete()
-            repository.downloadArchive(arcid, partialArchiveFile) { written, total ->
-                val p = if (total != null && total > 0) written.toFloat() / total else null
-                if (p != null) _progress.update { it + (arcid to p) }
-                onProgress(p)
-            }
-            if (!partialArchiveFile.exists() || partialArchiveFile.length() <= 0L) {
-                throw IllegalStateException("离线档案下载不完整")
-            }
-            if (archiveFile.exists() && !archiveFile.delete()) {
-                throw IllegalStateException("无法替换旧的离线档案")
-            }
-            if (!partialArchiveFile.renameTo(archiveFile)) {
-                throw IllegalStateException("无法完成离线档案写入")
-            }
-
-            // 3. 保存完整元数据
-            val cached = CachedArchive(
-                arcid = arcid,
-                title = archive.title,
-                pageCount = archive.pagecount,
-                coverExists = coverOk,
-                metadata = archive,
-                isLocal = false,
-                lastAccess = System.currentTimeMillis(),
-            )
-            File(dir, "meta.json").writeText(ApiClient.json.encodeToString(cached))
-            addToIndex(cached)
-            enforceLimit()
-        } finally {
-            File(File(offlineDir, arcid), "original.archive.part").delete()
-            _progress.update { it - arcid }
-            recomputeUsage()
-        }
-    }
-
-    /** 通过 `/api/archives/{id}/files` 获取分页图片绝对 URL 列表。 */
-    private suspend fun fetchPageUrls(arcid: String): List<String> = try {
-        val resp = api.getFiles(arcid)
-        if (!resp.isSuccessful) {
-            emptyList()
-        } else {
-            val body = resp.body()?.string()
-            if (body == null) emptyList()
-            else JsonHelpers.parsePageUrls(body).map { ApiClient.toAbsoluteUrl(it) }
-        }
-    } catch (e: Exception) {
-        emptyList()
-    }
-
-    private fun download(url: String, dest: File): Boolean = runCatching {
+    /** 通过流式响应把封面等小文件写入存储根。 */
+    private suspend fun downloadTo(root: StorageRoot, url: String, relPath: String): Boolean = try {
         val req = Request.Builder().url(url).build()
         ApiClient.okHttpClient.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return@runCatching false
-            dest.parentFile?.mkdirs()
-            val body = resp.body ?: return@runCatching false
-            body.byteStream().use { input ->
-                FileOutputStream(dest).use { out -> input.copyTo(out) }
+            val body = resp.body
+            when {
+                !resp.isSuccessful || body == null -> false
+                else -> root.writeFile(relPath, body.byteStream())
             }
-            true
         }
-    }.getOrDefault(false)
+    } catch (e: CancellationException) {
+        // 协程取消必须向上传播，不能被 runCatching 折叠成 false。
+        throw e
+    } catch (_: Exception) {
+        false
+    }
 
     /** Keep saved_artifact current while offline/index.json remains the rollback source. */
     private fun startRoomMirror() {
@@ -338,16 +357,8 @@ class OfflineCacheManager(
                     if (!syncInitial && revision == 0L) return@collectLatest
                     delay(800)
                     val snapshot = _index.value
-                    val facts = snapshot.items.map { item ->
-                        val original = archiveFile(item.arcid)
-                        OfflineIndexLegacyImporter.ArtifactFacts(
-                            arcid = item.arcid,
-                            filePath = original.absolutePath,
-                            exists = original.isFile,
-                            byteSize = if (original.isFile) original.length() else 0L,
-                            lastModified = if (original.isFile) original.lastModified() else 0L,
-                        )
-                    }
+                    val root = settingsRepository.storageRootState.value.root
+                    val facts = snapshot.items.map { item -> artifactFacts(root, item.arcid) }
                     val decoded = importer.decode(
                         ApiClient.json.encodeToString(snapshot),
                         facts,
@@ -358,6 +369,29 @@ class OfflineCacheManager(
                     }
             }
         }
+    }
+
+    /** 原档事实：优先当前存储根，回退默认目录中的历史数据（自定义根切换后的兼容路径）。 */
+    private suspend fun artifactFacts(root: StorageRoot, arcid: String): OfflineIndexLegacyImporter.ArtifactFacts {
+        val rel = "$arcid/$ARCHIVE_FILE_NAME"
+        val size = root.sizeOf(rel)
+        if (size > 0L) {
+            return OfflineIndexLegacyImporter.ArtifactFacts(
+                arcid = arcid,
+                filePath = root.pathOf(rel) ?: rel,
+                exists = true,
+                byteSize = size,
+                lastModified = root.lastModifiedOf(rel),
+            )
+        }
+        val legacy = File(defaultOfflineDir, rel)
+        return OfflineIndexLegacyImporter.ArtifactFacts(
+            arcid = arcid,
+            filePath = legacy.absolutePath,
+            exists = legacy.isFile,
+            byteSize = if (legacy.isFile) legacy.length() else 0L,
+            lastModified = if (legacy.isFile) legacy.lastModified() else 0L,
+        )
     }
 
     private fun addToIndex(item: CachedArchive) {
@@ -371,8 +405,7 @@ class OfflineCacheManager(
     @Synchronized
     private fun persistIndex() {
         val persisted = runCatching {
-            File(offlineDir, "index.json")
-                .writeTextAtomically(ApiClient.json.encodeToString(_index.value))
+            indexFile.writeTextAtomically(ApiClient.json.encodeToString(_index.value))
             true
         }.getOrDefault(false)
         if (persisted) roomMirrorRevision.value += 1L
@@ -394,14 +427,18 @@ class OfflineCacheManager(
         }
     }
 
-    /** 重新统计离线目录磁盘占用（除 index.json 外所有文件）与索引数量。 */
+    /**
+     * 重新统计离线产物磁盘占用（当前存储根的递归大小；默认根扣除 index.json 本身）与索引数量。
+     */
     private fun recomputeUsage() {
-        val totalBytes = if (offlineDir.exists()) {
-            offlineDir.walkTopDown().filter { it.isFile && it.name != "index.json" }.sumOf { it.length() }
-        } else {
-            0L
+        scope.launch {
+            val root = settingsRepository.storageRootState.value.root
+            val totalBytes = runCatching {
+                val total = root.sizeOf("")
+                if (root.isCustom) total else total - indexFile.length()
+            }.getOrDefault(0L).coerceAtLeast(0L)
+            _usage.value = OfflineUsage(totalBytes = totalBytes, count = _index.value.items.size)
         }
-        _usage.value = OfflineUsage(totalBytes = totalBytes, count = _index.value.items.size)
     }
 
     /** 超出上限时按 lastAccess 升序（最早访问优先）淘汰，直到落回上限内。 */
@@ -411,9 +448,15 @@ class OfflineCacheManager(
         val cacheKeys = _index.value.items.mapTo(linkedSetOf()) { artifactKey(it.arcid) }
         when (val result = savedArtifactRepository.evictToCapacity(limitBytes, cacheKeys)) {
             is EvictionResult.Removed -> if (result.artifacts.isNotEmpty()) {
+                val root = settingsRepository.storageRootState.value.root
                 val removedIds = result.artifacts.map { it.source.archiveId }.toSet()
                 result.artifacts.forEach { artifact ->
-                    File(artifact.path).parentFile?.deleteRecursively()
+                    runCatching { root.deleteDir(artifact.source.archiveId) }
+                    // 兼容历史数据：产物可能仍落在默认目录；只删产物文件本身，不再递归删除父目录。
+                    File(defaultOfflineDir, artifact.source.archiveId).takeIf(File::isDirectory)?.deleteRecursively()
+                    if (!artifact.path.startsWith("content://")) {
+                        File(artifact.path).takeIf(File::isFile)?.delete()
+                    }
                     lastEvicted.value = artifact.source.archiveId
                 }
                 _index.update { current -> OfflineIndex(current.items.filterNot { it.arcid in removedIds }) }
@@ -435,7 +478,12 @@ class OfflineCacheManager(
         savedArtifactRepository.remove(artifactKey(arcid))
         _index.update { OfflineIndex(it.items.filter { a -> a.arcid != arcid }) }
         persistIndex()
-        File(offlineDir, arcid).deleteRecursively()
+        val root = settingsRepository.storageRootState.value.root
+        runCatching { root.deleteDir(arcid) }
+        // 自定义根时同时清理默认目录里的历史遗留数据。
+        if (root.isCustom) {
+            File(defaultOfflineDir, arcid).takeIf(File::isDirectory)?.deleteRecursively()
+        }
         recomputeUsage()
     }
 
@@ -445,7 +493,18 @@ class OfflineCacheManager(
             _index.value.items.forEach { savedArtifactRepository.remove(artifactKey(it.arcid)) }
             _index.value = OfflineIndex()
             persistIndex()
-            offlineDir.listFiles()?.forEach { if (it.name != "index.json") it.deleteRecursively() }
+            val root = settingsRepository.storageRootState.value.root
+            runCatching {
+                root.walkFiles("")
+                    .filter { it != INDEX_FILE_NAME }
+                    .map { it.substringBefore('/') }
+                    .toList()
+                    .forEach { root.deleteDir(it) }
+            }
+            if (root.isCustom) {
+                // 同时清理默认目录中的历史遗留数据（index.json 除外）。
+                defaultOfflineDir.listFiles()?.forEach { if (it.name != INDEX_FILE_NAME) it.deleteRecursively() }
+            }
             recomputeUsage()
         }
     }

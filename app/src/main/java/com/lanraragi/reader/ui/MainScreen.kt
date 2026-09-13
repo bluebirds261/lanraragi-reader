@@ -1,7 +1,6 @@
 package com.lanraragi.reader.ui
 
 import android.app.Activity
-import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
@@ -10,6 +9,8 @@ import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
@@ -49,12 +50,16 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Book
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -87,6 +92,11 @@ import androidx.compose.ui.input.pointer.changedToUpIgnoreConsumed
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
@@ -105,12 +115,16 @@ import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.shapes.Capsule
 import com.lanraragi.reader.data.HistoryEntry
+import com.lanraragi.reader.data.catalog.isTankArchiveId
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.screens.DownloadScreen
+import com.lanraragi.reader.ui.screens.FilterContextBus
+import com.lanraragi.reader.ui.screens.toServerFilter
 import com.lanraragi.reader.ui.screens.LibraryScreen
 import com.lanraragi.reader.ui.screens.MainTabBus
-import com.lanraragi.reader.ui.screens.SelectionModeBus
 import com.lanraragi.reader.ui.screens.SettingsScreen
+import com.lanraragi.reader.ui.screens.ReaderDrawerBus
+import com.lanraragi.reader.ui.screens.SelectionModeBus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
@@ -132,12 +146,13 @@ private val mainTabs = listOf(
         label = "下载",
         icon = Icons.Filled.Download
     ),
+    // 原「导航」页已合并进设置：本键直接打开设置（设置页内含统计/历史/分类/单行本等入口）。
     MainTab(
         label = "设置",
-        icon = Icons.Filled.Menu
+        icon = Icons.Filled.Settings
     ),
     MainTab(
-        label = "正在阅读",
+        label = "续读/随机",
         icon = Icons.Filled.Book,
         isAction = true
     )
@@ -149,6 +164,22 @@ private data class RecentItem(
     val page: Int = 0,
     val pagecount: Int = 0,
 )
+
+/** 第 4 键抽屉模式：续读（最近阅读会话）/ 随机（按当前筛选上下文随机取书）。 */
+private enum class ReaderDrawerMode(val label: String) {
+    CONTINUE("续读"),
+    RANDOM("随机")
+}
+
+/** 抽屉内容区（续读 / 随机）切换时的交叉淡入时长（毫秒）。 */
+private const val DRAWER_FADE_MS = 180
+
+/**
+ * 抽屉内加载 / 空态 / 失败态的统一占位高度。
+ * EmptyBox 内部是 fillMaxSize，底部抽屉里必须给定高度，
+ * 否则会把 ModalBottomSheet 撑到全屏。
+ */
+private val DRAWER_STATE_HEIGHT = 200.dp
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -188,40 +219,100 @@ fun MainScreen(
         mutableStateOf<List<RecentItem>>(emptyList())
     }
 
+    /*
+     * ============================================================
+     * 第 4 键抽屉：续读 / 随机
+     * ============================================================
+     */
+    var drawerMode by remember {
+        mutableStateOf(ReaderDrawerMode.CONTINUE)
+    }
+
+    var randomItems by remember {
+        mutableStateOf<List<RecentItem>>(emptyList())
+    }
+
+    var randomLoading by remember {
+        mutableStateOf(false)
+    }
+
+    var randomFailed by remember {
+        mutableStateOf(false)
+    }
+
     val scope =
         rememberCoroutineScope()
 
     /*
      * ============================================================
-     * 正在阅读：最近阅读列表
+     * 第 4 键：打开「续读 / 随机」抽屉
+     *
+     * 续读：最近 3 个阅读会话（复用原「正在阅读」数据源）。
      * ============================================================
      */
-    val openRecent: () -> Unit = {
+    val openReaderDrawer: () -> Unit = {
         scope.launch {
             val s = container.settingsRepository.settings.first()
-            val recents = container.historyRepository.recentDeduped(10).toMutableList()
+            val recents = container.historyRepository.recentDeduped(3).toMutableList()
             val lastId = s.lastReadArcId
             if (lastId.isNotBlank() && recents.none { it.arcid == lastId }) {
                 recents.add(0, HistoryEntry(lastId, "", System.currentTimeMillis()))
             }
-            when {
-                recents.isEmpty() -> {
-                    Toast.makeText(context, "暂无正在阅读的漫画", Toast.LENGTH_SHORT).show()
+            recentItems = recents.take(3).map { e ->
+                // 进度以阅读历史为权威（HistoryEntry.page/pageCount，0 起始）；
+                // 原先取离线缓存元数据，未缓存过的档案就永远不显示进度条与「第 N 页」。
+                RecentItem(
+                    arcid = e.arcid,
+                    title = e.title.ifBlank {
+                        container.offlineCache.cached(e.arcid)?.metadata?.displayTitle ?: e.arcid
+                    },
+                    page = e.page,
+                    pagecount = e.pageCount,
+                )
+            }
+            drawerMode = ReaderDrawerMode.CONTINUE
+            showRecentList = true
+        }
+    }
+
+    /*
+     * ============================================================
+     * 随机模式：按 FilterContextBus 当前筛选上下文随机取 3 本
+     * ============================================================
+     */
+    val loadRandomArchives: () -> Unit = {
+        if (!randomLoading) {
+            scope.launch {
+                randomLoading = true
+                randomFailed = false
+                val filterContext = FilterContextBus.context.value
+                val archives = try {
+                    container.repository.searchRandom(
+                        count = 3,
+                        category = filterContext.category,
+                        // 关键词 + 标签一起组成服务端 filter，保证随机范围与库页当前命中范围一致。
+                        filter = filterContext.toServerFilter(),
+                        newOnly = filterContext.newOnly,
+                        untaggedOnly = filterContext.untaggedOnly,
+                        hideCompleted = filterContext.hideCompleted,
+                    )
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
                 }
-                recents.size == 1 -> {
-                    navController.navigate(Routes.reader(recents.first().arcid))
-                }
-                else -> {
-                    recentItems = recents.map { e ->
-                        val cached = container.offlineCache.cached(e.arcid)?.metadata
-                        RecentItem(
-                            arcid = e.arcid,
-                            title = e.title.ifBlank { cached?.displayTitle ?: e.arcid },
-                            page = cached?.progress ?: 0,
-                            pagecount = cached?.pagecount ?: 0,
-                        )
-                    }
-                    showRecentList = true
+                randomLoading = false
+                if (archives == null) {
+                    randomFailed = true
+                } else {
+                    randomItems = archives
+                        .map { archive ->
+                            RecentItem(
+                                arcid = archive.arcid,
+                                title = archive.displayTitle.ifBlank { archive.arcid },
+                            )
+                        }
+                        .distinctBy { it.arcid }
                 }
             }
         }
@@ -368,16 +459,6 @@ fun MainScreen(
 
     /*
      * ============================================================
-     * Check-in
-     * ============================================================
-     */
-    LaunchedEffect(Unit) {
-
-        container.checkinRepository.checkin()
-    }
-
-    /*
-     * ============================================================
      * D5 空态入口：图库空态点「扫描本地文件」→ 切到下载 Tab
      * ============================================================
      */
@@ -389,6 +470,28 @@ fun MainScreen(
 
                 onTabChange(t)
                 MainTabBus.target.value = null
+            }
+        }
+    }
+
+    /*
+     * ============================================================
+     * 空态入口：图库空态点「随机一本」→ 以随机模式呼出「续读 / 随机」抽屉
+     *
+     * 库页不再自己随机跳阅读器：随机范围统一走 FilterContextBus 的
+     * 当前筛选上下文，由 loadRandomArchives 组装请求。
+     * ============================================================
+     */
+    LaunchedEffect(Unit) {
+
+        ReaderDrawerBus.random.collect { requested ->
+
+            if (requested) {
+
+                drawerMode = ReaderDrawerMode.RANDOM
+                showRecentList = true
+                loadRandomArchives()
+                ReaderDrawerBus.random.value = false
             }
         }
     }
@@ -447,7 +550,7 @@ fun MainScreen(
              *
              * 页面顺序：
              *
-             * 首页 → 下载 → 设置
+             * 首页 → 下载 → 导航
              *
              * 向右切换：
              * 新页面从右侧进入
@@ -553,11 +656,6 @@ fun MainScreen(
                         LibraryScreen(
                             container = container,
                             navController = navController,
-                            onOpenDrawer = {
-                                navController.navigate(
-                                    Routes.NAVIGATION
-                                )
-                            }
                         )
                     }
 
@@ -574,11 +672,18 @@ fun MainScreen(
 
                     2 -> {
 
+                        // 设置页已合并原「导航」页的全部入口，直接作为主 tab 渲染：
+                        // onBack 传 null（顶级不显示返回箭头），进入子分区后再出现。
                         SettingsScreen(
                             container = container,
-                            onBack = null,
                             onOpenDiagnostics = { navController.navigate(Routes.DIAGNOSTICS) },
-                            onOpenEhFavorites = { navController.navigate(Routes.EH_FAVORITES_SYNC) },
+                            onOpenWriteback = { navController.navigate(Routes.WRITEBACK) },
+                            onOpenGuide = { navController.navigate(Routes.GUIDE) },
+                            onOpenWizard = { navController.navigate(Routes.WIZARD_EDIT) },
+                            onOpenStatistics = { navController.navigate(Routes.STATISTICS) },
+                            onOpenHistory = { navController.navigate(Routes.HISTORY) },
+                            onOpenCategory = { navController.navigate(Routes.CATEGORY) },
+                            onOpenTankoubons = { navController.navigate(Routes.TANKOUBONS) },
                         )
                     }
                 }
@@ -634,7 +739,15 @@ fun MainScreen(
                     ?: Color(0xFF0084FF)
 
             val inactiveColor =
-                Color(0xFF94A3B8)
+                settings
+                    ?.bottomBarColor
+                    ?.let {
+                        parseHexColor(it)
+                    }
+                    ?.let {
+                        Color(it)
+                    }
+                    ?: Color(0xFF94A3B8)
 
             /*
              * ====================================================
@@ -1859,7 +1972,7 @@ fun MainScreen(
                                                                                 3
                                                                             ) {
 
-                                                                                openRecent()
+                                                                                openReaderDrawer()
 
                                                                             } else if (
                                                                                 targetIndex !=
@@ -1987,6 +2100,22 @@ fun MainScreen(
                                     .clip(
                                         Capsule()
                                     )
+                                    .semantics {
+                                        // 这层透明拖拽层覆盖在「当前选中项」之上，读屏取到的是它而不是
+                                        // 下面的 SingleTabItem；不在这里声明语义，选中的 tab 会被报成
+                                        // 无名控件（uiautomator 里的 NAF 节点）。
+                                        val activeTab = mainTabs[selectedIndex.coerceIn(0, mainTabs.lastIndex)]
+                                        this.contentDescription = activeTab.label
+                                        this.role =
+                                            if (activeTab.isAction) {
+                                                Role.Button
+                                            } else {
+                                                Role.Tab
+                                            }
+                                        if (!activeTab.isAction) {
+                                            this.selected = true
+                                        }
+                                    }
                                     .clickable(
 
                                         indication = null,
@@ -2013,7 +2142,7 @@ fun MainScreen(
                                                     targetIndex == 3
                                                 ) {
 
-                                                    openRecent()
+                                                    openReaderDrawer()
 
                                                 } else {
 
@@ -2192,7 +2321,7 @@ fun MainScreen(
                                                     targetIndex == 3
                                                 ) {
 
-                                                    openRecent()
+                                                    openReaderDrawer()
 
                                                 } else if (
                                                     targetIndex !=
@@ -2610,7 +2739,7 @@ fun MainScreen(
                                                      * =========================================
                                                      * 最终落在 tab3：
                                                      *
-                                                     * 进入正在阅读。
+                                                     * 打开「续读 / 随机」抽屉。
                                                      * =========================================
                                                      */
                                                     if (
@@ -2618,7 +2747,7 @@ fun MainScreen(
                                                         3
                                                     ) {
 
-                                                        openRecent()
+                                                        openReaderDrawer()
 
                                                     } else if (
                                                         targetIndex !=
@@ -2687,7 +2816,7 @@ fun MainScreen(
 
                         onClick = {
 
-                            openRecent()
+                            openReaderDrawer()
                         }
                     )
                 }
@@ -2831,38 +2960,201 @@ fun MainScreen(
                         .fillMaxWidth()
                         .padding(bottom = 24.dp),
                 ) {
-                    Text(
-                        text = "正在阅读",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    )
-                    if (recentItems.isEmpty()) {
-                        Text(
-                            text = "暂无正在阅读的漫画",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(16.dp),
-                        )
-                    } else {
-                        LazyRow(
-                            contentPadding = PaddingValues(horizontal = 16.dp),
-                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    /*
+                     * 顶部：续读/随机 单选胶囊 + 换一批（仅随机模式显示）。
+                     */
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Row(
+                            Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant)
+                                .padding(3.dp),
                         ) {
-                            items(recentItems, key = { it.arcid }) { item ->
-                                RecentCard(
-                                    container = container,
-                                    item = item,
-                                    onOpen = {
-                                        showRecentList = false
-                                        navController.navigate(Routes.reader(item.arcid))
-                                    },
-                                    onRemove = {
-                                        recentItems = recentItems.filter { it.arcid != item.arcid }
-                                        scope.launch {
-                                            container.historyRepository.remove(item.arcid)
+                            ReaderDrawerMode.values().forEach { mode ->
+
+                                val selected =
+                                    drawerMode == mode
+
+                                Box(
+                                    Modifier
+                                        .clip(RoundedCornerShape(999.dp))
+                                        .background(
+                                            if (selected) {
+                                                MaterialTheme.colorScheme.primary
+                                            } else {
+                                                Color.Transparent
+                                            }
+                                        )
+                                        .clickable {
+
+                                            if (drawerMode != mode) {
+
+                                                drawerMode = mode
+
+                                                if (
+                                                    mode == ReaderDrawerMode.RANDOM &&
+                                                    randomItems.isEmpty() &&
+                                                    !randomLoading
+                                                ) {
+                                                    loadRandomArchives()
+                                                }
+                                            }
                                         }
-                                    },
+                                        .padding(horizontal = 14.dp, vertical = 5.dp)
+                                ) {
+                                    Text(
+                                        text = mode.label,
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = if (selected) {
+                                            MaterialTheme.colorScheme.onPrimary
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                    )
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.weight(1f))
+
+                        if (drawerMode == ReaderDrawerMode.RANDOM) {
+
+                            IconButton(
+                                onClick = { loadRandomArchives() },
+                                enabled = !randomLoading,
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Refresh,
+                                    contentDescription = "换一批",
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
+                            }
+                        }
+                    }
+
+                    /*
+                     * 内容区：续读 / 随机 交叉淡入切换（纯淡入淡出，不做位移动画）。
+                     */
+                    AnimatedContent(
+                        targetState = drawerMode,
+                        transitionSpec = {
+                            fadeIn(tween(DRAWER_FADE_MS)) togetherWith
+                                fadeOut(tween(DRAWER_FADE_MS))
+                        },
+                        label = "readerDrawerContent",
+                    ) { mode ->
+
+                        when (mode) {
+
+                            ReaderDrawerMode.CONTINUE -> {
+
+                                if (recentItems.isEmpty()) {
+                                    EmptyBox(
+                                        message = "读过的漫画会出现在这里，先去图库挑一本开始阅读。",
+                                        title = "暂无阅读记录",
+                                        modifier = Modifier.height(DRAWER_STATE_HEIGHT),
+                                    )
+                                } else {
+                                    LazyRow(
+                                        contentPadding = PaddingValues(horizontal = 16.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        items(recentItems, key = { it.arcid }) { item ->
+                                            RecentCard(
+                                                container = container,
+                                                item = item,
+                                                onOpen = {
+                                                    showRecentList = false
+                                                    // 单行本（TANK_xxx）只能进单行本阅读器：档案阅读器会去请求
+                                                    // /api/archives/TANK_xxx/metadata，而该端点要求 40 位 arcid。
+                                                    if (isTankArchiveId(item.arcid)) {
+                                                        navController.navigate(Routes.tankReader(item.arcid))
+                                                    } else {
+                                                        // 直达上次页；无进度时不带 page，交给阅读器按服务器/本地进度恢复。
+                                                        navController.navigate(
+                                                            if (item.page > 0) {
+                                                                Routes.reader(item.arcid, item.page)
+                                                            } else {
+                                                                Routes.reader(item.arcid)
+                                                            },
+                                                        )
+                                                    }
+                                                },
+                                                onRemove = {
+                                                    recentItems = recentItems.filter { it.arcid != item.arcid }
+                                                    scope.launch {
+                                                        container.historyRepository.remove(item.arcid)
+                                                    }
+                                                },
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            ReaderDrawerMode.RANDOM -> {
+
+                                when {
+
+                                    randomLoading -> {
+                                        Box(
+                                            Modifier
+                                                .fillMaxWidth()
+                                                .height(DRAWER_STATE_HEIGHT),
+                                            contentAlignment = Alignment.Center,
+                                        ) {
+                                            CircularProgressIndicator()
+                                        }
+                                    }
+
+                                    randomFailed -> {
+                                        // 失败态保留重试：同一筛选上下文重新请求。
+                                        EmptyBox(
+                                            message = "检查网络或服务器设置后重试。",
+                                            title = "随机加载失败",
+                                            modifier = Modifier.height(DRAWER_STATE_HEIGHT),
+                                            actions = listOf(
+                                                "重试" to { loadRandomArchives() },
+                                            ),
+                                        )
+                                    }
+
+                                    randomItems.isEmpty() -> {
+                                        EmptyBox(
+                                            message = "当前筛选条件下没有可随机的档案，试试放宽搜索或筛选条件。",
+                                            title = "没有符合条件的档案",
+                                            modifier = Modifier.height(DRAWER_STATE_HEIGHT),
+                                        )
+                                    }
+
+                                    else -> {
+                                        LazyRow(
+                                            contentPadding = PaddingValues(horizontal = 16.dp),
+                                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                        ) {
+                                            items(randomItems, key = { it.arcid }) { item ->
+                                                RandomCard(
+                                                    container = container,
+                                                    item = item,
+                                                    onOpen = {
+                                                        showRecentList = false
+                                                        // 随机结果里可能混有单行本（服务端 groupby_tanks 默认开启）。
+                                                        if (isTankArchiveId(item.arcid)) {
+                                                            navController.navigate(Routes.tankReader(item.arcid))
+                                                        } else {
+                                                            navController.navigate(Routes.reader(item.arcid))
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2902,6 +3194,10 @@ private fun SingleTabItem(
                 MutableInteractionSource()
             }
 
+    // 无障碍：读屏需要知道当前 Tab 是否选中；第 4 键是动作键（呼出抽屉），
+    // 不是可切换的页面，因此只宣告为按钮、不宣告 selected。
+    val isTabSelected = selected
+
     Box(
 
         modifier =
@@ -2928,7 +3224,20 @@ private fun SingleTabItem(
 
                         onClick =
                             onClick
-                    ),
+                    )
+                    .semantics {
+                        // 标签由本节点统一宣告（Icon 改为纯装饰），避免合并语义重复朗读。
+                        this.contentDescription = tab.label
+                        this.role =
+                            if (tab.isAction) {
+                                Role.Button
+                            } else {
+                                Role.Tab
+                            }
+                        if (!tab.isAction) {
+                            this.selected = isTabSelected
+                        }
+                    },
 
             contentAlignment =
                 Alignment.Center
@@ -2980,8 +3289,9 @@ private fun SingleTabItem(
                     imageVector =
                         tab.icon,
 
+                    // 装饰性图标：标签名由外层 clickable 节点的语义统一提供。
                     contentDescription =
-                        tab.label,
+                        null,
 
                     modifier =
                         Modifier
@@ -3053,13 +3363,63 @@ private fun RecentCard(
             minLines = 2,
             overflow = TextOverflow.Ellipsis,
         )
-        if (item.pagecount > 0 && item.page > 0) {
+        // 进度以 HistoryEntry 为权威，page 是 0 起始：展示与占比都要 +1 换算成人类页号
+        // （第 12 页 = page 11），否则会出现「第 0 页」或整体少一页的错觉。
+        if (item.pagecount > 0) {
+            val humanPage = (item.page + 1).coerceAtMost(item.pagecount)
+            Spacer(Modifier.height(4.dp))
+            LinearProgressIndicator(
+                progress = {
+                    (humanPage.toFloat() / item.pagecount).coerceIn(0f, 1f)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                color = MaterialTheme.colorScheme.primary,
+                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+            )
+            Spacer(Modifier.height(2.dp))
             Text(
-                text = "第 ${item.page}/${item.pagecount} 页",
+                text = "第 $humanPage 页",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.primary,
                 maxLines = 1,
             )
         }
+    }
+}
+
+/** 随机模式卡片：封面 + 标题。 */
+@Composable
+private fun RandomCard(
+    container: AppContainer,
+    item: RecentItem,
+    onOpen: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .width(120.dp)
+            .clickable(onClick = onOpen),
+    ) {
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .aspectRatio(0.72f)
+                .clip(RoundedCornerShape(10.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+        ) {
+            RemoteThumbnailImage(
+                container = container,
+                arcid = item.arcid,
+                contentDescription = item.title,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = item.title.ifBlank { item.arcid },
+            style = MaterialTheme.typography.bodySmall,
+            maxLines = 2,
+            minLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }

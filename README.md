@@ -2,6 +2,12 @@
 
 一个为自托管漫画/本子管理服务器 [LANraragi](https://github.com/Difegue/LANraragi) 编写的 Android 客户端，通过其官方 REST API 完成对接。部署在 Linux NAS 上的 LANraragi 只需开放 HTTP(S) 端口，即可用本 App 在手机上浏览、搜索、阅读与离线缓存。
 
+> **English** — A native Android client for self-hosted [LANraragi](https://github.com/Difegue/LANraragi) servers: Jetpack Compose UI, full REST API integration (library / search / reader / progress), offline archive caching, and a metadata-scraping + Chinese-localization workbench. Talks only to your own server; ships no content of its own.
+
+**状态**：`beta-0.1.1` · Kotlin 2.4 / Jetpack Compose (Material 3) / AGP 9.4 / Gradle 9.6 · minSdk 26（compileSdk 37）· 对接 LANraragi 0.9.81 · 单元测试 57 类 / 283 例全通过（另有 Room 迁移等仪器化测试）
+
+> ⚠️ **免责声明**：本项目只是一个客户端，不提供、不托管、不索引任何内容，全部数据来自你自己部署的服务器。请遵守所在地法律法规，仅用于访问你有权访问的内容。
+
 ## 功能
 
 - **服务器连接**：填 NAS 上 LANraragi 的反代地址（hostname/带路径前缀均可，自动补 https://）+ API Key，一键测试连通性。
@@ -19,6 +25,7 @@
   - 阅读进度自动回传服务器（`/progress`），下次进入可继续阅读。
 - **离线缓存**：把整本漫画的每一页下载到本地，无网络也能读；可删除单本或清空。
 - **下载原档**：把 zip/cbz/rar 原档保存到手机。
+- **开屏封面**：设置 → 外观 → 「开屏封面」可从系统图库选一张图片作为启动画面（约 2 秒后淡出，期间点按可跳过；不设置则显示 App 图标）。
 - **统计**：服务器档案数 / 页数 / 标签数等。
 
 ## 技术栈
@@ -28,30 +35,79 @@ Kotlin + Jetpack Compose (Material 3) · Retrofit + OkHttp（动态 baseUrl + Be
 ## 目录结构
 
 ```
-lanraragi-reader/
+lanraragi-reader-merged/
 ├── app/src/main/java/com/lanraragi/reader/
-│   ├── data/
-│   │   ├── api/        # Retrofit 接口、OkHttp/Coil 客户端、鉴权+动态 host 拦截器
-│   │   ├── model/      # Archive / ServerStats / CachedArchive 等
-│   │   ├── SettingsRepository.kt     # 服务器地址、API Key、阅读偏好（DataStore）
-│   │   ├── FavoritesRepository.kt    # 收藏（DataStore）
-│   │   ├── OfflineCacheManager.kt    # 离线缓存（页图下载 + 索引）
-│   │   ├── LanraragiRepository.kt    # 业务仓库（解析 + 错误处理）
-│   │   └── JsonHelpers.kt            # 兼容不同版本的响应结构
+│   ├── data/            # api(Retrofit/OkHttp/Bearer 拦截器) · model · catalog(库网关/排序)
+│   │                    # assets(缩略图仓库) · db(Room v9) · download · history · local(SAF 本地库)
+│   │                    # metadata(刮削/中文回写) · reader(页面源) · security · storage · tags
+│   ├── domain/          # 与 UI 无关的领域逻辑
 │   ├── di/AppContainer.kt            # 简易服务定位（无 Hilt）
 │   └── ui/
-│       ├── AppRoot.kt                # 导航路由
-│       ├── components/               # 封面卡片 / 顶栏 / 状态视图
-│       └── screens/                  # 配置/图库/详情/阅读器/离线/统计/设置
+│       ├── AppRoot.kt                # 导航路由表（Routes）
+│       ├── adaptive/                 # 响应式骨架（>840dp）
+│       ├── components/               # 封面卡片 / 顶栏 / 玻璃组件 / 分段控件 / 状态视图
+│       ├── screens/                  # 图库 / 详情 / 阅读器 / 下载 / 设置 / 统计 / 历史 / 分类 / 单行本
+│       ├── settings/ setup/ tools/ theme/ reader/ library/
+├── app/src/test/         # JVM 单元测试
+├── app/src/androidTest/  # 仪器化测试（Room 迁移、Android 正则守卫）
+├── app/schemas/          # Room 导出的 schema（迁移基线）
+├── docs/                 # 规划、验收报告、功能处置文档
+└── gradle/libs.versions.toml         # 版本目录（AGP / Kotlin / KSP / Compose BOM / Room…）
 ```
 
 ## 构建
 
-环境要求：JDK 17、Android SDK（compileSdk 35，Android Studio 会自动下载）。
+> **⚠ 本项目用的是很新的工具链，不是"打开即用"的常规项目。** 请按下表准备环境；
+> 尤其**不要**执行 `gradle wrapper --gradle-version 8.x` 之类"降级 wrapper"的操作——
+> AGP 9.4 无法在 Gradle 8 上运行，同步会直接失败。
 
-1. 用 **Android Studio（Koala 及以上）** 打开本目录 `lanraragi-reader/`，等待 Gradle 同步（会自动下载 Gradle 8.9 与依赖）。
-2. 连接真机或启动模拟器，点击 Run。
-3. 命令行方式：先 `gradle wrapper --gradle-version 8.9` 生成 wrapper，再 `./gradlew :app:assembleDebug`，产物在 `app/build/outputs/apk/debug/`。
+| 组件 | 本项目要求 | 说明 |
+|---|---|---|
+| Gradle | **9.6.0**（wrapper 自带，勿改动） | `gradle/wrapper/gradle-wrapper.properties` 指向腾讯云镜像；换源见下方 FAQ |
+| Android Gradle Plugin | **9.4.0** | **需要 canary/nightly 渠道的 Android Studio**；stable 版 Studio 同步时会报 "incompatible version of the Android Gradle Plugin" |
+| Kotlin / KSP / Room | 2.4.10 / 2.3.10 / 2.8.4 | 由 `gradle/libs.versions.toml` 固定，勿单独升级 |
+| JDK | **17 以上，推荐 21** | Gradle 9.x 最低 17；Android Studio 自带的 JBR 21 即可 |
+| compileSdk / targetSdk | **37（Android 17）** | 必须在 SDK Manager 安装 **Android 17 (API 37)** 平台并接受许可。本机 SDK 目录名为 `android-37.0`（预览版命名）。装不上就把它降到 36，见 FAQ |
+| Android SDK 路径 | `local.properties` 或 `ANDROID_HOME` | **源码包里故意不含 `local.properties`**（它记录的是打包者的本机路径）。请自行创建或在 IDE 里指定 |
+
+**方式一：Android Studio（canary/nightly 渠道）**
+
+1. 打开本目录（**不要**再套一层子目录）。
+2. 首次同步会下载 Gradle 9.6 与全部依赖（约 1.2 GB，国内镜像加速，实测 4–5 分钟）。
+3. 连接真机或启动模拟器，点 Run。
+
+**方式二：命令行（不需要 Studio 的版本匹配，只要 JDK + SDK 齐备）**
+
+```bat
+:: Windows
+set JAVA_HOME=<JDK 21 的路径>
+set ANDROID_HOME=<Android SDK 路径>       :: 或者建好 local.properties
+gradlew.bat :app:assembleDebug --console=plain
+:: 产物：app\build\outputs\apk\debug\app-debug.apk
+```
+
+```bash
+# macOS / Linux
+export JAVA_HOME=/path/to/jdk21
+./gradlew :app:assembleDebug --console=plain
+```
+
+`local.properties`（放在项目根目录，Windows 路径里的 `\` 要写成 `\\` 或 `/`）：
+
+```properties
+sdk.dir=D\:\\Android\\Sdk
+```
+
+### 构建常见报错对照
+
+| 报错 | 原因 | 处理 |
+|---|---|---|
+| `Failed to find target with hash string 'android-37'` / `compileSdk 37` 未安装 | 没装 Android 17 (API 37) 平台 | SDK Manager 安装 API 37；或把 `app/build.gradle.kts` 里 `compileSdk`/`targetSdk` 改成 **36**（代码未使用任何 37 专有 API），并删掉 `gradle.properties` 的 `android.suppressUnsupportedCompileSdk=37` |
+| `SDK location not found` | 缺 `local.properties` / `ANDROID_HOME` | 见上 |
+| `incompatible version of the Android Gradle Plugin` | Studio 是 stable 渠道，跟不上 AGP 9.4 | 换 canary/nightly Studio，或直接用命令行构建 |
+| `Could not find io.github.kyant0:backdrop:2.0.1` | 到 Maven Central 的网络不通 | 项目已内置阿里云 central 镜像；检查代理/网络后重试 |
+| `ClassNotFoundException: worker.org.gradle.process.internal.worker.GradleWorkerMain`（只在跑 `test`/`build` 时出现，`assembleDebug` 正常） | **中文用户名 + Windows**：Gradle 以 UTF-8 写测试 worker 的 argfile，JVM 启动器却按系统 GBK 读取 | 加参数：`gradlew.bat build "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g -Dfile.encoding=GBK"`；或把 `GRADLE_USER_HOME` 指到纯 ASCII 路径（如 `D:\gradle-home`） |
+| 同步长时间卡在下载 Gradle 发行包 | 腾讯云镜像不可达 | 改 `gradle/wrapper/gradle-wrapper.properties` 的 `distributionUrl` 为 `https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip`（`-bin` 比 `-all` 小很多） |
 
 > 提示：App 会访问内网 HTTP 明文地址，已在 `AndroidManifest.xml` 与 `res/xml/network_security_config.xml` 中开启 cleartext。
 
@@ -74,13 +130,13 @@ lanraragi-reader/
 | 元数据（含 pages、tags、progress） | `GET /api/archives/{id}/metadata` |
 | 封面缩略图 | `GET /api/archives/{id}/thumbnail` |
 | 单页图片 | `GET /api/archives/{id}/page?path=<已编码页路径>` |
-| 回传阅读进度 | `POST /api/archives/{id}/progress/{page}`（0 起） |
+| 回传阅读进度 | `PUT /api/archives/{id}/progress/{page}`（0 起） |
 | 下载原档 | `GET /api/archives/{id}/download` |
 | 删除档案 | `DELETE /api/archives/{id}` |
 | 分类 / 标签 | `GET /api/categories` · `GET /api/tags` |
 | 统计 | `GET /api/database/stats` |
 
-鉴权：每个请求带 `Authorization: Bearer <APIKey>`，由 OkHttp 拦截器统一注入。
+鉴权：每个请求带 `Authorization: Bearer <base64(API Key)>`（LANraragi 的契约是把 key 做一次 base64，不是直接把明文 key 放进 Bearer），由 OkHttp 拦截器统一注入。
 
 ## 说明与已知限制
 
@@ -90,6 +146,7 @@ lanraragi-reader/
 - **反向代理子路径**：支持 `https://host/lanraragi` 形式的前缀。
 - **离线缓存**：以「页图」形式缓存（不解析 rar/zip 原档），因此对 zip/cbz/rar/cbr 均通用；缓存任务在 App 进程内运行，进程被杀后需重新触发（后续可用 WorkManager 升级为后台任务）。
 - **下载原档**：保存到 `Android/data/com.lanraragi.reader/files/Download/LANraragi/`，扩展名按文件魔数自动识别（zip/rar/7z/gz）。
+- **开屏封面**：选图后会把图片**拷进应用私有目录**（`filesDir/splash/cover.jpg`），因此不需要任何存储权限，也不依赖图库原图是否还在。Android 13+ 走系统照片选择器（无权限弹窗）；Android 8/9 由 AndroidX 自动回退到「文档选择器（仅图片）」。落盘时会按 EXIF 摆正并等比缩到最长边 1600px（通常 200–600 KB）。移除封面会删除该副本。
 
 ## License
 

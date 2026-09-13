@@ -119,7 +119,7 @@ class LegacyStateMigrationInstrumentedTest {
         legacyFile(AppDataBootstrapper.HISTORY_KEY).writeText("{ definitely not json")
         legacyFile(AppDataBootstrapper.DOWNLOAD_TASKS_KEY).apply {
             parentFile?.mkdirs()
-            writeText("""[{"id":"download-only","type":"PAGE","state":"DONE"}]""")
+            writeText("""[{"id":"download-only","type":"OFFLINE_CACHE","state":"DONE"}]""")
         }
 
         val report = AppDataBootstrapper(isolatedContext, database, clock = { FIXED_CLOCK }).run()
@@ -146,7 +146,7 @@ class LegacyStateMigrationInstrumentedTest {
         legacyFile(AppDataBootstrapper.DOWNLOAD_TASKS_KEY).apply {
             parentFile?.mkdirs()
             writeText(
-                """[{"id":"waiting-task","type":"PAGE","arcid":"remote-download","state":"WAITING"}]""",
+                """[{"id":"waiting-task","type":"OFFLINE_CACHE","arcid":"remote-download","state":"WAITING"}]""",
             )
         }
         legacyFile(AppDataBootstrapper.OFFLINE_INDEX_KEY).apply {

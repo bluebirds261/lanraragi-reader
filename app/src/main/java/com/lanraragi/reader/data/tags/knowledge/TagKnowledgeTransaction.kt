@@ -21,7 +21,13 @@ interface TagKnowledgeStore {
     }
 }
 
-data class TagKnowledgeStage internal constructor(val snapshot: TagKnowledgeSnapshot)
+/**
+ * 已暂存但未激活的快照（stage 的返回值）。
+ *
+ * 用普通类而不是 `data class`：构造函数是 internal，而 data class 会自动生成公开的 `copy()`，
+ * 让外部绕过 `stage()` 的校验直接造一个「已暂存」令牌（Kotlin 2.4 告警、2.5 起报错）。
+ */
+class TagKnowledgeStage internal constructor(val snapshot: TagKnowledgeSnapshot)
 
 sealed class TagKnowledgeUpdate {
     data class Accepted(val snapshot: TagKnowledgeSnapshot) : TagKnowledgeUpdate()

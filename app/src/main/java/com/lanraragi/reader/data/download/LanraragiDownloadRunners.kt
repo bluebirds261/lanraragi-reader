@@ -20,15 +20,19 @@ import kotlinx.coroutines.withContext
 import okhttp3.Request
 import kotlin.coroutines.coroutineContext
 
-/** Registers the protocol runners used by durable archive/cache/page tasks. */
+/**
+ * Registers the protocol runners used by durable archive/cache tasks.
+ *
+ * `repository` is retained so existing call sites (AppContainer) stay source-compatible;
+ * the single-page favorite ("收藏单页") task type was removed and no longer needs it.
+ */
 class LanraragiDownloadRunnerFactory(
-    private val repository: LanraragiRepository,
+    @Suppress("unused") private val repository: LanraragiRepository,
     private val contentResolver: android.content.ContentResolver? = null,
 ) {
     fun registry(): DownloadRunnerRegistry = DownloadRunnerRegistry.Builder()
         .register(DownloadTaskSpec.Archive::class.java, ArchiveRunner(contentResolver))
         .register(DownloadTaskSpec.Cache::class.java, ArchiveRunner(contentResolver))
-        .register(DownloadTaskSpec.Page::class.java, PageRunner(repository, contentResolver))
         .build()
 
     private class ArchiveRunner(private val contentResolver: android.content.ContentResolver?) : DownloadTaskRunner {
@@ -42,19 +46,6 @@ class LanraragiDownloadRunnerFactory(
                 contentResolver = contentResolver,
                 reporter = reporter,
             )
-    }
-
-    private class PageRunner(
-        private val repository: LanraragiRepository,
-        private val contentResolver: android.content.ContentResolver?,
-    ) : DownloadTaskRunner {
-        override suspend fun run(task: DurableDownloadTask, reporter: DownloadProgressReporter): DownloadRunResult {
-            val spec = task.spec as? DownloadTaskSpec.Page
-                ?: return DownloadRunResult.Failed(DownloadFailure.Unknown("Invalid page task"))
-            val url = repository.getPageUrls(spec.source.archiveId).getOrNull(spec.page)
-                ?: return DownloadRunResult.Failed(DownloadFailure.SourceMissing("Page ${spec.page} is unavailable"))
-            return download(url, spec.destination.value, task.completedBytes, spec.expectedRevision, task.entityTag, contentResolver, reporter)
-        }
     }
 }
 

@@ -172,7 +172,7 @@ class DownloadTaskLegacyImporter(
     ) {
         "OFFLINE_CACHE", "OFFLINE", "CACHE", "OFFLINECACHE" -> "OFFLINE_CACHE"
         "ARCHIVE_FILE", "ARCHIVE", "FILE", "ARCHIVEFILE" -> "ARCHIVE_FILE"
-        "PAGE", "SINGLE_PAGE" -> "PAGE"
+        // "PAGE"/"SINGLE_PAGE" (收藏单页) tasks were removed app-wide and are skipped on import.
         else -> null
     }
 

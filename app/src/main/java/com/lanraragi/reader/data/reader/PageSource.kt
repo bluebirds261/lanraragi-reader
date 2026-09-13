@@ -117,7 +117,11 @@ class RemotePageSource(
     }
 }
 
-/** A complete original archive saved by [OfflineCacheManager]. */
+/**
+ * A complete original archive saved by [OfflineCacheManager].
+ * The backing URI comes from [OfflineCacheManager.archiveUri]: `file://` under the default root,
+ * `content://` (SAF document) under a custom root; [ArchiveFileReader] reads both shapes.
+ */
 class SavedArchivePageSource(
     private val context: Context,
     private val offlineCache: OfflineCacheManager,
@@ -139,17 +143,20 @@ class SavedArchivePageSource(
     private var artifactLease: ArtifactLease? = null
 
     override suspend fun sourceUri(): Uri = withContext(Dispatchers.IO) {
-        val file = offlineCache.archiveFile(identity.arcid)
-        if (!file.isFile || file.length() <= 0L) {
+        // 存在性经存储根抽象探测（默认根 = filesDir/offline，自定义根 = SAF），并对历史默认目录数据兼容。
+        if (!offlineCache.archiveReady(identity.arcid)) {
             throw PageSourceUnavailableException("已保存档案不可用: ${identity.arcid}")
         }
+        // 默认根返回 file://，自定义根返回 content://；ArchiveFileReader 两种形态均可读取。
+        val source = offlineCache.archiveUri(identity.arcid)
+            ?: throw PageSourceUnavailableException("已保存档案不可用: ${identity.arcid}")
         if (artifactLease == null) {
             val artifact = savedArtifacts?.findBySource(
                 com.lanraragi.reader.data.download.DownloadSourceIdentity(identity.arcid, identity.serverScope),
             )
             artifactLease = artifact?.let { savedArtifacts.acquire(it.artifactKey) }
         }
-        Uri.fromFile(file)
+        source
     }
 
     override fun close() {
@@ -253,8 +260,8 @@ class PageSourceResolver(
         val remoteIdentity = ArchiveIdentity.Remote(arcid, serverScope)
 
         offlineCache?.let { cache ->
-            val file = cache.archiveFile(arcid)
-            if (file.isFile && file.length() > 0L) {
+            // 经存储根抽象判存在（含非空校验），默认根行为与旧 File 探测一致，SAF 根不再误判缺失。
+            if (cache.archiveReady(arcid)) {
                 val source = SavedArchivePageSource(context, cache, remoteIdentity, savedArtifacts)
                 return try {
                     source.refresh()

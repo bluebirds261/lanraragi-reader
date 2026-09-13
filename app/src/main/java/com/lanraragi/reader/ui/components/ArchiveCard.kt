@@ -45,6 +45,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.lanraragi.reader.data.api.ApiClient
 import com.lanraragi.reader.data.assets.CoverState
+import com.lanraragi.reader.data.catalog.isTankArchiveId
 import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.di.AppContainer
 import java.text.SimpleDateFormat
@@ -102,6 +103,8 @@ fun ArchiveCover(
                 isOffline -> firstPageUrl // 离线但没传文件，回退
                 firstPageUrl != null -> firstPageUrl
                 remoteRequest != null -> remoteRequest
+                // 单行本封面在 `/api/tankoubons/{id}/thumbnail`，档案端点对 TANK_ id 没有对应文件。
+                isTankArchiveId(archive.arcid) -> ApiClient.tankoubonThumbnailUrl(archive.arcid)
                 else -> ApiClient.thumbnailUrl(archive.arcid)
             },
             contentDescription = null,
@@ -133,6 +136,12 @@ fun ArchiveCard(
     selectionMode: Boolean = false,
     isSelected: Boolean = false,
     onLongPress: (() -> Unit)? = null,
+    /**
+     * 单行本卷数（服务端 `archive_count`）。> 0 时在封面左下角渲染「单行本 · N 卷」角标，
+     * 默认 0 保持静默：既有调用点（DownloadScreen / CategoryBrowseScreen 等）传入的普通档案
+     * 与本地档案都不会多出任何视觉元素。
+     */
+    volumeCount: Int = 0,
 ) {
     LaunchedEffect(archive.arcid) { onRequestCover?.invoke() }
     Card(
@@ -157,6 +166,7 @@ fun ArchiveCard(
                 isSelected,
                 thumbnailState,
                 thumbnailContainer,
+                volumeCount,
             )
         } else {
             Column {
@@ -174,6 +184,7 @@ fun ArchiveCard(
                     isSelected,
                     thumbnailState,
                     thumbnailContainer,
+                    volumeCount,
                 )
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 4.dp)) {
                     Text(
@@ -245,6 +256,7 @@ private fun CoverBox(
     isSelected: Boolean = false,
     thumbnailState: CoverState? = null,
     thumbnailContainer: AppContainer? = null,
+    volumeCount: Int = 0,
 ) {
     Box(Modifier.fillMaxWidth().aspectRatio(0.72f)) {
         ArchiveCover(
@@ -298,6 +310,41 @@ private fun CoverBox(
                 trackColor = Color.Transparent,
             )
         }
+        TankVolumeBadge(
+            volumeCount = volumeCount,
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .padding(start = 6.dp, bottom = 6.dp),
+        )
+    }
+}
+
+/**
+ * 单行本角标（封面左下角）：仅当 [volumeCount] > 0 时渲染「单行本 · N 卷」。
+ *
+ * 视觉沿用同一张卡片上既有的角标语言（半透明黑底 + 6dp 圆角 + labelSmall 白字，
+ * 与 CoverBadges 的「已缓存 / 固定 / 收藏」一致），位置避开左上角标、右上「新」与
+ * 底部进度条；不改变任何既有角标与布局。
+ */
+@Composable
+private fun TankVolumeBadge(
+    volumeCount: Int,
+    modifier: Modifier = Modifier,
+) {
+    if (volumeCount <= 0) return
+    Box(
+        modifier = modifier
+            .clip(RoundedCornerShape(6.dp))
+            .background(Color.Black.copy(alpha = 0.42f))
+            .padding(horizontal = 5.dp, vertical = 3.dp),
+    ) {
+        Text(
+            text = "单行本 · $volumeCount 卷",
+            color = Color.White,
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
