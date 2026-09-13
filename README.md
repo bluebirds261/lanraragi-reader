@@ -1,6 +1,6 @@
 # LANraragi Reader (Android)
 
-一个为自托管漫画/本子管理服务器 [LANraragi](https://github.com/Difegue/LANraragi) 编写的 Android 客户端，通过其官方 REST API 完成对接。部署在 Linux NAS 上的 LANraragi 只需开放 HTTP(S) 端口，即可用本 App 在手机上浏览、搜索、阅读与离线缓存。
+一个为自托管漫画/同人志管理服务器 [LANraragi](https://github.com/Difegue/LANraragi) 编写的 Android 客户端，通过其官方 REST API 完成对接。部署在 Linux NAS 上的 LANraragi 只需开放 HTTP(S) 端口，即可用本 App 在手机上浏览、搜索、阅读与离线缓存。
 
 > **English** — A native Android client for self-hosted [LANraragi](https://github.com/Difegue/LANraragi) servers: Jetpack Compose UI, full REST API integration (library / search / reader / progress), offline archive caching, and a metadata-scraping + Chinese-localization workbench. Talks only to your own server; ships no content of its own.
 
