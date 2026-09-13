@@ -638,6 +638,36 @@ SAF（ContentProvider）往返，现已包进 `withContext(Dispatchers.IO)`，�
 
 ---
 
+## 二·补九 第九轮：AGP 版本与 Android Studio 支持上限对齐（D-21）
+
+**现象**：用 Android Studio 打开项目、同步即被拦截：
+
+```
+The project is using an incompatible version (AGP 9.4.0) of the Android Gradle plugin.
+Latest supported version is AGP 9.3.0
+```
+
+**原因**：Studio 的 AGP 兼容性检查发生在 Gradle 之前——项目声明的 AGP 高于当前 Studio 渠道的实现上限时，
+同步直接失败，命令行构建却不受影响（这也解释了为什么本机能编、用 IDE 的人不能编）。
+与第七轮朋友那份「解压后无法 sync、build」是同一类问题的另一种表现。
+
+**处理**：`gradle/libs.versions.toml` 的 `agp` 由 `9.4.0` 改为 **`9.3.0`**（只改这一行），
+并在该行上方写明「必须落在 Android Studio 支持上限内；将来升级 Studio 后可改回 9.4.0」。
+README 同步更新：工具链表 AGP 列改 9.3.0、Android Studio 说明去掉 canary/nightly 限定、
+FAQ 中「AGP 不兼容」一条改为可执行指引（照报错里的版本号改 catalog 那一行，其余依赖无需调整）。
+
+**实测（AGP 9.3.0 + Gradle 9.6.0 + Kotlin 2.4.10 + KSP 2.3.10 + Room 2.8.4 + compileSdk/targetSdk 37）**：
+
+- `:app:assembleDebug` 通过（APK 24,822,850 字节）
+- `:app:testDebugUnitTest` 通过：**57 类 / 283 用例 / 0 失败**
+- `:app:assembleDebugAndroidTest` 通过（androidTest APK 正常产出）
+- 编译告警 **0**
+
+**遗留提示**：若同步随后报 `Failed to find target with hash string 'android-37'`，那是另一个独立问题
+（缺 Android 17 预览平台），按 README FAQ 降到 compileSdk 36 即可。
+
+---
+
 ## 三、高价值缺陷（已修复）
 
 | # | 缺陷 | 修复要点 | 验证 |

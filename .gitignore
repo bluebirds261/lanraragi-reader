@@ -37,7 +37,9 @@ replay_pid*.log
 *.dump
 
 # ========== 本地构建日志与验收临时目录（打包源码时不应进包） ==========
-/build-*.log
+# 根目录下的任何 .log 都是本地构建/调试输出（含 adb、gradle 重定向日志），一律不进仓库。
+# 曾用 `/build-*.log` 这种窄规则，结果 agp933.log 之类漏网被误提交，故放宽到 `/*.log`。
+/*.log
 /deps-*.txt
 /dependency-*.txt
 .verify/

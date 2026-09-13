@@ -1,5 +1,9 @@
 [versions]
-agp = "9.4.0"
+# AGP 必须落在「Android Studio 支持上限」之内，否则同步直接报
+# "The project is using an incompatible version (AGP x.y.z) of the Android Gradle plugin.
+#  Latest supported version is AGP a.b.c"。9.4.0 已超出当前 Studio 渠道的上限（9.3.0），故钉在 9.3.0；
+# 将来升级 Android Studio 后想回到 9.4.0，只改这一行即可，其余无需调整。
+agp = "9.3.0"
 kotlin = "2.4.10"
 # 下列版本与「实际解析结果」对齐（原先声明的值会被传递依赖抬高，声明与落地不一致，
 # 排查依赖问题时容易误判）。改动后 `:app:dependencies` 里这些模块不再出现 `x -> y`。

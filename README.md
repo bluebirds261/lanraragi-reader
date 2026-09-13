@@ -4,7 +4,7 @@
 
 > **English** — A native Android client for self-hosted [LANraragi](https://github.com/Difegue/LANraragi) servers: Jetpack Compose UI, full REST API integration (library / search / reader / progress), offline archive caching, and a metadata-scraping + Chinese-localization workbench. Talks only to your own server; ships no content of its own.
 
-**状态**：`beta-0.1.1` · Kotlin 2.4 / Jetpack Compose (Material 3) / AGP 9.4 / Gradle 9.6 · minSdk 26（compileSdk 37）· 对接 LANraragi 0.9.81 · 单元测试 57 类 / 283 例全通过（另有 Room 迁移等仪器化测试）
+**状态**：`beta-0.1.1` · Kotlin 2.4 / Jetpack Compose (Material 3) / AGP 9.3 / Gradle 9.6 · minSdk 26（compileSdk 37）· 对接 LANraragi 0.9.81 · 单元测试 57 类 / 283 例全通过（另有 Room 迁移等仪器化测试）
 
 > ⚠️ **免责声明**：本项目只是一个客户端，不提供、不托管、不索引任何内容，全部数据来自你自己部署的服务器。请遵守所在地法律法规，仅用于访问你有权访问的内容。
 
@@ -59,18 +59,18 @@ lanraragi-reader-merged/
 
 > **⚠ 本项目用的是很新的工具链，不是"打开即用"的常规项目。** 请按下表准备环境；
 > 尤其**不要**执行 `gradle wrapper --gradle-version 8.x` 之类"降级 wrapper"的操作——
-> AGP 9.4 无法在 Gradle 8 上运行，同步会直接失败。
+> AGP 9.x 无法在 Gradle 8 上运行，同步会直接失败。
 
 | 组件 | 本项目要求 | 说明 |
 |---|---|---|
 | Gradle | **9.6.0**（wrapper 自带，勿改动） | `gradle/wrapper/gradle-wrapper.properties` 指向腾讯云镜像；换源见下方 FAQ |
-| Android Gradle Plugin | **9.4.0** | **需要 canary/nightly 渠道的 Android Studio**；stable 版 Studio 同步时会报 "incompatible version of the Android Gradle Plugin" |
+| Android Gradle Plugin | **9.3.0** | 已钉在「当前 Android Studio 支持的上限」内。**不要随手升级**：高于 Studio 支持上限时，同步会直接报 `The project is using an incompatible version (AGP x.y.z) … Latest supported version is AGP a.b.c` |
 | Kotlin / KSP / Room | 2.4.10 / 2.3.10 / 2.8.4 | 由 `gradle/libs.versions.toml` 固定，勿单独升级 |
 | JDK | **17 以上，推荐 21** | Gradle 9.x 最低 17；Android Studio 自带的 JBR 21 即可 |
 | compileSdk / targetSdk | **37（Android 17）** | 必须在 SDK Manager 安装 **Android 17 (API 37)** 平台并接受许可。本机 SDK 目录名为 `android-37.0`（预览版命名）。装不上就把它降到 36，见 FAQ |
 | Android SDK 路径 | `local.properties` 或 `ANDROID_HOME` | **源码包里故意不含 `local.properties`**（它记录的是打包者的本机路径）。请自行创建或在 IDE 里指定 |
 
-**方式一：Android Studio（canary/nightly 渠道）**
+**方式一：Android Studio**
 
 1. 打开本目录（**不要**再套一层子目录）。
 2. 首次同步会下载 Gradle 9.6 与全部依赖（约 1.2 GB，国内镜像加速，实测 4–5 分钟）。
@@ -104,7 +104,7 @@ sdk.dir=D\:\\Android\\Sdk
 |---|---|---|
 | `Failed to find target with hash string 'android-37'` / `compileSdk 37` 未安装 | 没装 Android 17 (API 37) 平台 | SDK Manager 安装 API 37；或把 `app/build.gradle.kts` 里 `compileSdk`/`targetSdk` 改成 **36**（代码未使用任何 37 专有 API），并删掉 `gradle.properties` 的 `android.suppressUnsupportedCompileSdk=37` |
 | `SDK location not found` | 缺 `local.properties` / `ANDROID_HOME` | 见上 |
-| `incompatible version of the Android Gradle Plugin` | Studio 是 stable 渠道，跟不上 AGP 9.4 | 换 canary/nightly Studio，或直接用命令行构建 |
+| `The project is using an incompatible version (AGP x.y.z) … Latest supported version is AGP a.b.c` | 项目的 AGP 高于当前 Android Studio 的支持上限 | 把 `gradle/libs.versions.toml` 里 `agp` 改成报错信息中提示的那个版本（如 `9.4.0` → `9.3.0`）后重新同步；或升级 Android Studio。**只改这一行即可，其余依赖无需调整**（本项目实测 AGP 9.3.0 与 Gradle 9.6 / Kotlin 2.4.10 / KSP 2.3.10 / compileSdk 37 组合可正常编译） |
 | `Could not find io.github.kyant0:backdrop:2.0.1` | 到 Maven Central 的网络不通 | 项目已内置阿里云 central 镜像；检查代理/网络后重试 |
 | `ClassNotFoundException: worker.org.gradle.process.internal.worker.GradleWorkerMain`（只在跑 `test`/`build` 时出现，`assembleDebug` 正常） | **中文用户名 + Windows**：Gradle 以 UTF-8 写测试 worker 的 argfile，JVM 启动器却按系统 GBK 读取 | 加参数：`gradlew.bat build "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g -Dfile.encoding=GBK"`；或把 `GRADLE_USER_HOME` 指到纯 ASCII 路径（如 `D:\gradle-home`） |
 | 同步长时间卡在下载 Gradle 发行包 | 腾讯云镜像不可达 | 改 `gradle/wrapper/gradle-wrapper.properties` 的 `distributionUrl` 为 `https\://services.gradle.org/distributions/gradle-9.6.0-bin.zip`（`-bin` 比 `-all` 小很多） |
