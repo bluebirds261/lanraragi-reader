@@ -1,6 +1,7 @@
 package com.lanraragi.reader.ui.components.glass
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
@@ -8,6 +9,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.drawBackdrop
@@ -34,6 +36,10 @@ import com.kyant.shapes.Capsule
  * [activeColor] 非 null 时在玻璃表面叠加 20% 着色层（选中态强调），
  * 与底栏选中滑块的着色方式一致。
  *
+ * [outline] 为 true 时在胶囊边缘再勾一圈 1.dp 的描边，让轮廓在内容较杂的背景上更清楚
+ * （浮在画廊卡片上方的顶栏用得上；底栏背后通常是空白，不需要）。描边颜色按主题明暗取：
+ * 深色主题用 20% 白（玻璃边缘的高光），浅色主题用 10% 黑（白描边在浅底上看不见）。
+ *
  * [backdrop] 由调用方通过 `rememberLayerBackdrop()` 创建并在背景内容上
  * 调用 `Modifier.layerBackdrop(backdrop)` 采样；为 null 时回退为普通 surface 卡样式，
  * 组件仍可独立预览。
@@ -44,7 +50,24 @@ import com.kyant.shapes.Capsule
 fun Modifier.liquidGlassCapsule(
     backdrop: Backdrop?,
     activeColor: Color? = null,
+    outline: Boolean = false,
 ): Modifier {
+    val outlineModifier =
+        if (outline) {
+            Modifier.border(
+                width = 1.dp,
+                color =
+                    if (MaterialTheme.colorScheme.surface.luminance() > 0.5f) {
+                        Color.Black.copy(alpha = 0.10f)
+                    } else {
+                        Color.White.copy(alpha = 0.20f)
+                    },
+                shape = Capsule(),
+            )
+        } else {
+            Modifier
+        }
+
     if (backdrop == null) {
         return this
             .clip(Capsule())
@@ -56,6 +79,7 @@ fun Modifier.liquidGlassCapsule(
                     Modifier
                 }
             )
+            .then(outlineModifier)
     }
 
     return this
@@ -105,4 +129,5 @@ fun Modifier.liquidGlassCapsule(
                 }
             },
         )
+        .then(outlineModifier)
 }

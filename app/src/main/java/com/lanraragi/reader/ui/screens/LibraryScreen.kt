@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -1553,6 +1554,20 @@ fun LibraryScreen(
             96.dp
         }
 
+    /*
+     * 悬浮顶栏几何（顶栏与底栏现在同一套悬浮关系）：
+     * 顶栏不再用 Scaffold 的 topBar 预留整块空间，而是浮在内容之上，
+     * 画廊从胶囊下方穿过（玻璃因此能采样到卡片），只靠列表的 contentPadding
+     * 保证「首屏第一行不被挡住」。
+     *
+     * 数值必须与顶栏自身的写法对上（见下方 `.statusBarsPadding().padding(vertical = topBarVerticalPadding)`
+     * 与 `LiquidGlassSearchBar(height = topBarCapsuleHeight)`），改一处这里跟着改。
+     */
+    val topBarCapsuleHeight = 48.dp
+    val topBarVerticalPadding = 6.dp
+    val topBarToContentGap = 8.dp
+    val topBarClearance = topBarVerticalPadding + topBarCapsuleHeight + topBarToContentGap
+
     val listState = rememberLazyListState()
     val gridState = rememberLazyGridState()
     val adaptiveLayout = adaptiveLayout(LocalConfiguration.current.screenWidthDp.dp)
@@ -1706,12 +1721,12 @@ fun LibraryScreen(
 
             Scaffold(
                 topBar = {
-                    // 为浮动顶栏预留空间（含 48dp 液态玻璃预设按键）
+                    // 只预留状态栏高度：顶栏本身是浮在内容之上的（与底栏同一套悬浮关系），
+                    // 画廊内容可以从胶囊下方穿过，玻璃因此能采样到卡片。
                     Spacer(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .statusBarsPadding()
-                            .height(60.dp),
+                            .statusBarsPadding(),
                     )
                 },
                 snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -1829,7 +1844,8 @@ fun LibraryScreen(
                                     contentPadding =
                                         PaddingValues(
                                             start = 12.dp,
-                                            top = 12.dp,
+                                            // 首行落在悬浮顶栏下方（滚动时内容会从胶囊底下穿过）
+                                            top = topBarClearance,
                                             end = 12.dp,
                                             bottom = listBottomPad,
                                         ),
@@ -1915,7 +1931,8 @@ fun LibraryScreen(
                                     contentPadding =
                                         PaddingValues(
                                             start = 12.dp,
-                                            top = 12.dp,
+                                            // 首行落在悬浮顶栏下方（滚动时内容会从胶囊底下穿过）
+                                            top = topBarClearance,
                                             end = 12.dp,
                                             bottom = listBottomPad,
                                         ),
@@ -2036,7 +2053,7 @@ fun LibraryScreen(
                 .statusBarsPadding()
                 .padding(
                     horizontal = 8.dp,
-                    vertical = 6.dp,
+                    vertical = topBarVerticalPadding,
                 ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -2065,11 +2082,14 @@ fun LibraryScreen(
                 readOnly = true,
                 capsuleClickable = true,
                 clearContentDescription = "清除搜索词",
+                height = topBarCapsuleHeight,
                 leading = {
                     // 与搜索区共享同一个玻璃壳，但各自保留点击区与无障碍语义。
+                    // 高度跟随胶囊，点击区因此也是整条高度。
                     Box(
                         modifier = Modifier
-                            .size(40.dp)
+                            .fillMaxHeight()
+                            .width(topBarCapsuleHeight)
                             .clip(CircleShape)
                             .clickable {
                                 showFilter = true

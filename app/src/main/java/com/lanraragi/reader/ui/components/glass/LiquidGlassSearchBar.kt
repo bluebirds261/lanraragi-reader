@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
 
@@ -29,8 +30,8 @@ import com.kyant.backdrop.Backdrop
  *
  * 表面使用 [liquidGlassCapsule]，与 MainScreen 液态底栏**同一份配方**
  * （vibrancy + blur(4.dp) + lens(24.dp, 24.dp, 色散) + Highlight.Ambient(0.5f)
- * + Shadow(16.dp, 25% 黑) + InnerShadow(6.dp, 0.25f) + 2% 白表面）。
- * 高度固定 40.dp。
+ * + Shadow(16.dp, 25% 黑) + InnerShadow(6.dp, 0.25f) + 2% 白表面），
+ * 并额外勾一圈 1.dp 描边，让它在画廊卡片上方滚动时轮廓依然清楚。高度由 [height] 决定（缺省 48.dp）。
  *
  * 两种形态（由 [readOnly] 选择，缺省为可编辑）：
  *
@@ -83,12 +84,16 @@ fun LiquidGlassSearchBar(
      * 合并进胶囊左侧的按键槽位（自带点击区），例如库页的排序/筛选键。
      */
     leading: (@Composable RowScope.() -> Unit)? = null,
+    /*
+     * 胶囊高度。库页顶栏用 48.dp（比原来的 40.dp 更高一点，触控更从容）。
+     */
+    height: Dp = 48.dp,
 ) {
     Row(
         modifier =
             modifier
-                .height(40.dp)
-                .liquidGlassCapsule(backdrop = backdrop),
+                .height(height)
+                .liquidGlassCapsule(backdrop = backdrop, outline = true),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         leading?.invoke(this)
