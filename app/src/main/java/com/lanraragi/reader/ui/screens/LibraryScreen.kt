@@ -35,6 +35,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ViewList
@@ -133,7 +134,6 @@ import com.lanraragi.reader.ui.adaptive.adaptiveLayout
 import com.lanraragi.reader.ui.components.Segment
 import com.lanraragi.reader.ui.components.SegmentedControl
 import com.lanraragi.reader.ui.components.glass.LiquidGlassBar
-import com.lanraragi.reader.ui.components.glass.LiquidGlassButton
 import com.lanraragi.reader.ui.components.glass.LiquidGlassSearchBar
 import com.lanraragi.reader.ui.library.AdaptiveLibraryDetailPane
 import kotlinx.coroutines.CancellationException
@@ -1533,11 +1533,6 @@ fun LibraryScreen(
         mutableStateOf(false)
     }
 
-    // 预设快捷展板（搜索框右侧按键弹出的 ModalBottomSheet）
-    var showPresetQuickPanel by remember {
-        mutableStateOf(false)
-    }
-
     var showCategoryManager by remember {
         mutableStateOf(false)
     }
@@ -2046,35 +2041,12 @@ fun LibraryScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
 
-            // 排序 / 筛选按钮
-            Box(
-                modifier = Modifier
-                    .size(40.dp)
-                    .clip(
-                        RoundedCornerShape(
-                            percent = 50,
-                        ),
-                    )
-                    .clickable {
-                        showFilter = true
-                    },
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    imageVector = Icons.Filled.FilterList,
-                    contentDescription = "排序与筛选",
-                    modifier = Modifier.size(20.dp),
-                )
-            }
-
-            Spacer(
-                modifier = Modifier.width(8.dp),
-            )
-
-            // 搜索胶囊（液态玻璃，采样背景层）：点按跳转搜索页，
-            // SearchScreen 提交后经 SearchBus 写回本页（ViewModel 收集刷新）。
-            // 只读展示当前搜索词，不再内联输入——统一由共享的
-            // LiquidGlassSearchBar（只读 + 整条可点）渲染。
+            // 顶栏合并成「一条液态玻璃胶囊，内部两个点击区」：
+            //   左侧 = 排序 / 筛选键，右侧 = 搜索区（点按跳转搜索页，
+            //   SearchScreen 提交后经 SearchBus 写回本页由 ViewModel 收集刷新）。
+            // 玻璃表面与底栏同一份配方（liquidGlassCapsule），高度仍是原来的 40.dp。
+            // 原先搜索胶囊右侧的「预设搜索」按键已移除；预设仍可从
+            // 排序与筛选面板进入（FilterSheet → 预设）。
             LiquidGlassSearchBar(
                 value = state.filter,
                 // 只读模式下组件不会产生输入变更：value 只会被置空，
@@ -2093,29 +2065,24 @@ fun LibraryScreen(
                 readOnly = true,
                 capsuleClickable = true,
                 clearContentDescription = "清除搜索词",
-            )
-
-            Spacer(
-                modifier = Modifier.width(8.dp),
-            )
-
-            // 预设快捷展板入口（液态玻璃按键，复用本页搜索胶囊的背景采样）：
-            // 当前筛选与任一已保存预设完全一致时给按键加激活态着色（图标随之取主色）。
-            val presetActive =
-                state.presets.any { preset ->
-                    presetMatchesCurrent(state, preset)
-                }
-
-            LiquidGlassButton(
-                onClick = { showPresetQuickPanel = true },
-                backdrop = backdrop,
-                activeColor = if (presetActive) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    null
+                leading = {
+                    // 与搜索区共享同一个玻璃壳，但各自保留点击区与无障碍语义。
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .clickable {
+                                showFilter = true
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.FilterList,
+                            contentDescription = "排序与筛选",
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
                 },
-                icon = Icons.Filled.Bookmark,
-                iconContentDescription = "预设搜索",
             )
         }
         }
@@ -2178,20 +2145,6 @@ fun LibraryScreen(
             vm = vm,
             onDismiss = {
                 showPresetPanel = false
-            },
-        )
-    }
-
-    if (showPresetQuickPanel) {
-        PresetQuickPanel(
-            state = state,
-            vm = vm,
-            onManage = {
-                showPresetQuickPanel = false
-                showPresetPanel = true
-            },
-            onDismiss = {
-                showPresetQuickPanel = false
             },
         )
     }
@@ -2871,294 +2824,6 @@ private fun PresetPanel(
                     }
                 }
             }
-    }
-}
-
-/**
- * 预设快捷展板：搜索框右侧液态玻璃按键弹出的轻量预设面板。
- * 与 PresetPanel 共用同一份 state.presets 与 vm.applyPreset/savePreset 逻辑；
- * 点击即应用，长按（或右上「管理」）进入现有预设管理面板 PresetPanel。
- */
-@OptIn(
-    ExperimentalFoundationApi::class,
-    ExperimentalMaterial3Api::class,
-)
-@Composable
-private fun PresetQuickPanel(
-    state: LibraryState,
-    vm: LibraryViewModel,
-    onManage: () -> Unit,
-    onDismiss: () -> Unit,
-) {
-    var showSave by remember {
-        mutableStateOf(false)
-    }
-
-    var presetName by remember {
-        mutableStateOf("")
-    }
-
-    val sheetState =
-        rememberModalBottomSheetState()
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-    ) {
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .navigationBarsPadding(),
-        ) {
-
-            // ============================================================
-            // 标题栏
-            // ============================================================
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .padding(
-                        horizontal = 20.dp,
-                        vertical = 16.dp,
-                    ),
-                verticalAlignment =
-                    Alignment.CenterVertically,
-            ) {
-
-                Icon(
-                    Icons.Filled.Bookmark,
-                    contentDescription = null,
-                    tint =
-                        MaterialTheme.colorScheme.primary,
-                )
-
-                Spacer(
-                    Modifier.width(12.dp)
-                )
-
-                Text(
-                    "预设搜索",
-                    style =
-                        MaterialTheme.typography.titleMedium,
-                    modifier =
-                        Modifier.weight(1f),
-                )
-
-                TextButton(
-                    onClick = onManage,
-                ) {
-                    Text("管理")
-                }
-            }
-
-            HorizontalDivider()
-
-            Spacer(
-                Modifier.height(8.dp)
-            )
-
-            if (state.presets.isEmpty()) {
-
-                Text(
-                    "在筛选面板中保存预设后，可在这里一键应用",
-                    style =
-                        MaterialTheme.typography.bodyMedium,
-                    color =
-                        MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier =
-                        Modifier.padding(
-                            horizontal = 20.dp,
-                            vertical = 12.dp,
-                        ),
-                )
-
-            } else {
-
-                state.presets.forEach { preset ->
-
-                    val isCurrent =
-                        presetMatchesCurrent(state, preset)
-
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(
-                                horizontal = 16.dp,
-                                vertical = 4.dp,
-                            )
-                            .clip(
-                                RoundedCornerShape(12.dp)
-                            )
-                            .then(
-                                if (isCurrent) {
-                                    // 当前筛选与该预设一致：高亮描边
-                                    Modifier.border(
-                                        1.dp,
-                                        MaterialTheme.colorScheme.primary,
-                                        RoundedCornerShape(12.dp),
-                                    )
-                                } else {
-                                    Modifier
-                                },
-                            )
-                            .combinedClickable(
-                                onClick = {
-                                    // 面板内再次点击已选预设即取消：清空该预设对应的筛选条件。
-                                    if (isCurrent) {
-                                        vm.clearFilters()
-                                    } else {
-                                        vm.applyPreset(preset)
-                                    }
-                                    onDismiss()
-                                },
-                                onLongClick = onManage,
-                            )
-                            .padding(
-                                horizontal = 12.dp,
-                                vertical = 10.dp,
-                            ),
-                        verticalAlignment =
-                            Alignment.CenterVertically,
-                    ) {
-
-                        Column(
-                            Modifier.weight(1f),
-                        ) {
-
-                            Text(
-                                preset.name,
-                                style =
-                                    MaterialTheme.typography.bodyLarge,
-                                color =
-                                    if (isCurrent) {
-                                        MaterialTheme.colorScheme.primary
-                                    } else {
-                                        MaterialTheme.colorScheme.onSurface
-                                    },
-                            )
-
-                            Spacer(
-                                Modifier.height(4.dp)
-                            )
-
-                            Row(
-                                horizontalArrangement =
-                                    Arrangement.spacedBy(6.dp),
-                            ) {
-
-                                PresetSummaryChip(
-                                    presetSortLabel(preset)
-                                )
-
-                                if (preset.tags.isNotEmpty()) {
-                                    PresetSummaryChip(
-                                        "标签 ${preset.tags.size}"
-                                    )
-                                }
-
-                                if (preset.newOnly) {
-                                    PresetSummaryChip("新增")
-                                }
-
-                                if (preset.untaggedOnly) {
-                                    PresetSummaryChip("无标签")
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            HorizontalDivider()
-
-            // ============================================================
-            // 保存当前筛选为预设（复用 vm.savePreset）
-            // ============================================================
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clickable {
-                        presetName = ""
-                        showSave = true
-                    }
-                    .padding(
-                        horizontal = 20.dp,
-                        vertical = 14.dp,
-                    ),
-                verticalAlignment =
-                    Alignment.CenterVertically,
-            ) {
-
-                Icon(
-                    Icons.Filled.Bookmark,
-                    contentDescription = null,
-                    modifier = Modifier.size(20.dp),
-                    tint =
-                        MaterialTheme.colorScheme.primary,
-                )
-
-                Spacer(
-                    Modifier.width(12.dp)
-                )
-
-                Text(
-                    "保存当前筛选为预设",
-                    style =
-                        MaterialTheme.typography.bodyLarge,
-                )
-            }
-        }
-    }
-
-    // ================================================================
-    // 保存预设对话框（与 FilterSheet 内保存流一致，复用 vm.savePreset）
-    // ================================================================
-    if (showSave) {
-
-        AlertDialog(
-            onDismissRequest = {
-                showSave = false
-            },
-
-            title = {
-                Text("保存筛选预设")
-            },
-
-            text = {
-                OutlinedTextField(
-                    value = presetName,
-                    onValueChange = {
-                        presetName = it
-                    },
-                    label = {
-                        Text("预设名称")
-                    },
-                    singleLine = true,
-                )
-            },
-
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        vm.savePreset(presetName)
-                        showSave = false
-                    }
-                ) {
-                    Text("保存")
-                }
-            },
-
-            dismissButton = {
-                TextButton(
-                    onClick = {
-                        showSave = false
-                    }
-                ) {
-                    Text("取消")
-                }
-            },
-        )
     }
 }
 
