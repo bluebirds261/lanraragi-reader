@@ -9,6 +9,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.unit.dp
 import com.kyant.backdrop.Backdrop
@@ -51,6 +52,11 @@ fun Modifier.liquidGlassCapsule(
     backdrop: Backdrop?,
     activeColor: Color? = null,
     outline: Boolean = false,
+    /**
+     * 表面形状。缺省胶囊；「搜索栏原地展开」这类形变会传入圆角矩形
+     * （圆角由调用方用 `animateDpAsState` 过渡，看起来就是胶囊长成了面板）。
+     */
+    shape: Shape = Capsule(),
 ): Modifier {
     val outlineModifier =
         if (outline) {
@@ -62,7 +68,7 @@ fun Modifier.liquidGlassCapsule(
                     } else {
                         Color.White.copy(alpha = 0.20f)
                     },
-                shape = Capsule(),
+                shape = shape,
             )
         } else {
             Modifier
@@ -70,11 +76,11 @@ fun Modifier.liquidGlassCapsule(
 
     if (backdrop == null) {
         return this
-            .clip(Capsule())
-            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f), Capsule())
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f), shape)
             .then(
                 if (activeColor != null) {
-                    Modifier.background(activeColor.copy(alpha = 0.20f), Capsule())
+                    Modifier.background(activeColor.copy(alpha = 0.20f), shape)
                 } else {
                     Modifier
                 }
@@ -85,12 +91,12 @@ fun Modifier.liquidGlassCapsule(
     return this
         .graphicsLayer {
             compositingStrategy = CompositingStrategy.Offscreen
-            shape = Capsule()
+            this.shape = shape
             clip = true
         }
         .drawBackdrop(
             backdrop = backdrop,
-            shape = { Capsule() },
+            shape = { shape },
             effects = {
                 vibrancy()
 

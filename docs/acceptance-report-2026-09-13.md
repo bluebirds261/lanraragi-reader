@@ -871,6 +871,57 @@ APP 侧的应对：面板为空时给出可执行的排查指引（去「设置 
 
 ---
 
+## 二·补十四 第十四轮：参考 EhViewer 的「搜索栏原地展开」（D-26）
+
+用户指令：「再参考 `D:\program\EhViewer-1.14.6` 里的搜索栏，理解包括在首页时的形式、点击展开的动画、
+搜索页面的具体 UI/UX 审美，再结合代码现状和 JHenTai 的相关 UI/UX 改进搜索页」。
+
+### 参考实现读到了什么
+
+EhViewer 1.14.6 是 **Compose（KMP）重写版**，搜索入口在 `app/.../ui/screen/SearchBarScreen.kt`：
+
+| 环节 | 它的做法 |
+|---|---|
+| 首页形态 | 一个 M3 `SearchBar` 停靠在 Scaffold 顶部，**收起时占位文本显示当前标题/查询**，左侧是抽屉（Menu）图标，右侧是自定义动作 |
+| 点击展开 | **交给 M3 `SearchBar(expanded, onExpandedChange)`**：胶囊原地长成全屏面板、背后压一层 scrim、展开态左侧变返回箭头、右侧变「清除/以图搜图」 |
+| 展开区内容 | `filter?.invoke()` 作为列表首项（筛选行）+ 一条 **LazyColumn**：联想行用 `ListItem`（headline=关键词、supporting=译名提示、leading=可直接打开、trailing=删除），条目带 `animateItem()` 位移动画 |
+| 联想来源 | 三路合并：快速搜索（provider）→ **搜索历史（可删，最多 128）** → **标签库按最后一个关键字匹配（最多 50）** |
+| 标签追写 | `wrapTagKeyword`：值含空格 → `ns:"tag$"`，否则 `ns:tag$` |
+| 提交 | 去首尾空白、折叠连续空格，写入搜索历史（先去重）再应用 |
+
+### 本轮落地（在库页原地展开，而不是跳路由）
+
+新增 `ui/screens/LibrarySearchOverlay.kt` + 库页接线：
+
+- **点顶栏搜索胶囊 → 原地展开**（`LibraryScreen` 的 `searchExpanded`），不再直接跳搜索页；
+- 展开层 = **玻璃面板形变**：`liquidGlassCapsule()` 新增 `shape` 参数，胶囊用 `animateDpAsState`
+  把圆角过渡到 18.dp（260ms），观感是「胶囊长成面板」；`graphicsLayer` 的 `shape` 随之变形，
+  玻璃折射跟着一起变 —— 比 M3 通用容器更符合我们自己的语言；
+- 背后是 `background.copy(alpha=0.86)` 的 scrim（淡入），点空白收起；
+- 展开区顶行就是输入框（自动聚焦）+ 四个动作：**收起搜索 / 排序与筛选（打开库页既有 FilterSheet）/ 标签浏览（进完整搜索页）/ 管理历史**；
+- 联想列表按 EhViewer 的合并范式：**历史与标签同列**（历史在前、`标签` 小标题在后），
+  历史行右侧在「管理历史」模式下出现 ✕（对应它的 trailing 删除）；
+  标签行 = 命名空间着色标题 + 词库译名副标题 + weight（为 0 时不显示，避免噪声）；
+- 展开期间**隐藏液态底栏**（复用 `SelectionModeBus`，与多选模式同一写入点取或），
+  否则玻璃底栏会浮在展开层之上还能被误触 —— EhViewer 的展开态是全屏的；
+- 标签追写与搜索页统一为 `ns:"value$"` 引号形式（值含空格更稳，服务端两种都接受）。
+
+### 真机验证
+
+| 项 | 结果 |
+|---|---|
+| 点胶囊原地展开 | ✅ 展开层出现：`收起搜索 / 排序与筛选 / 标签浏览 / 管理历史` + 历史行 |
+| 底栏 | ✅ 展开期间隐藏，收起后恢复 |
+| 联想 | ✅ 输入 `big` → `artist:big bomber`（副标题 `ビッグボンバー`）、`character:big bad wolf`（`大灰狼`）等，命名空间着色 |
+| 追写 + 提交 | ✅ 点联想 → 查询串 `big,artist:"big bomber$"`；回车提交 → 回库页按该条件刷新 |
+| 构建 | `assembleDebug` + `testDebugUnitTest`（57 类 / 283 例 / 0 失败），编译告警 0 |
+
+**仍留给 ③ 讨论**：EhViewer 的展开区把「以图搜图」放在 trailing（LANraragi 无此能力）、
+它的筛选行是分类/语言 chips（我们的对应物是 FilterSheet，已接线但形态不同）、
+以及「结果内嵌展开层/搜索页」这一结构性改动。
+
+---
+
 ## 三、高价值缺陷（已修复）
 
 | # | 缺陷 | 修复要点 | 验证 |

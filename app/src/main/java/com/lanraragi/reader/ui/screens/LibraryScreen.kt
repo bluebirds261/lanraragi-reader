@@ -260,6 +260,20 @@ class LibraryViewModel(
         viewModelScope.launch { _scrollToTop.emit(Unit) }
     }
 
+    /** 提交一条搜索（展开层用）：记历史 + 写入 SearchBus，由本页收集后刷新。 */
+    fun submitSearch(query: String) {
+        val q = query.trim()
+        if (q.isEmpty()) return
+        viewModelScope.launch {
+            container.searchHistoryRepository.add(q)
+            SearchBus.query.value = q
+        }
+    }
+
+    fun removeSearchHistory(query: String) {
+        viewModelScope.launch { container.searchHistoryRepository.remove(query) }
+    }
+
     init {
         viewModelScope.launch {
             val s = container.settingsRepository.settings.first()
@@ -1539,6 +1553,37 @@ fun LibraryScreen(
 
     val backdrop = rememberLayerBackdrop()
 
+    /*
+     * 搜索胶囊的原地展开（参考 EhViewer 1.14.6 的 SearchBar 展开）：
+     * 展开层直接铺在库页之上，历史与联想列表就在里面；「标签浏览」再去完整搜索页。
+     */
+    var searchExpanded by rememberSaveable { mutableStateOf(false) }
+    var overlayQuery by rememberSaveable { mutableStateOf("") }
+    val overlayHistory by container.searchHistoryRepository.history
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+    var overlaySuggestions by remember { mutableStateOf<List<TagStat>>(emptyList()) }
+
+    // 联想去抖：词库 FTS 查询（与搜索页同一条数据源）
+    LaunchedEffect(searchExpanded, overlayQuery) {
+        if (!searchExpanded) return@LaunchedEffect
+        val q = overlayQuery.trim()
+        if (q.isEmpty()) {
+            overlaySuggestions = emptyList()
+            return@LaunchedEffect
+        }
+        kotlinx.coroutines.delay(220)
+        overlaySuggestions = runCatching {
+            container.tagKnowledgeRepository.suggestions(q, limit = 24)
+                .map { s ->
+                    TagStat(
+                        namespace = s.entry.namespace.takeIf(String::isNotBlank),
+                        text = s.entry.tagKey,
+                        weight = s.frequency.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                    )
+                }
+        }.getOrDefault(emptyList())
+    }
+
     var showFilter by remember {
         mutableStateOf(false)
     }
@@ -1702,8 +1747,10 @@ fun LibraryScreen(
     }
 
     // D2：选择模式激活时通知 MainScreen 隐藏液态底栏（多选结束后自动复位）
-    LaunchedEffect(state.selectedIds.isNotEmpty()) {
-        SelectionModeBus.active.value = state.selectedIds.isNotEmpty()
+    // 搜索展开层同理：展开期间也要把底栏收起来，否则玻璃底栏会浮在展开层之上还能被误触
+    // （EhViewer 的展开态是全屏的）。两个条件取或，保持单一写入点。
+    LaunchedEffect(state.selectedIds.isNotEmpty(), searchExpanded) {
+        SelectionModeBus.active.value = state.selectedIds.isNotEmpty() || searchExpanded
     }
 
     DisposableEffect(Unit) {
@@ -2099,7 +2146,10 @@ fun LibraryScreen(
                     vm.clearQuery()
                 },
                 onClick = {
-                    navController.navigate(Routes.SEARCH)
+                    // EhViewer 式：点胶囊**原地展开**（历史 + 联想直接铺在库页上），
+                    // 需要按命名空间挑标签时再进「标签浏览」（原搜索页）。
+                    overlayQuery = state.filter
+                    searchExpanded = true
                 },
                 modifier =
                     Modifier
@@ -2133,6 +2183,47 @@ fun LibraryScreen(
             )
         }
         }
+
+        // ================================================================
+        // 搜索胶囊的原地展开层（EhViewer 式展开：盖住库页，玻璃面板形变 + 联想列表）
+        // ================================================================
+        LibrarySearchOverlay(
+            expanded = searchExpanded,
+            query = overlayQuery,
+            onQueryChange = { overlayQuery = it },
+            onSubmit = {
+                val q = overlayQuery.trim()
+                if (q.isNotEmpty()) {
+                    vm.submitSearch(q)
+                } else {
+                    vm.clearQuery()
+                }
+                searchExpanded = false
+            },
+            onCollapse = { searchExpanded = false },
+            onOpenAdvanced = {
+                searchExpanded = false
+                navController.navigate(Routes.SEARCH)
+            },
+            onOpenFilter = {
+                searchExpanded = false
+                showFilter = true
+            },
+            onAppendTag = { full ->
+                // 与搜索页同一写法：值用引号包住、结尾 $ 表示精确匹配（带空格的值更稳）
+                val token = full.substringBefore(':') + ":\"" + full.substringAfter(':') + "\$"
+                overlayQuery =
+                    if (overlayQuery.isBlank()) {
+                        token
+                    } else {
+                        "${overlayQuery.trimEnd()},$token"
+                    }
+            },
+            history = overlayHistory,
+            onRemoveHistory = { h -> vm.removeSearchHistory(h) },
+            suggestions = overlaySuggestions,
+            backdrop = backdrop,
+        )
 
         // ================================================================
         // 批量操作条：多选模式下悬浮于底部（此时 MainScreen 液态底栏已隐藏）
