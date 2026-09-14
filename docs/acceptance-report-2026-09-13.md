@@ -836,6 +836,41 @@ APP 侧的应对：面板为空时给出可执行的排查指引（去「设置 
 
 ---
 
+## 二·补十三 第十三轮：补数据 + 搜索输入页对齐 JHenTai（D-25）
+
+用户指令：「先做前两步（① 补数据 ② 输入页 1:1），最后一步（结果内嵌）再讨论」。
+
+### ① 补数据
+
+| 项 | 结果 |
+|---|---|
+| **EhTagTranslation 词库** | 真机点「设置 → 工具 → 更新标签翻译」**下载成功**：`已更新 · 13 个命名空间 · 44213 条`，落盘 `files/tag_translations.json`（1.2 MB）。来源为 GitHub Release 资产，说明设备可直连 GitHub |
+| **服务端标签索引 LRR_STATS** | 已恢复：搜索页的命名空间横排从「全部 / 添加日期」变成「全部 / 添加日期 / 来源 / 艺术家 / 女性」，热门面板出现 汉语/翻译/巨乳/同人志/原创/中出/单男主 等真实标签。**重建方式（已从服务端源码确认）**：`LANraragi.pm:186` 在**应用启动时**就 `minion->enqueue('build_stat_hashes')`，即**重启 LANraragi 服务即可重建标签索引**；`Database.pm` 的 `invalidate_cache(1)` 路径同理。APP 内没有对应入口，属服务端运维动作 |
+
+### ② 搜索输入页对齐 JHenTai（`lib/src/pages/search/mobile_v2` + `mixin/search_page_mixin.dart` + `widget/eh_tag.dart`）
+
+| JHenTai 的做法 | 本轮落地 |
+|---|---|
+| 搜索框 **label 显示当前标签关键词**（`/` 分隔） | ✅ 已选标签以浮动 label 挂在输入框上 |
+| prefix 图标 = **清空条件并重搜**；suffix = 清除 | ✅ `SearchViewModel.clearAndSearch()`（写入空查询回库页刷新） |
+| 历史 chips = **EHTag 造型** | ✅ 高 24 / 圆角 8 / 水平 6 / 垂直 3 / 字号 12 / 行高 12sp；删除模式下 chips 内**弹入**圆形 × 徽章（`AnimatedVisibility + scaleIn`） |
+| 历史三种模式：**删除模式 / 隐藏历史 / 历史译名** + 清空 | ✅ 右上三个动作 + 「清空」；隐藏用 `AnimatedVisibility` 折叠整区（对应 JHenTai 的 `AnimatedSwitcher + SizeTransition`） |
+| 历史点击=立刻再搜、**长按=追加进搜索框** | ✅ 两种手势都实现 |
+| 联想列表：**命中高亮** + **译名副标题** + weight + 逐行 FadeIn | ✅ `SuggestionRow`（`buildAnnotatedString` 高亮命中片段；400ms 淡入） |
+| 联想点击追加 `ns:"key$"`、**`-` 为排除操作符** | ✅ 点选=包含、长按=排除；顶栏新增「排除模式」开关（开启后点选即排除）。**服务端语法已核对**：`Model/Search.pm:411`（前导 `-` → `isneg`）、`:432/:442`（引号或 `$` → `isexact`），两种写法 LANraragi 都接受 |
+
+**本轮有意没做（留给 ③ 一起讨论）**：JHenTai 顶栏的「搜索配置」与「快捷搜索」——它们的等价物是我们库页**私有的** `FilterSheet` / `PresetPanel`，
+要复刻就得先把这两个组件提升为共享组件；以及「结果内嵌搜索页」这一结构性改动。
+
+### 验证
+
+- 构建：`assembleDebug` + `testDebugUnitTest`（57 类 / 283 例 / 0 失败），编译告警 0
+- 真机：词库下载成功并可查；搜索页出现真实标签面板；点标签 → 查询框显示 `女性:"巨乳$"`、已选 chip 显示 `女性:巨乳`；
+  历史区三动作齐全、chip 为 EHTag 造型
+- 未能真机验证：中文关键词联想（`adb shell input text` 只支持 ASCII，无法注入中文）
+
+---
+
 ## 三、高价值缺陷（已修复）
 
 | # | 缺陷 | 修复要点 | 验证 |

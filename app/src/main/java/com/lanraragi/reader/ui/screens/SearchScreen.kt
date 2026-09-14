@@ -1,9 +1,21 @@
 package com.lanraragi.reader.ui.screens
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -24,9 +36,14 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.Clear
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.outlined.Block
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -46,20 +63,27 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.lanraragi.reader.data.model.TagStat
+import com.lanraragi.reader.data.TagTranslationStore
 import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.AppTopBar
@@ -217,25 +241,42 @@ class SearchViewModel(private val container: AppContainer) : ViewModel() {
     fun clearHistory() {
         viewModelScope.launch { container.searchHistoryRepository.clear() }
     }
+
+    /** 清空筛选并重新搜索（对应 JHenTai 搜索框左侧图标「清空并刷新」）。 */
+    fun clearAndSearch() {
+        SearchBus.query.value = ""
+    }
 }
 
 /*
  * ============================================================
  * 查询串的结构
  *
- * 库页最终拿到的是一条服务端 filter 串，标签用「精确匹配」写法 `namespace:value$`，
- * 多个条件用逗号连接（与 LibraryFilterContext.toServerFilter() 同口径）。
- * 因此这一页把查询串就当成「标签 token + 关键词」的集合来编辑：
- * 点标签不再立刻跳走，而是把它**追加**进查询串，攒够了再点底部「搜索」。
+ * 库页最终拿到的是一条服务端 filter 串。LANraragi 的解析规则（Model/Search.pm:400-469，
+ * 从右往左逐 token）支持三种写法，这一页全部用上：
+ *   - `ns:value$`       精确匹配（`$` 结尾 = isexact）
+ *   - `ns:"value$"`     引号包裹的精确匹配（JHenTai 的写法，服务端同样接受）
+ *   - `-ns:value$`      排除（前导 `-` = isneg）
+ * 因此点标签不再立刻跳走，而是把它**追加**进查询串，攒够了再点底部「搜索」。
  * （这一范式参考 JHenTai 的搜索页：搜索框承载完整查询，联想/标签点击即追加。）
  * ============================================================
  */
 private data class QueryToken(val raw: String) {
-    /** 形如 `artist:foo$` 的精确标签 token。 */
-    val isTag: Boolean get() = raw.endsWith("$") && raw.contains(':')
+    /** 是否为「精确匹配」的标签 token（`ns:value$` 或 `ns:"value$"`，可带前导 `-`）。 */
+    val isTag: Boolean
+        get() {
+            val body = raw.removePrefix("-")
+            return body.replace("\"", "").endsWith("$") && body.contains(':')
+        }
 
-    /** 去掉结尾 `$` 的显示形态（chip 上不显示匹配符）。 */
-    val display: String get() = if (isTag) raw.dropLast(1) else raw
+    /** 是否为排除项（前导 `-`）。 */
+    val isExcluded: Boolean get() = raw.startsWith("-")
+
+    /** 显示形态：去掉 `-` 与引号、去掉结尾 `$`，chip 上只留 `ns:value`。 */
+    val display: String
+        get() = raw.removePrefix("-")
+            .replace("\"", "")
+            .removeSuffix("$")
 }
 
 private fun parseQueryTokens(query: String): List<QueryToken> =
@@ -244,9 +285,19 @@ private fun parseQueryTokens(query: String): List<QueryToken> =
         .filter { it.isNotEmpty() }
         .map(::QueryToken)
 
+/** 标签 token 的两种形态（引号形式与 JHenTai 一致）：`ns:"value$"`，排除时前缀 `-`。 */
+private fun tagToken(fullTag: String, excluded: Boolean): String {
+    val prefix = if (excluded) "-" else ""
+    val colon = fullTag.indexOf(':')
+    if (colon < 0) return "$prefix\"$fullTag\$\""
+    val ns = fullTag.substring(0, colon)
+    val value = fullTag.substring(colon + 1)
+    return "$prefix$ns:\"$value\$\""
+}
+
 /** 把标签 token 追加进查询串（已存在则不重复加）。 */
-private fun appendTagToken(query: String, fullTag: String): String {
-    val token = "${fullTag}$"
+private fun appendTagToken(query: String, fullTag: String, excluded: Boolean = false): String {
+    val token = tagToken(fullTag, excluded)
     val tokens = parseQueryTokens(query)
     if (tokens.any { it.raw == token }) return query
     return (tokens.map { it.raw } + token).joinToString(",")
@@ -286,6 +337,18 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
     // 当前浏览的命名空间："" = 全部（展示热门标签）
     var namespace by remember { mutableStateOf("") }
 
+    // 历史区三种模式（对齐 JHenTai）：删除模式 / 隐藏历史 / 历史译名
+    var deleteMode by remember { mutableStateOf(false) }
+    var hideHistory by remember { mutableStateOf(false) }
+    var translateHistory by remember { mutableStateOf(false) }
+
+    // 排除模式：进入后点击标签/联想追加的是 `-ns:"value$"`（服务端 isneg 语义）
+    var excludeMode by remember { mutableStateOf(false) }
+
+    // 词库是否就绪（决定是否显示「历史译名」开关，与 JHenTai 的 tagTranslationService.isReady 同义）
+    val translations by TagTranslationStore.translations.collectAsStateWithLifecycle()
+    val dictionaryReady = translations.isNotEmpty()
+
     val tokens = remember(state.query) { parseQueryTokens(state.query) }
     val selectedTags = remember(tokens) { tokens.filter { it.isTag } }
     val keywordOnly = remember(tokens) { tokens.none { it.isTag } }
@@ -300,7 +363,29 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
 
     Scaffold(
         modifier = Modifier.edgeSwipeBack { navController.popBackStack() },
-        topBar = { AppTopBar(title = "搜索", onBack = { navController.popBackStack() }) },
+        topBar = {
+            AppTopBar(
+                title = "搜索",
+                onBack = { navController.popBackStack() },
+                // 对应 JHenTai 顶栏的 filter 动作：这里先用它承载「排除模式」开关
+                // （搜索配置/快捷搜索的等价物是库页私有的 FilterSheet/PresetPanel，
+                //  需要一起提升为共享组件，留待与结果页一并处理）。
+                actions = {
+                    IconButton(onClick = { excludeMode = !excludeMode }) {
+                        Icon(
+                            if (excludeMode) Icons.Filled.Block else Icons.Outlined.Block,
+                            contentDescription = if (excludeMode) "退出排除模式" else "排除模式",
+                            tint =
+                                if (excludeMode) {
+                                    MaterialTheme.colorScheme.error
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                        )
+                    }
+                },
+            )
+        },
         bottomBar = {
             SearchActionBar(
                 selectedTagCount = selectedTags.size,
@@ -318,7 +403,32 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                 value = state.query,
                 onValueChange = vm::onQueryChange,
                 placeholder = { Text("关键词或点选下方标签…") },
-                leadingIcon = { Icon(Icons.Filled.Search, contentDescription = "搜索") },
+                // JHenTai：已选标签以浮动 label 的形式挂在搜索框上（` / ` 分隔）
+                label =
+                    if (selectedTags.isNotEmpty()) {
+                        {
+                            Text(
+                                selectedTags.joinToString(" / ") { it.display },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    } else {
+                        null
+                    },
+                // JHenTai：点搜索图标 = 清空条件并重新搜索（这里即回到库页的未筛选状态）
+                leadingIcon = {
+                    IconButton(
+                        onClick = {
+                            vm.onQueryChange("")
+                            vm.clearAndSearch()
+                            navController.popBackStack()
+                        },
+                    ) {
+                        Icon(Icons.Filled.Search, contentDescription = "清空条件并搜索")
+                    }
+                },
                 trailingIcon = {
                     if (state.query.isNotEmpty()) {
                         IconButton(onClick = { vm.onQueryChange("") }) {
@@ -350,21 +460,16 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                 ) {
                     selectedTags.forEach { token ->
                         val ns = TagRules.nsOf(token.display)
-                        SuggestionChip(
-                            onClick = { vm.onQueryChange(removeQueryToken(state.query, token)) },
-                            label = {
-                                Text(
+                        val excluded = token.isExcluded
+                        // 已选标签也用 EHTag 造型（与历史 chips 同一套视觉）
+                        EhTag(
+                            text =
+                                (if (excluded) "-" else "") +
                                     rememberTagText(ns, TagRules.valueOf(token.display)),
-                                    color = rememberTagColor(ns),
-                                )
-                            },
-                            icon = {
-                                Icon(
-                                    Icons.Filled.Close,
-                                    contentDescription = "移除该标签",
-                                    modifier = Modifier.size(16.dp),
-                                )
-                            },
+                            color = if (excluded) MaterialTheme.colorScheme.error else rememberTagColor(ns),
+                            background = MaterialTheme.colorScheme.surfaceVariant,
+                            inDeleteMode = true,
+                            onClick = { vm.onQueryChange(removeQueryToken(state.query, token)) },
                         )
                     }
                 }
@@ -468,39 +573,28 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                     // --------------------------------------------------------
                     if (state.history.isNotEmpty()) {
                         item(key = "history") {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    "搜索历史",
-                                    style = MaterialTheme.typography.titleSmall,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                TextButton(onClick = vm::clearHistory) { Text("清空") }
-                            }
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                state.history.forEach { h ->
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        SuggestionChip(
-                                            onClick = {
-                                                vm.onQueryChange(h)
-                                                vm.submit(h, normalize = false)
-                                                navController.popBackStack()
-                                            },
-                                            label = { Text(h, maxLines = 1, overflow = TextOverflow.Ellipsis) },
-                                        )
-                                        // 单条删除：用显式 × 而不是长按（长按会与 chip 自身点击抢手势）
-                                        IconButton(
-                                            onClick = { vm.removeHistory(h) },
-                                            modifier = Modifier.size(28.dp),
-                                        ) {
-                                            Icon(
-                                                Icons.Filled.Close,
-                                                contentDescription = "删除该历史",
-                                                modifier = Modifier.size(16.dp),
-                                            )
-                                        }
-                                    }
-                                }
-                            }
+                            SearchHistorySection(
+                                history = state.history,
+                                hideHistory = hideHistory,
+                                deleteMode = deleteMode,
+                                translateHistory = translateHistory,
+                                dictionaryReady = dictionaryReady,
+                                onToggleHide = { hideHistory = !hideHistory },
+                                onToggleDeleteMode = { deleteMode = !deleteMode },
+                                onToggleTranslate = { translateHistory = !translateHistory },
+                                onClearAll = vm::clearHistory,
+                                onSearch = { h ->
+                                    vm.onQueryChange(h)
+                                    vm.submit(h, normalize = false)
+                                    navController.popBackStack()
+                                },
+                                onAppend = { h ->
+                                    // JHenTai：长按历史 = 追加进搜索框（而不是立刻搜）
+                                    val base = state.query.trimEnd()
+                                    vm.onQueryChange(if (base.isEmpty()) h else "$base $h")
+                                },
+                                onRemove = vm::removeHistory,
+                            )
                         }
                     }
 
@@ -611,9 +705,9 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
 
                     item(key = "suggestions-header") {
                         Text(
-                            "标签联想",
+                            if (excludeMode) "标签联想（点选=排除，长按=包含）" else "标签联想（点选=包含，长按=排除）",
                             style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (excludeMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 8.dp),
                         )
                     }
@@ -628,36 +722,17 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
                     } else {
                         items(state.suggestions, key = { it.full }) { tag ->
                             val ns = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
-                            val color = rememberTagColor(ns)
-                            Row(
-                                Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { vm.onQueryChange(appendTagToken(state.query, tag.full)) }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                // 命名空间前缀用命名空间着色，一眼区分作者/角色/原作…
-                                Text(
-                                    "${TagRules.label(ns)}:",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = color,
-                                )
-                                Text(
-                                    tag.text,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = color,
-                                    fontWeight = FontWeight.Medium,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                Text(
-                                    tag.weight.toString(),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
+                            SuggestionRow(
+                                namespace = ns.ifBlank { tag.namespace.orEmpty() },
+                                value = tag.text,
+                                translation = rememberTagText(ns, tag.text),
+                                query = state.query,
+                                weight = tag.weight,
+                                excludeMode = excludeMode,
+                                onAppend = { excluded ->
+                                    vm.onQueryChange(appendTagToken(state.query, tag.full, excluded))
+                                },
+                            )
                         }
                     }
                 }
@@ -666,10 +741,262 @@ fun SearchScreen(container: AppContainer, navController: NavController) {
     }
 }
 
+/**
+ * EHTag：JHenTai 的标签胶囊（`widget/eh_tag.dart`）。
+ *
+ * 造型逐项对齐：**高 24 / 圆角 8 / 水平内边距 6 / 垂直 3 / 字号 12 / 行高 1**，
+ * 背景为命名空间底色（这里用调用方给的颜色淡版），文字用命名空间色。
+ * 删除模式下在右侧**弹入**一个圆形 × 徽章（JHenTai 用 AnimatedSwitcher，这里用
+ * AnimatedVisibility + scaleIn，观感一致）。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun EhTag(
+    text: String,
+    color: Color,
+    background: Color,
+    inDeleteMode: Boolean = false,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
+) {
+    Row(
+        modifier =
+            modifier
+                .height(24.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(background)
+                .then(
+                    if (onClick != null || onLongClick != null) {
+                        Modifier.combinedClickable(
+                            onClick = { onClick?.invoke() },
+                            onLongClick = onLongClick,
+                        )
+                    } else {
+                        Modifier
+                    },
+                )
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp, lineHeight = 12.sp),
+            color = color,
+        )
+        AnimatedVisibility(
+            visible = inDeleteMode,
+            enter = scaleIn() + fadeIn(),
+            exit = scaleOut() + fadeOut(),
+        ) {
+            Box(
+                Modifier
+                    .padding(start = 4.dp)
+                    .size(13.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.error),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "删除",
+                    tint = MaterialTheme.colorScheme.onError,
+                    modifier = Modifier.size(10.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 搜索历史区（对齐 JHenTai 的 `buildSearchHistory` + `buildButtons`）：
+ * 一行为历史 chips（点击=直接再搜、长按=追加进搜索框、删除模式下点击=删除），
+ * 右上角是三个动作：历史译名开关（词库就绪时才有）、隐藏/删除模式切换（长按=清空全部）。
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SearchHistorySection(
+    history: List<String>,
+    hideHistory: Boolean,
+    deleteMode: Boolean,
+    translateHistory: Boolean,
+    dictionaryReady: Boolean,
+    onToggleHide: () -> Unit,
+    onToggleDeleteMode: () -> Unit,
+    onToggleTranslate: () -> Unit,
+    onClearAll: () -> Unit,
+    onSearch: (String) -> Unit,
+    onAppend: (String) -> Unit,
+    onRemove: (String) -> Unit,
+) {
+    // 历史条目没有命名空间，用统一的胶囊底色；译名按词库直查（与 TagChip 的查法一致）。
+    val chipBackground = MaterialTheme.colorScheme.surfaceVariant
+    val chipText = MaterialTheme.colorScheme.onSurface
+    val translations by TagTranslationStore.translations.collectAsStateWithLifecycle()
+
+    fun displayOf(raw: String): String {
+        if (!translateHistory || !dictionaryReady) return raw
+        // 历史可能整条是关键词（含空格），逐 token 尝试词库直查，命中就替换。
+        return raw.split(' ').joinToString(" ") { word ->
+            val ns = word.substringBefore(':', "")
+            val value = word.substringAfter(':', word)
+            translations[ns]?.get(value)?.takeIf { it.isNotBlank() } ?: word
+        }
+    }
+
+    Column {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "搜索历史",
+                style = MaterialTheme.typography.titleSmall,
+                modifier = Modifier.weight(1f),
+            )
+            AnimatedVisibility(visible = !hideHistory && dictionaryReady) {
+                IconButton(onClick = onToggleTranslate) {
+                    Icon(
+                        Icons.Filled.Translate,
+                        contentDescription = if (translateHistory) "取消历史译名" else "历史显示译名",
+                        modifier = Modifier.size(20.dp),
+                        tint =
+                            if (translateHistory) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                    )
+                }
+            }
+            IconButton(onClick = if (hideHistory) onToggleHide else onToggleDeleteMode) {
+                Icon(
+                    when {
+                        hideHistory -> Icons.Filled.Visibility
+                        deleteMode -> Icons.Filled.Close
+                        else -> Icons.Filled.DeleteOutline
+                    },
+                    contentDescription = when {
+                        hideHistory -> "显示历史"
+                        deleteMode -> "退出删除模式"
+                        else -> "删除历史"
+                    },
+                    modifier = Modifier.size(20.dp),
+                    tint = if (deleteMode) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            TextButton(onClick = onClearAll) { Text("清空") }
+        }
+        // JHenTai 用 AnimatedSwitcher + SizeTransition 折叠整个历史区
+        AnimatedVisibility(visible = !hideHistory, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(7.dp),
+                modifier = Modifier.padding(top = 4.dp),
+            ) {
+                history.forEach { h ->
+                    EhTag(
+                        text = displayOf(h),
+                        color = chipText,
+                        background = chipBackground,
+                        inDeleteMode = deleteMode,
+                        onClick = { if (deleteMode) onRemove(h) else onSearch(h) },
+                        onLongClick = if (deleteMode) null else ({ onAppend(h) }),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 联想行（对齐 JHenTai 的 `buildSuggestions`）：
+ * 标题是**高亮命中片段**的原始标签、副标题是译名（同样高亮），
+ * 点击把 `ns:"value$"` 追加进查询框，**长按追加排除形式** `-ns:"value$"`。
+ * 逐行淡入（JHenTai 用 FadeIn 400ms）。
+ */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SuggestionRow(
+    namespace: String,
+    value: String,
+    translation: String,
+    query: String,
+    weight: Int,
+    excludeMode: Boolean,
+    onAppend: (Boolean) -> Unit,
+) {
+    val highlight = MaterialTheme.colorScheme.primary
+    val base = MaterialTheme.colorScheme.onSurface
+    val secondary = MaterialTheme.colorScheme.onSurfaceVariant
+    val nsColor = rememberTagColor(namespace)
+    val keyword = query.trim().substringAfterLast(' ').substringAfterLast(',').removePrefix("-").replace("\"", "")
+
+    // 命中片段高亮：在“命名空间:值”与译名里各找一次关键字
+    fun highlighted(text: String, color: Color): AnnotatedString {
+        val start = if (keyword.isBlank()) -1 else text.indexOf(keyword, ignoreCase = true)
+        return if (start < 0) {
+            AnnotatedString(text, SpanStyle(color = color))
+        } else {
+            buildAnnotatedString {
+                withStyle(SpanStyle(color = color)) { append(text.substring(0, start)) }
+                withStyle(SpanStyle(color = highlight, fontWeight = FontWeight.Bold)) {
+                    append(text.substring(start, start + keyword.length))
+                }
+                withStyle(SpanStyle(color = color)) { append(text.substring(start + keyword.length)) }
+            }
+        }
+    }
+
+    // 逐行淡入
+    val alpha = remember { Animatable(0f) }
+    LaunchedEffect(Unit) { alpha.animateTo(1f, tween(durationMillis = 400)) }
+
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .alpha(alpha.value)
+            .clip(RoundedCornerShape(12.dp))
+            .combinedClickable(
+                onClick = { onAppend(excludeMode) },
+                onLongClick = { onAppend(!excludeMode) },
+            )
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Filled.Search,
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = secondary,
+        )
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                highlighted("$namespace:$value", nsColor),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            if (translation.isNotBlank() && translation != value) {
+                Text(
+                    highlighted(translation, secondary),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+        Text(
+            weight.toString(),
+            style = MaterialTheme.typography.labelSmall,
+            color = secondary,
+        )
+    }
+}
+
 /** 底部动作条：左侧提示、右侧「搜索」（JHenTai 的搜索按钮位置）。 */
 @Composable
-private fun SearchActionBar(
-    selectedTagCount: Int,
+private fun SearchActionBar(    selectedTagCount: Int,
     enabled: Boolean,
     onSearch: () -> Unit,
 ) {
