@@ -761,6 +761,81 @@ DetailScreen 用的是同文件内自己的私有实现）。保留为组件库�
 
 ---
 
+## 二·补十二 第十二轮：底栏交互 + 下拉指示器 + 搜索页按 JHenTai 重做（D-24）
+
+用户指令四条：①底栏激活色与「水滴」要停在与当前页面一致的位置（在首页点第 4 键再返回后要回到首页键上）；
+②双击底栏「首页」键回顶；③下拉刷新的转圈指示器固定在顶栏胶囊下方；④点搜索栏展开的搜索页参考 JHenTai。
+
+### ① 水滴 / 激活色跟随当前页面
+
+**根因**：`indicatorPosition`（水滴横向位置，同时通过 `roundToInt()` 决定哪一格显示激活色）只被
+`LaunchedEffect(selectedIndex)` 拉回。点/拖到第 4 键会把它移到 3，但页面并没有切走，`selectedIndex`
+不变 → 该 effect 不重跑 → 水滴与激活色滞留在第 4 键。
+
+**修复**：effect 改为 `LaunchedEffect(selectedIndex, showRecentList)`——抽屉打开时保持现状（水滴停在第 4 键
+作为「抽屉已开」的提示），抽屉关闭后回落 `selectedIndex`。
+
+**真机复现 + 验证**（PHK110 / 1080×2376 / density 480）：在底栏把滑块从第 1 格拖到第 4 格 →
+抽屉打开、**「首页」的 `selected` 语义消失**（激活色确实跑到第 4 键，复现了用户看到的现象）→
+关闭抽屉后 **`selected` 回到「首页」** ✓
+
+### ② 双击「首页」键回顶
+
+实现放在**覆盖当前选中项的透明拖拽层**的 `onClick` 里，用两次点击的时间戳（`HOME_DOUBLE_TAP_MS = 300`）
+判断双击，而不是 `combinedClickable(onDoubleClick=…)`：前者实测**永远收不到第二下**——第一下会切页并触发重组，
+手势检测器随之被重置（本项目专门插桩验证过）。
+
+**真机验证**：滚动到首卡 y=783（底栏展开）→ 双击「首页」键 → 首卡回到 **y=1001**（= 顶部基线）✓
+
+### ③ 下拉刷新指示器固定在胶囊下方
+
+`PullToRefreshBox` 默认把指示器画在容器顶部——顶栏改为悬浮后容器顶部就是状态栏下方，转圈会从胶囊背后升起。
+新增 `state = rememberPullToRefreshState()` + 自定义 `indicator`，把 `PullToRefreshDefaults.Indicator`
+放在 `padding(top = topBarClearance)`（= 胶囊底 + 8dp）。
+
+`PullToRefreshDefaults.Indicator` 的签名（M3 1.4.0 的 `Indicator-2poqoh4`：state / isRefreshing / modifier /
+containerColor / color / threshold）先用 `javap` 从缓存 AAR 里核对过再写。
+**该项为代码级验证**：指示器位置无法用 uiautomator 观测（无文本/语义节点）。
+
+### ④ 搜索页按 JHenTai 重做
+
+参考本机 `D:\program\JHenTai-8.0.16` 的 `lib/src/pages/search/…`（mobile_v2 搜索页 + `search_page_mixin.dart`），
+采用它的核心范式：**搜索框承载完整查询、点标签是「追加」而不是立刻跳走、底部统一「搜索」动作**。
+
+| 之前 | 之后 |
+|---|---|
+| `OutlinedTextField` + 历史/热门/命名空间分组三个互不相关的区块 | 查询框（承载 `ns:value$` 标签 token + 关键词）→ 已选标签 chips（可逐个摘除）→ 命名空间横排 → 二列标签面板 / 输入时的联想列表 → 底部「搜索」动作条（左侧显示已选标签数） |
+| 点标签立即 `FilterBus` 过滤或立即提交并返回 | 点标签把 `namespace:value$` **追加进查询串**，可继续加、可删；按底部「搜索」或回车一起提交（与 `LibraryFilterContext.toServerFilter()` 同口径，逗号连接 = AND） |
+| 热门标签按 weight | 热门标签排除「日期 / 时间戳」这类机器元数据（它们每个档案都有、weight 极高会霸屏），并按标签自身判断，因此对**中文命名空间**的库同样有效 |
+| 命名空间列表来自内置英文词表 | 命名空间列表来自**服务器实际返回的标签**（本库的命名空间是中文「作者/原作/角色…」，用英文词表筛出来的分组点进去是空的） |
+| — | 空查询时联想/映射/历史保留；「直接搜索『关键词』」入口保留；词典映射点击也是追加 |
+
+### 本轮发现的**服务端**问题（不是代码 bug）
+
+搜索页的标签面板在这台服务器上是空的。插桩抓到原始响应：
+
+```
+tagstats len=541 head=[{"namespace":"date_added","text":"1788366586","weight":"2"}, … ]
+tagstats parsed=9
+```
+
+`/api/database/stats` 只返回 **9 条** date_added 记录。查服务端源码：该端点读的是 Redis 有序集合
+`LRR_STATS`（`LANraragi/Model/Stats.pm::build_tag_stats` → `zrangebyscore("LRR_STATS", minweight, +inf)`），
+而这个集合只在服务端扫描/重建索引时写入（`Stats.pm:101/176` 的 `zincrby`）。你这台库的该集合几乎是空的
+（很可能是库直接拷进去或 Redis 被清过），因此**所有依赖标签统计的页面都会退化**（旧搜索页的「热门标签」
+与「标签筛选」分组同样受影响，这不是本轮引入的）。
+
+APP 侧的应对：面板为空时给出可执行的排查指引（去「设置 → 连接 → 立即重扫服务器文件夹」重扫一次，
+或在服务端重建标签索引），并保证**关键词/标签直接输入搜索仍然完全可用**。
+
+### 本轮验证状态
+
+- `:app:assembleDebug`、`:app:testDebugUnitTest`（57 类 / 283 例 / 0 失败）、`:app:assembleDebugAndroidTest` 全通过，编译告警 0
+- 真机：①复现+修复 ②双击回顶 ④搜索页结构 + 端到端提交（输入关键词 → 底部「搜索」→ 库页按该条件刷新）共 4 项通过
+- ③为代码级验证（指示器位置无法用 uiautomator 观测）
+
+---
+
 ## 三、高价值缺陷（已修复）
 
 | # | 缺陷 | 修复要点 | 验证 |

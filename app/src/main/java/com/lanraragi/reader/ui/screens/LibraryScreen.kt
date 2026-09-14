@@ -66,6 +66,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.material3.pulltorefresh.PullToRefreshDefaults
+import androidx.compose.material3.pulltorefresh.rememberPullToRefreshState
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -246,6 +248,17 @@ class LibraryViewModel(
 
     private val _scrollToTop = MutableSharedFlow<Unit>()
     val scrollToTop = _scrollToTop.asSharedFlow()
+
+    /**
+     * 请求列表/网格回到顶部。
+     *
+     * 除了筛选变化（[refresh] 内部会调用）之外，底栏「首页」键**双击**也走这里：
+     * MainScreen 通过同一 ViewModelStoreOwner 拿到的是同一个 VM 实例，
+     * 因此不需要再额外加一条跨屏总线。
+     */
+    fun requestScrollToTop() {
+        viewModelScope.launch { _scrollToTop.emit(Unit) }
+    }
 
     init {
         viewModelScope.launch {
@@ -1804,10 +1817,24 @@ fun LibraryScreen(
                         AdaptiveLayoutHost(
                             layout = adaptiveLayout,
                             master = {
+                                // 转圈指示器固定到悬浮顶栏胶囊下方：
+                                // 默认位置在容器顶部（现在就是状态栏下方），会被胶囊挡住，
+                                // 从玻璃后面升起几乎看不见。
+                                val refreshState = rememberPullToRefreshState()
                                 PullToRefreshBox(
                                     isRefreshing = state.loading,
                                     onRefresh = vm::refresh,
+                                    state = refreshState,
                                     modifier = Modifier.fillMaxSize(),
+                                    indicator = {
+                                        PullToRefreshDefaults.Indicator(
+                                            state = refreshState,
+                                            isRefreshing = state.loading,
+                                            modifier = Modifier
+                                                .align(Alignment.TopCenter)
+                                                .padding(top = topBarClearance),
+                                        )
+                                    },
                                 ) {
 
                             if (state.viewMode == "list") {

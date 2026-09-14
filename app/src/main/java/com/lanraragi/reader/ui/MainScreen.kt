@@ -67,6 +67,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -102,6 +103,7 @@ import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.kyant.backdrop.backdrops.layerBackdrop
 import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
@@ -121,6 +123,7 @@ import com.lanraragi.reader.ui.screens.DownloadScreen
 import com.lanraragi.reader.ui.screens.FilterContextBus
 import com.lanraragi.reader.ui.screens.toServerFilter
 import com.lanraragi.reader.ui.screens.LibraryScreen
+import com.lanraragi.reader.ui.screens.LibraryViewModel
 import com.lanraragi.reader.ui.screens.MainTabBus
 import com.lanraragi.reader.ui.screens.SettingsScreen
 import com.lanraragi.reader.ui.screens.ReaderDrawerBus
@@ -130,6 +133,9 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
+
+/** 双击「首页」键的判定窗口（与系统双击超时同量级）。 */
+private const val HOME_DOUBLE_TAP_MS = 300L
 
 private data class MainTab(
     val label: String,
@@ -194,6 +200,14 @@ fun MainScreen(
         .collectAsStateWithLifecycle(
             initialValue = null
         )
+
+    /*
+     * 与 LibraryScreen 共用同一个 ViewModelStoreOwner（同一个 NavBackStackEntry），
+     * 因此这里的 viewModel{} 取到的就是库页那份 LibraryViewModel 实例本身 ——
+     * 「首页」键双击可以直接复用它的 scrollToTop，不必再造一条跨屏总线。
+     */
+    val libraryViewModel: LibraryViewModel =
+        viewModel { LibraryViewModel(container) }
 
     val activeDownloadCount by container.downloadManager.activeCount
         .collectAsStateWithLifecycle()
@@ -317,6 +331,14 @@ fun MainScreen(
             }
         }
     }
+
+    /*
+     * 底栏「首页」键双击（回到库页顶部）用的时间戳：
+     * 只要两次点击落在 HOME_DOUBLE_TAP_MS 内即视为双击。
+     * 用 remember 状态而不是手势检测器内部状态 —— 第一次点击会切页触发重组，
+     * 手势检测器会被重置，检测不到第二下。
+     */
+    var lastHomeTapAt by remember { mutableLongStateOf(0L) }
 
     /*
      * ============================================================
@@ -856,8 +878,22 @@ fun MainScreen(
                 }
 
             LaunchedEffect(
-                selectedIndex
+                selectedIndex,
+                showRecentList
             ) {
+
+                /*
+                 * 水滴与激活色的落点：
+                 * - 切页时跟随 selectedIndex；
+                 * - 「续读 / 随机」抽屉关闭后必须**回落到当前页面**：点第 4 键（或把滑块拖到
+                 *   第 4 键）会把 indicatorPosition 移到 3，但页面并没有切走，selectedIndex
+                 *   不变时本 LaunchedEffect 不会重跑，水滴就会滞留在第 4 键上（用户报的 bug）。
+                 */
+                if (showRecentList) {
+
+                    // 抽屉开着：保持现状（水滴停在第 4 键，作为「抽屉已打开」的视觉提示）
+                    return@LaunchedEffect
+                }
 
                 isIndicatorMoving = true
 
@@ -2053,7 +2089,13 @@ fun MainScreen(
                                                         itemsAlpha
                                                     ),
 
+                                            // 记录「首页」键点击时间（双击回顶的时间窗判定）
                                             onClick = {
+
+                                                if (index == 0) {
+                                                    lastHomeTapAt =
+                                                        System.currentTimeMillis()
+                                                }
 
                                                 if (
                                                     progress > 0.8f
@@ -2138,7 +2180,39 @@ fun MainScreen(
                                                             3
                                                         )
 
+                                                /*
+                                                 * 双击「首页」→ 库页回到列表顶部。
+                                                 *
+                                                 * 用「两次点击的时间窗」判断，而不是 combinedClickable 的
+                                                 * onDoubleClick：第一下会切页并触发重组，双击检测器随之被
+                                                 * 重置，第二下永远进不了 onDoubleClick（实测确认）。
+                                                 * 这里只依赖 remember 的时间戳，不受重组影响。
+                                                 */
+                                                val now =
+                                                    System
+                                                        .currentTimeMillis()
+
+                                                val isHomeDoubleTap =
+                                                    targetIndex == 0 &&
+                                                            now - lastHomeTapAt in
+                                                            1..HOME_DOUBLE_TAP_MS
+
                                                 if (
+                                                    targetIndex == 0
+                                                ) {
+
+                                                    lastHomeTapAt =
+                                                        now
+                                                }
+
+                                                if (
+                                                    isHomeDoubleTap
+                                                ) {
+
+                                                    libraryViewModel
+                                                        .requestScrollToTop()
+
+                                                } else if (
                                                     targetIndex == 3
                                                 ) {
 
@@ -3215,15 +3289,12 @@ private fun SingleTabItem(
                     .clip(
                         CircleShape
                     )
-                    .clickable(
-
-                        indication = null,
-
-                        interactionSource =
-                            actualInteractionSource,
-
-                        onClick =
-                            onClick
+                    .then(
+                        Modifier.clickable(
+                            indication = null,
+                            interactionSource = actualInteractionSource,
+                            onClick = onClick,
+                        )
                     )
                     .semantics {
                         // 标签由本节点统一宣告（Icon 改为纯装饰），避免合并语义重复朗读。
