@@ -62,13 +62,21 @@ internal fun LibraryResultsContent(
         }
         return
     }
+    // 混合来源分区标题：只在**两组都真的有内容**时才显示。
+    // 本地书架为空时首页只有「服务器」一组，这个标题纯属噪音；只有本地时同理。
+    // 两组并存时它仍然是有用的分区信息（本地在前、服务器在后）。
     val sourceHeaders = remember(state.items, state.source) {
-        if (state.source != com.lanraragi.reader.data.catalog.LibrarySource.ALL) emptyMap() else
+        val localPresent = state.items.any { it.arcid.startsWith("local_") }
+        val remotePresent = state.items.any { !it.arcid.startsWith("local_") }
+        if (state.source != com.lanraragi.reader.data.catalog.LibrarySource.ALL || !localPresent || !remotePresent) {
+            emptyMap()
+        } else {
             state.items.mapIndexedNotNull { index, archive ->
                 val local = archive.arcid.startsWith("local_")
                 if (index == 0 || state.items[index - 1].arcid.startsWith("local_") != local)
                     archive.arcid to if (local) "本地书架" else "服务器" else null
             }.toMap()
+        }
     }
     PullToRefreshBox(isRefreshing = state.loading, onRefresh = vm::refresh, modifier = modifier) {
         if (state.viewMode == "list") {

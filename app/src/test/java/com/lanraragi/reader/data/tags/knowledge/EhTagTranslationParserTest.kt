@@ -30,6 +30,22 @@ class EhTagTranslationParserTest {
         assertEquals(EhTagTranslationParser.sha256("""[{"namespace":"artists","data":{"Alice":{"name":"爱丽丝","intro":"Painter"}}}]"""), imported.source?.checksumSha256)
     }
 
+    /**
+     * `rows` 是 EhTagTranslation 的**命名空间对照表**（`rows.artist = "艺术家"`、
+     * `rows.group = "团队"`、`rows.reclass = "重新分类"`），不是标签命名空间。
+     * 不排除它就会被当成 13 个普通标签导入，用户点中后生成 `rows:artist$`
+     * 这种服务器上根本不存在条件的查询（真机已复现）。
+     */
+    @Test fun rowsMappingTableIsNotImportedAsTags() {
+        val imported = EhTagTranslationParser.parseJson(
+            """{"artist":{"alice":{"name":"爱丽丝"}},"rows":{"artist":{"name":"艺术家"},"group":{"name":"团队"}}}""",
+            request(),
+        ).snapshot
+
+        assertEquals(listOf("alice"), imported.dictionary.map { it.tagKey })
+        assertTrue(imported.dictionary.none { it.namespace == "rows" })
+    }
+
     @Test fun htmlImportAcceptsEmbeddedAuthoritativeJson() {
         val imported = EhTagTranslationParser.parseHtml(
             """<script id="eh-tag-translation-data" type="application/json">[{"namespace":"female","data":{"glasses":{"name":"眼镜"}}}]</script>""",

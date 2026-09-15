@@ -9,6 +9,23 @@ data class TagKnowledgeKey(val namespace: String, val tagKey: String) {
     val fullName: String get() = if (namespace.isBlank()) tagKey else "$namespace:$tagKey"
 }
 
+/**
+ * EhTagTranslation 里**不是标签命名空间**的伪命名空间。
+ *
+ * `rows` 是它的命名空间对照表（`rows.artist = "艺术家"`、`rows.group = "团队"`、
+ * `rows.reclass = "重新分类"`），恰好就是中文社区实际在用的那套命名空间写法。
+ * 混进标签词库的后果很具体：用户搜到并点中 `rows:artist` 会生成 `rows:artist$`
+ * 这种服务器上根本不存在条件的查询（真机已复现）。
+ *
+ * 之所以解析器和排序器**各挡一次**：词库是导入时落库的，已经导入过的旧快照
+ * 不会再走一遍解析，只在解析器里排除挡不住老数据。
+ */
+val PSEUDO_DICTIONARY_NAMESPACES = setOf("rows")
+
+/** 该命名空间是否只是词库的元数据，不该作为标签参与联想。 */
+fun isPseudoDictionaryNamespace(namespace: String?): Boolean =
+    namespace != null && namespace.trim().lowercase(Locale.ROOT) in PSEUDO_DICTIONARY_NAMESPACES
+
 data class TagDictionaryRecord(
     val namespace: String = "",
     val tagKey: String,

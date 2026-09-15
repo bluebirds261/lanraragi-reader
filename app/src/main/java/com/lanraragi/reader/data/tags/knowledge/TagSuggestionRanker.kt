@@ -38,6 +38,9 @@ object TagSuggestionRanker {
         var visited = 0
         return entries.asSequence().mapNotNull { entry ->
             if (visited++ % 128 == 0) checkpoint()
+            // 词库的元数据伪命名空间（rows 对照表）不是标签；旧快照里可能还留着，
+            // 在这里挡一次，否则它会占掉候选名额甚至被用户点中。
+            if (isPseudoDictionaryNamespace(entry.namespace)) return@mapNotNull null
             val key = TagKnowledgeKey(entry.namespace, entry.tagKey)
             val total = freq[key] ?: 0L
             val personal = personalFrequency[key] ?: 0L

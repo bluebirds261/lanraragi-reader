@@ -1615,8 +1615,10 @@ fun LibraryScreen(
      * 面板还在收、图库已经「先回来了」。开合期间始终只挂载一个活跃列表。
      */
     val searchFullyOpen = searchTransition.currentState
+    // 图库页上的清除（胶囊的 ×、空结果的「清除搜索条件」）会直接改 state.filter；
+    // 同步回会话的「已提交查询」，否则下次打开搜索面会拿旧查询当草稿。
     LaunchedEffect(state.filter) {
-        if (searchSession.submitted && state.filter != searchSession.committed) searchSession.accept(state.filter)
+        if (!searchSession.expanded && state.filter != searchSession.committed) searchSession.committed = state.filter
     }
     val historyRepository = container.searchHistoryRepository
     val serverScope by remember(container) {
@@ -1650,7 +1652,8 @@ fun LibraryScreen(
     LaunchedEffect(serverScope) {
         if (previousServer != serverScope) {
             searchSession.phase = SearchPhase.CLOSED
-            searchSession.hasResults = false
+            searchSession.committed = ""
+            searchSession.draft = TextFieldValue()
             previousServer = serverScope
         }
         vm.setServerScope(serverScope)
@@ -1681,7 +1684,7 @@ fun LibraryScreen(
         overlaySuggestions = emptyList()
         suggestionsError = null
         suggestionsLoading = false
-        if (!searchExpanded || searchSession.submitted || draft.composition != null) return@LaunchedEffect
+        if (!searchExpanded || draft.composition != null) return@LaunchedEffect
         val token = SearchQueryCodec.active(draft.text, draft.selection.start).value
         if (token.isBlank()) return@LaunchedEffect
         suggestionsLoading = true
@@ -1704,6 +1707,13 @@ fun LibraryScreen(
         } catch (error: Exception) { suggestionsError = "标签联想暂不可用：${error.message}"
         } finally { suggestionsLoading = false }
     }
+    /**
+     * 提交搜索：**搜索面直接收起**，结果显示在图库页本身。
+     *
+     * 不再把结果内嵌在展开层里：真机上看下来那一层与收起后返回的首页是同一套
+     * LibraryResultsContent、同一份滚动位置、同一批操作，等于把同一个列表在两层里
+     * 各挂一次，多出来的只有一层动画和「哪一层在响应手势」的歧义。
+     */
     fun submitDraft(value: String = searchSession.draft.text) {
         if (searchSession.draft.composition != null) return
         val q = value.trim().trimEnd(',')
@@ -1718,14 +1728,10 @@ fun LibraryScreen(
         mutableStateOf(false)
     }
 
-    var showSortView by remember {
-        mutableStateOf(false)
-    }
-
-    // 排序面板要回答「这个排序字段在本库能不能生效」，所以打开时补齐一次命名空间分布。
+    // 面板要回答「这个排序字段在本库能不能生效」，所以打开时补齐一次命名空间分布。
     // 已有缓存（搜索面板开过一次）就直接用，不重复请求；取不到时不阻断任何选项。
-    LaunchedEffect(showFilter, showSortView, historyScope) {
-        if (!showFilter && !showSortView) return@LaunchedEffect
+    LaunchedEffect(showFilter, historyScope) {
+        if (!showFilter) return@LaunchedEffect
         val repository = container.searchDiscoveryRepository
         repository.namespaceCounts(historyScope)?.let {
             namespaceCounts = it
@@ -1980,6 +1986,10 @@ fun LibraryScreen(
                         LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
                             modifier = Modifier.fillMaxSize().padding(padding),
                             contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = topBarClearance, bottom = listBottomPad),
+                            // 空结果时直接回到搜索面改条件；结果本来就在这一页上，
+                            // 不需要再切一层「结果页」。
+                            onEdit = { searchSession.open(state.filter) },
+                            onClearSearch = { vm.clearQuery(); searchSession.open("") },
                             extraEmptyActions = {
                                 TextButton(onClick = { MainTabBus.requestDownloadTab(); DownloadSubTabBus.local.value = true }) { Text("扫描本地文件") }
                                 TextButton(onClick = { urlImportText = ""; showUrlImport = true }) { Text("上传到服务器") }
@@ -2063,7 +2073,7 @@ fun LibraryScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
 
-            // One 48dp glass shell, with separate filter and search hit targets.
+            // One 48dp glass shell: 搜索区 + 最右侧一个「排序与筛选」键。
             LiquidGlassSearchBar(
                 value = state.filter,
                 // 只读模式下组件不会产生输入变更：value 只会被置空，
@@ -2082,29 +2092,15 @@ fun LibraryScreen(
                 readOnly = true,
                 capsuleClickable = true,
                 clearContentDescription = "清除搜索词",
+                // 结果就在图库页上，所以数量也放在这条胶囊里；不额外占一行。
+                // 总数未知（请求中 / 服务器没给）时不显示，避免先亮出上一轮的旧数字。
+                trailingLabel =
+                    state.total?.takeIf { state.filter.isNotBlank() }?.let { "共 $it 项" },
                 height = topBarCapsuleHeight,
-                leading = {
-                    // 与搜索区共享同一个玻璃壳，但各自保留点击区与无障碍语义。
-                    // 高度跟随胶囊，点击区因此也是整条高度。
-                    //
-                    // 两个键，因为这是两个决策：「排序与视图」决定怎么排、怎么显示，
-                    // 「筛选」决定看哪些。混成一个入口时用户为了换个列数要先越过一整屏筛选条件。
-                    Box(
-                        modifier = Modifier
-                            .fillMaxHeight()
-                            .width(topBarCapsuleHeight)
-                            .clip(CircleShape)
-                            .clickable {
-                                showSortView = true
-                            },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Tune,
-                            contentDescription = "排序与视图",
-                            modifier = Modifier.size(20.dp),
-                        )
-                    }
+                trailing = {
+                    // 排序 / 视图 / 筛选合并成一个键：它们都是「怎么看这个库」的同一次决策，
+                    // 拆成两个键时用户为了换个列数要先越过一整屏筛选条件。
+                    // 放在最右侧（主操作侧），图标沿用「排序与视图」的 Tune。
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
@@ -2116,10 +2112,11 @@ fun LibraryScreen(
                         contentAlignment = Alignment.Center,
                     ) {
                         Icon(
-                            imageVector = Icons.Filled.FilterList,
-                            contentDescription = "筛选",
+                            imageVector = Icons.Filled.Tune,
+                            contentDescription = "排序与筛选",
                             modifier = Modifier.size(20.dp),
                         )
+                        // 条件圆点：有生效中的筛选 / 非默认范围时提醒一次。
                         if (state.categoryId.isNotBlank() || state.selectedTags.isNotEmpty() || state.newOnly || state.untaggedOnly || state.hideCompleted || state.source != LibrarySource.ALL) {
                             Box(Modifier.align(Alignment.TopEnd).padding(8.dp).size(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
                         }
@@ -2132,19 +2129,9 @@ fun LibraryScreen(
         }
 
         // ================================================================
-        // 搜索面（EhViewer 式原地展开；结果内嵌其中，不再有独立搜索页）
+        // 搜索面（EhViewer 式原地展开）：只负责输入、联想、历史与热门；
+        // 提交后**直接收起**，结果显示在图库页本身。
         // ================================================================
-        val sortNote =
-            SORT_OPTIONS
-                .firstOrNull { it.first == state.sortby }
-                ?.let {
-                    (value, _) ->
-                    LibrarySortResolver.shortNote(
-                        value,
-                        LibrarySortResolver.report(value, namespaceCounts),
-                    )
-                }
-
         LibrarySearchOverlay(
             session = searchSession, visibility = searchTransition,
             onSubmit = { submitDraft() },
@@ -2174,16 +2161,7 @@ fun LibraryScreen(
             hotTags = overlayHotTags, hotLoading = hotLoading, hotError = hotError, hotUpdated = hotUpdated, hotLocal = localDiscovery,
             onRetryHot = { hotRevision++ },
             onOpenDictionary = { searchSession.phase = SearchPhase.CLOSED; MainTabBus.requestSettingsTab() },
-            state = state, onClearSelection = vm::exitSelection, onOpenFilters = { showFilter = true },
-            onOpenSortView = { showSortView = true },
-            onClearSearch = { vm.clearQuery(); searchSession.open("") }, sortNote = sortNote, backdrop = backdrop,
-            resultsContent = { modifier ->
-                LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
-                    modifier = modifier, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp,
-                        bottom = if (state.selectedIds.isNotEmpty()) 100.dp else 24.dp),
-                    onEdit = { searchSession.phase = SearchPhase.EDITING },
-                    onClearSearch = { vm.clearQuery(); searchSession.open("") })
-            },
+            backdrop = backdrop,
         )
         if (searchExpanded) SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding())
 
@@ -2219,10 +2197,10 @@ fun LibraryScreen(
     }
 
     // ================================================================
-    // 筛选面板（搜什么 / 只看哪一类）
+    // 排序 / 视图 / 筛选合并面板（顶栏胶囊最右侧那一个键）
     // ================================================================
     if (showFilter) {
-        FilterSheet(
+        LibraryOptionsSheet(
             state = state,
             vm = vm,
             onDismiss = {
@@ -2235,16 +2213,6 @@ fun LibraryScreen(
             onOpenCategoryManager = {
                 showFilter = false
                 showCategoryManager = true
-            },
-        )
-    }
-
-    if (showSortView) {
-        SortViewSheet(
-            state = state,
-            vm = vm,
-            onDismiss = {
-                showSortView = false
             },
             namespaceCounts = namespaceCounts,
         )
@@ -2989,28 +2957,28 @@ private fun PresetSummaryChip(text: String) {
     }
 }
 
-/**
- * 「排序与视图」独立面板。
- *
- * 为什么和「筛选」分开：排序字段、排序方向、视图模式、网格大小回答的是「怎么排、怎么显示」，
- * 与「搜什么 / 只看哪一类」不是同一个决策。混在一个面板里，用户既不容易找到排序，
- * 每次只想换个列数也要先越过一整屏筛选条件 —— EhViewer 把视图切换藏在设置页、
- * JHenTai 的搜索页干脆没有排序入口，都是同一类问题的不同表现。
- *
- * 入口有两处：收起态顶栏胶囊左侧的「排序与视图」键，以及搜索结果头的排序键。
- */
 @OptIn(
     ExperimentalMaterial3Api::class,
     ExperimentalLayoutApi::class,
 )
 @Composable
-private fun SortViewSheet(
+private fun LibraryOptionsSheet(
     state: LibraryState,
     vm: LibraryViewModel,
     onDismiss: () -> Unit,
+    onOpenPresets: () -> Unit,
+    onOpenCategoryManager: () -> Unit,
     /** 服务器命名空间分布；null 表示未知，此时所有排序字段一律可选用。 */
     namespaceCounts: Map<String, Int>? = null,
 ) {
+    var showSave by remember {
+        mutableStateOf(false)
+    }
+
+    var presetName by remember {
+        mutableStateOf("")
+    }
+
     val sheetState =
         rememberModalBottomSheetState()
 
@@ -3029,23 +2997,44 @@ private fun SortViewSheet(
                 .padding(bottom = 24.dp),
         ) {
 
+            // ============================================================
+            // 标题栏
+            // ============================================================
             Row(
                 verticalAlignment =
                     Alignment.CenterVertically,
             ) {
 
                 Text(
-                    "排序与视图",
+                    "排序与筛选",
                     style =
                         MaterialTheme.typography.titleMedium,
                     modifier =
                         Modifier.weight(1f),
                 )
 
-                TextButton(
-                    onClick = onDismiss,
+                IconButton(
+                    onClick = onOpenPresets,
                 ) {
-                    Text("完成")
+                    Icon(
+                        Icons.Filled.Bookmark,
+                        contentDescription = "预设",
+                    )
+                }
+
+                TextButton(
+                    onClick = {
+                        presetName = ""
+                        showSave = true
+                    }
+                ) {
+                    Text("保存")
+                }
+
+                TextButton(
+                    onClick = vm::clearFilters
+                ) {
+                    Text("清除")
                 }
             }
 
@@ -3125,8 +3114,8 @@ private fun SortViewSheet(
                 }
             }
 
-            // 只列出「本库没有该命名空间」的字段，并把服务端实际使用的相近写法一并给出，
-            // 让用户知道不是应用坏了，而是库里根本没有这一套标签。
+            // 只点名「本库没有该命名空间」的字段。文案压到一行：带警示图标的那几个
+            // 已经说明了问题，这里只需要给出服务端实际在用的写法。
             val ineffectiveSorts =
                 SORT_OPTIONS.filter {
                     (value, _) ->
@@ -3137,16 +3126,16 @@ private fun SortViewSheet(
 
             if (ineffectiveSorts.isNotEmpty()) {
                 Text(
-                    ineffectiveSorts.joinToString("、") { (value, label) ->
-                        LibrarySortResolver.explain(
-                            value,
-                            label,
-                            LibrarySortResolver.report(value, namespaceCounts),
-                        ) ?: label
-                    } + "。",
+                    ineffectiveSorts.joinToString("、") { (value, _) ->
+                        LibrarySortResolver
+                            .report(value, namespaceCounts)
+                            .similarNamespace
+                            ?.let { ns -> "$value→$ns" }
+                            ?: value
+                    } + "：本库无此命名空间，排序不生效",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 6.dp),
+                    modifier = Modifier.padding(top = 4.dp),
                 )
             }
 
@@ -3155,16 +3144,28 @@ private fun SortViewSheet(
             )
 
             // ============================================================
-            // 视图模式（排在网格大小之前：先定「怎么显示」，再定「一行几本」）
-            // 三选一是典型的分段控件场景，等宽铺满比三个散落的 Chip 更像「模式切换」。
+            // 视图 / 列数
+            // 先定「怎么显示」，再定「一行几本」；列表视图下每行固定一本，
+            // 列数不参与布局，因此置灰并说明，避免出现「改了没反应」的控件。
             // ============================================================
-            Text(
-                "视图模式",
-                style =
-                    MaterialTheme.typography.labelMedium,
-                color =
-                    MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "视图",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+
+                val columnsEffective = state.viewMode != "list"
+
+                Text(
+                    text = if (columnsEffective) "${state.columns} 列" else "列表不分列",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
 
             Spacer(
                 Modifier.height(8.dp)
@@ -3172,8 +3173,8 @@ private fun SortViewSheet(
 
             SegmentedControl(
                 segments = listOf(
-                    Segment("松散网格", Icons.Filled.GridView),
-                    Segment("紧凑网格", Icons.Filled.GridOn),
+                    Segment("松散", Icons.Filled.GridView),
+                    Segment("紧凑", Icons.Filled.GridOn),
                     Segment("列表", Icons.AutoMirrored.Filled.ViewList),
                 ),
                 selectedIndex = when (state.viewMode) {
@@ -3194,34 +3195,6 @@ private fun SortViewSheet(
             )
 
             Spacer(
-                Modifier.height(16.dp)
-            )
-
-            // ============================================================
-            // 网格大小
-            // 列表视图下每行固定一本，列数不参与布局，因此置灰并在右侧说明，
-            // 避免出现「改了没反应」的控件。2..8 用等宽分段一次点到位，比 7 个 Chip 更省空间。
-            // ============================================================
-            val columnsEffective = state.viewMode != "list"
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "网格大小",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                )
-
-                Text(
-                    text = if (columnsEffective) "${state.columns} 列" else "列表视图不适用",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Spacer(
                 Modifier.height(8.dp)
             )
 
@@ -3230,118 +3203,38 @@ private fun SortViewSheet(
                 selectedIndex = (state.columns - 2).coerceIn(0, 6),
                 onSelect = { vm.setColumns(it + 2) },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = columnsEffective,
+                enabled = state.viewMode != "list",
                 compact = true,
             )
 
             Spacer(
                 Modifier.height(12.dp)
             )
-        }
-    }
-}
-
-@OptIn(
-    ExperimentalMaterial3Api::class,
-    ExperimentalLayoutApi::class,
-)
-@Composable
-private fun FilterSheet(
-    state: LibraryState,
-    vm: LibraryViewModel,
-    onDismiss: () -> Unit,
-    onOpenPresets: () -> Unit,
-    onOpenCategoryManager: () -> Unit,
-) {
-    var showSave by remember {
-        mutableStateOf(false)
-    }
-
-    var presetName by remember {
-        mutableStateOf("")
-    }
-
-    val sheetState =
-        rememberModalBottomSheetState()
-
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState,
-    ) {
-
-        Column(
-            Modifier
-                .fillMaxWidth()
-                .verticalScroll(
-                    rememberScrollState()
-                )
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 24.dp),
-        ) {
 
             // ============================================================
-            // 标题栏
+            // 范围
             // ============================================================
-            Row(
-                verticalAlignment =
-                    Alignment.CenterVertically,
-            ) {
-
-                Text(
-                    "筛选",
-                    style =
-                        MaterialTheme.typography.titleMedium,
-                    modifier =
-                        Modifier.weight(1f),
-                )
-
-                IconButton(
-                    onClick = onOpenPresets,
-                ) {
-                    Icon(
-                        Icons.Filled.Bookmark,
-                        contentDescription = "预设",
-                    )
-                }
-
-                TextButton(
-                    onClick = {
-                        presetName = ""
-                        showSave = true
-                    }
-                ) {
-                    Text("保存")
-                }
-
-                TextButton(
-                    onClick = vm::clearFilters
-                ) {
-                    Text("清除")
-                }
-            }
-
-            Text("搜索范围", style = MaterialTheme.typography.titleSmall)
+            Text("范围", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(4.dp))
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 LibrarySource.entries.forEach { source ->
                     FilterChip(selected = state.source == source, onClick = { vm.setSource(source) },
                         label = { Text(when (source) { LibrarySource.ALL -> "全部"; LibrarySource.REMOTE -> "服务器"; LibrarySource.LOCAL -> "本地" }) })
                 }
             }
-            if (state.source == LibrarySource.ALL) Text("按来源分组：本地在前，服务器在后，各组沿用当前排序。", style = MaterialTheme.typography.labelSmall)
 
             // ============================================================
-            // 当前筛选条件
+            // 已选条件（只列可单独移除的：标签与分类）
             // ============================================================
             if (
                 state.selectedTags.isNotEmpty() ||
-                state.categoryId.isNotEmpty() ||
-                state.newOnly ||
-                state.untaggedOnly ||
-                state.hideCompleted
+                state.categoryId.isNotEmpty()
             ) {
 
+                Spacer(Modifier.height(12.dp))
+
                 Text(
-                    "当前筛选",
+                    "已选",
                     style =
                         MaterialTheme.typography.labelMedium,
                     color =
@@ -3390,55 +3283,20 @@ private fun FilterSheet(
                             },
                         )
                     }
-
-                    if (state.newOnly) {
-
-                        FilterChip(
-                            selected = true,
-                            onClick = vm::toggleNewOnly,
-                            label = {
-                                Text("新增")
-                            },
-                        )
-                    }
-
-                    if (state.untaggedOnly) {
-
-                        FilterChip(
-                            selected = true,
-                            onClick = vm::toggleUntaggedOnly,
-                            label = {
-                                Text("无标签")
-                            },
-                        )
-                    }
-
-                    if (state.hideCompleted) {
-
-                        FilterChip(
-                            selected = true,
-                            onClick = vm::toggleHideCompleted,
-                            label = {
-                                Text("隐藏读完")
-                            },
-                        )
-                    }
                 }
-
-                Spacer(
-                    Modifier.height(12.dp)
-                )
             }
 
             // ============================================================
-            // 分类
+            // 分类与状态
+            // 两者都是「只看哪一类」的同一个决策，放同一行 chips：分类在前、状态在后，
+            // 既省一个标题，也不必让用户在两处找同一个开关。
             // ============================================================
             Row(
                 verticalAlignment =
                     Alignment.CenterVertically,
             ) {
                 Text(
-                    "分类",
+                    "分类 / 状态",
                     style =
                         MaterialTheme.typography.labelMedium,
                     color =
@@ -3537,8 +3395,8 @@ private fun FilterSheet(
                 Text(
                     when {
                         state.markingAllRead -> "标已读中…"
-                        loadedNewCount > 0 -> "全部标为已读（$loadedNewCount）"
-                        else -> "全部标为已读"
+                        loadedNewCount > 0 -> "全部已读（$loadedNewCount）"
+                        else -> "全部已读"
                     },
                 )
             }

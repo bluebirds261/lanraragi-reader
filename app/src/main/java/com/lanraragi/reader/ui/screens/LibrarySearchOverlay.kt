@@ -33,7 +33,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
@@ -87,10 +86,7 @@ fun LibrarySearchOverlay(
     suggestions: List<TagCandidate>, suggestionsLoading: Boolean, suggestionsError: String?,
     hotTags: List<TagStat>, hotLoading: Boolean, hotError: String?, hotUpdated: String?, hotLocal: Boolean,
     onRetryHot: () -> Unit, onOpenDictionary: () -> Unit,
-    state: LibraryState, onClearSelection: () -> Unit, onOpenFilters: () -> Unit, onOpenSortView: () -> Unit, onClearSearch: () -> Unit,
-    /** 当前排序字段在本库不生效时的短提示（见 LibrarySortResolver），null 表示不提示。 */
-    sortNote: String? = null,
-    backdrop: Backdrop?, resultsContent: @Composable (Modifier) -> Unit,
+    backdrop: Backdrop?,
 ) {
     val view = LocalView.current
     val lightSurface = MaterialTheme.colorScheme.background.luminance() > 0.5f
@@ -121,16 +117,17 @@ fun LibrarySearchOverlay(
     var suggestionsExpanded by rememberSaveable { mutableStateOf(false) }
     var historyMenu by remember { mutableStateOf(false) }
     var hotMenu by remember { mutableStateOf(false) }
-    var resultMenu by remember { mutableStateOf(false) }
     val imeVisible = WindowInsets.isImeVisible
+    /*
+     * 返回优先级：先退出历史管理模式，再收起搜索面。
+     *
+     * 多选不在这里处理：结果现在显示在图库页上，长按进入多选也发生在那一层，
+     * 搜索面展开时只会盖住输入区，不该替底层吞掉一次返回。
+     */
     val back: () -> Unit = {
         keyboard?.hide()
         focusManager.clearFocus()
-        when {
-            managing -> managing = false
-            state.selectedIds.isNotEmpty() -> if (!state.batchBusy) onClearSelection()
-            else -> session.back()
-        }
+        if (managing) managing = false else session.back()
     }
     BackHandler(visibility.currentState || visibility.targetState) {
         if (imeVisible) { keyboard?.hide(); focusManager.clearFocus() } else back()
@@ -194,7 +191,6 @@ fun LibrarySearchOverlay(
                         keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
                         modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).wrapContentHeight()
                             .focusRequester(focusRequester)
-                            .onFocusChanged { if (it.isFocused && session.submitted) session.phase = SearchPhase.EDITING }
                             .onPreviewKeyEvent { event ->
                                 if (event.type != KeyEventType.KeyUp) return@onPreviewKeyEvent false
                                 when (event.key) {
@@ -220,7 +216,7 @@ fun LibrarySearchOverlay(
                 IconButton(onClick = onSubmit, enabled = query.isNotBlank() && session.draft.composition == null,
                     modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Search, "提交搜索", Modifier.size(20.dp)) }
             }
-            if (!session.submitted && conditions.isNotEmpty()) {
+            if (conditions.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     conditions.forEach { clause ->
                         SearchChip(text = translatedQuery(query.substring(clause.start, clause.end)) + " ×", onClick = {
@@ -232,33 +228,7 @@ fun LibrarySearchOverlay(
                 }
             }
             session.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(8.dp)) }
-            if (session.submitted || (!visibility.targetState && session.hasResults)) {
-                Row(Modifier.fillMaxWidth().padding(start = 6.dp).heightIn(min = 36.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Text(if (state.loading) "搜索中…" else state.total?.let { "$it 项结果" }
-                        ?: "已加载 ${state.items.size} 项", Modifier.weight(1f),
-                        style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp), color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    IconButton(onClick = onOpenSortView, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.Tune, "排序与视图", Modifier.size(18.dp))
-                    }
-                    IconButton(onClick = onOpenFilters, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.FilterList, "筛选", Modifier.size(18.dp))
-                    }
-                    Box {
-                        IconButton(onClick = { resultMenu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "结果选项", Modifier.size(18.dp)) }
-                        DropdownMenu(resultMenu, { resultMenu = false }) {
-                            DropdownMenuItem(text = { Text("已加载 ${state.items.size} 项", fontSize = 12.sp) }, enabled = false, onClick = {})
-                            DropdownMenuItem(text = { Text(if (sortNote == null) searchScopeSummary(state) else "$sortNote\n${searchScopeSummary(state)}", fontSize = 12.sp) }, onClick = { resultMenu = false; onOpenFilters() })
-                            DropdownMenuItem(text = { Text("清除搜索") }, onClick = { resultMenu = false; onClearSearch() })
-                        }
-                    }
-                }
-                if (state.selectedIds.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("已选 ${state.selectedIds.size} 项")
-                    TextButton(onClick = onClearSelection, enabled = !state.batchBusy) { Text("退出多选") }
-                }
-                resultsContent(Modifier.weight(1f).fillMaxWidth())
-            } else {
-                LazyColumn(state = suggestionListState, modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth().weight(1f),
+            LazyColumn(state = suggestionListState, modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth().weight(1f),
                     contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (query.isNotBlank()) {
                         item("direct") { SearchSuggestionRow("搜索「$query」", onClick = onSubmit, searchIcon = true) }
@@ -438,7 +408,6 @@ fun LibrarySearchOverlay(
                         } else if (!hotLoading && hotError == null) item("hot-empty") { Text("暂无标签", Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                 }
-            }
         }
     }
     clearHistory?.let { legacy -> AlertDialog(onDismissRequest = { clearHistory = null },
@@ -498,21 +467,6 @@ fun LibrarySearchOverlay(
         }
     }
 }
-
-internal fun searchScopeSummary(state: LibraryState): String = buildList {
-    add(when (state.source) {
-        com.lanraragi.reader.data.catalog.LibrarySource.LOCAL -> "本地书架"
-        com.lanraragi.reader.data.catalog.LibrarySource.REMOTE -> "服务器"
-        else -> "全部来源（分组）"
-    })
-    if (state.categoryId.isNotBlank()) add(state.categories.firstOrNull { it.id == state.categoryId }?.name ?: "当前分类")
-    if (state.newOnly) add("仅新档案")
-    if (state.untaggedOnly) add("无标签")
-    if (state.hideCompleted) add("隐藏读完")
-    if (state.selectedTags.isNotEmpty()) add(state.selectedTags.joinToString("、"))
-    add((when (state.sortby) { "title" -> "标题"; "lastread" -> "最近阅读"; "date_added" -> "添加日期"; "artist" -> "作者"; "language" -> "语言"; "series" -> "系列"; else -> state.sortby }) +
-        if (state.order.equals("desc", true)) "降序" else "升序")
-}.joinToString(" · ")
 
 @Composable private fun translatedQuery(query: String): String {
     val values = mutableListOf<String>()

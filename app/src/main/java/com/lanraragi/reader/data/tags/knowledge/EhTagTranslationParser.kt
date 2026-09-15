@@ -62,7 +62,7 @@ object EhTagTranslationParser {
                             skipped += appendTagMap(namespace, values as? JsonObject, request.version, records)
                         }
                         else -> root.forEach { (namespace, values) ->
-                            if (namespace !in ROOT_METADATA_KEYS) {
+                            if (namespace !in ROOT_METADATA_KEYS && namespace.lowercase() !in PSEUDO_NAMESPACES) {
                                 skipped += appendTagMap(namespace, values as? JsonObject, request.version, records)
                             }
                         }
@@ -183,6 +183,23 @@ object EhTagTranslationParser {
         .replace("&gt;", ">")
 
     private val ROOT_METADATA_KEYS = setOf("version", "schemaversion", "updatedat", "license", "source")
+
+    /**
+     * EhTagTranslation 顶层里**不是标签命名空间**的键。
+     *
+     * `rows` 是它的命名空间对照表：`rows.artist = "艺术家"`、`rows.group = "团队"`、
+     * `rows.reclass = "重新分类"` …… 恰好就是中文社区实际在用的那套命名空间写法。
+     * 不排除它就会被当成 13 个普通标签导入（`rows:artist` → 艺术家），
+     * 用户点中后生成 `rows:artist$` 这种服务器上根本不存在条件的查询（真机已复现）。
+     *
+     * 与 [PSEUDO_DICTIONARY_NAMESPACES] 共用同一份定义；那里是给**已经导入过**的
+     * 旧快照兜底用的（见该常量注释）。
+     *
+     * 这张表本身是有价值的输入（命名空间中英归一要以它为准），等归一功能落地时
+     * 会由解析器单独读取，而不是混进标签词库。
+     */
+    private val PSEUDO_NAMESPACES = PSEUDO_DICTIONARY_NAMESPACES
+
     private val EMBEDDED_JSON = Regex(
         "<script[^>]*(?:id=[\"']eh-tag-translation-data[\"']|type=[\"']application/json[\"'])[^>]*>(.*?)</script>",
         setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL),

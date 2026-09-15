@@ -86,6 +86,18 @@ fun LiquidGlassSearchBar(
      */
     leading: (@Composable RowScope.() -> Unit)? = null,
     /*
+     * 合并进胶囊右侧的按键槽位（自带点击区），例如库页的「排序与视图」。
+     * 与 [leading] 对称；两者可以只用一个。放在右侧时搜索文字自然左对齐，
+     * 也符合「主操作在右」的拇指可达性。
+     */
+    trailing: (@Composable RowScope.() -> Unit)? = null,
+    /*
+     * 只读形态下贴在文字右侧的补充说明（例如结果数量）。用 onSurfaceVariant 着色、
+     * 不参与点击，与查询串本身区分开 —— 不把「1494 项」混进 [value] 里，
+     * 否则清除按钮、语义描述和摘要都会跟着带上它。
+     */
+    trailingLabel: String? = null,
+    /*
      * 胶囊高度。库页顶栏用 48.dp（比原来的 40.dp 更高一点，触控更从容）。
      */
     height: Dp = 48.dp,
@@ -116,7 +128,7 @@ fun LiquidGlassSearchBar(
                     // 40dp 点击区，只剩一点视觉间距。
                     .padding(
                         start = if (leading == null) 12.dp else 8.dp,
-                        end = 12.dp,
+                        end = if (trailing == null) 12.dp else 4.dp,
                     ),
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -142,6 +154,24 @@ fun LiquidGlassSearchBar(
                         },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+
+                trailingLabel?.takeIf { it.isNotBlank() }?.let { label ->
+                    Spacer(
+                        modifier = Modifier.width(6.dp),
+                    )
+
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                Spacer(
                     modifier = Modifier.weight(1f),
                 )
 
@@ -199,5 +229,7 @@ fun LiquidGlassSearchBar(
                 }
             }
         }
+
+        trailing?.invoke(this)
     }
 }
