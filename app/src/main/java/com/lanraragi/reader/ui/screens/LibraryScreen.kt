@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -98,9 +99,8 @@ import androidx.compose.material3.SnackbarResult
 import com.lanraragi.reader.data.catalog.SearchQueryCodec
 import com.lanraragi.reader.data.SearchDiscoveryRepository
 import com.lanraragi.reader.data.catalog.RoomLibraryLocalGateway
-import com.lanraragi.reader.data.tags.knowledge.TagSuggestion
-import com.lanraragi.reader.data.tags.knowledge.TagDictionaryRecord
-import com.lanraragi.reader.data.tags.knowledge.TagMatchQuality
+import com.lanraragi.reader.data.tags.knowledge.TagCandidate
+import com.lanraragi.reader.data.tags.knowledge.TagCandidateBuilder
 import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeKey
 import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import androidx.lifecycle.ViewModel
@@ -122,6 +122,7 @@ import com.lanraragi.reader.data.model.FilterPreset
 import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.data.catalog.LibraryQuery
 import com.lanraragi.reader.data.catalog.LibrarySort
+import com.lanraragi.reader.data.catalog.LibrarySortResolver
 import com.lanraragi.reader.data.catalog.SortDirection
 import com.lanraragi.reader.data.catalog.LibrarySource
 import com.lanraragi.reader.data.catalog.archiveActionTargets
@@ -181,6 +182,27 @@ private val SORT_OPTIONS = listOf(
     "language" to "语言",
     "series" to "系列",
 )
+
+/**
+ * 联想候选上限。
+ *
+ * 与 JHenTai 的 `limit: 100`、EhViewer 的 `.take(50)` 相比刻意收紧：这里一次算完但
+ * **默认只展示 [LibrarySearchOverlay] 的前若干行**，多出来的由「更多」展开 ——
+ * 键盘打开时首屏要留给真正可能被点到的候选。
+ */
+private const val SUGGESTION_LIMIT = 40
+
+/**
+ * 本地书架的标签频次（与「热门标签」同一口径）。
+ *
+ * 本地来源没有 `/api/database/stats`，只能从本地索引里自己数；粉丝册（TANK_）的
+ * 成员标签不在这里展开，与服务端 `build_tag_stats` 的口径一致。
+ */
+private suspend fun localTagStats(container: AppContainer): List<TagStat> =
+    RoomLibraryLocalGateway(container.readerDatabase).fetch().flatMap { it.tags.distinct() }
+        .groupingBy { it }.eachCount().map { (full, count) ->
+            TagStat(if (':' in full) full.substringBefore(':') else null, full.substringAfter(':'), count)
+        }
 
 // ================================================================
 // D2 批量刮削参数
@@ -1601,7 +1623,7 @@ fun LibraryScreen(
     val legacyHistory by historyRepository.history.collectAsStateWithLifecycle(initialValue = emptyList())
     val historyHidden by historyRepository.hidden.collectAsStateWithLifecycle(initialValue = false)
     val historyPaused by historyRepository.paused.collectAsStateWithLifecycle(initialValue = false)
-    var overlaySuggestions by remember(historyScope) { mutableStateOf<List<TagSuggestion>>(emptyList()) }
+    var overlaySuggestions by remember(historyScope) { mutableStateOf<List<TagCandidate>>(emptyList()) }
     var suggestionsLoading by remember { mutableStateOf(false) }
     var suggestionsError by remember { mutableStateOf<String?>(null) }
     var overlayHotTags by remember(historyScope) { mutableStateOf<List<TagStat>>(emptyList()) }
@@ -1609,6 +1631,15 @@ fun LibraryScreen(
     var hotError by remember(historyScope) { mutableStateOf<String?>(null) }
     var hotUpdated by remember(historyScope) { mutableStateOf<String?>(null) }
     var hotRevision by remember { mutableStateOf(0) }
+    /**
+     * 服务器上每个命名空间的标签条数（键小写），用来判断「排序字段在当前库上到底有没有生效」。
+     *
+     * 服务端把 `sortby` 当成字面正则去标签串里匹配命名空间（LANraragi 0.9.81
+     * `Model/Search.pm:576,595`）：库里没有该命名空间时既不报错也不退回上一个顺序，
+     * 只是把全部条目按 Redis 索引的任意顺序返回。详见 [LibrarySortResolver]。
+     * null 表示尚未取到统计，此时不阻断任何排序选项。
+     */
+    var namespaceCounts by remember(historyScope) { mutableStateOf<Map<String, Int>?>(null) }
     val libraryRevision by LibraryRefreshBus.tick.collectAsStateWithLifecycle()
     var previousServer by rememberSaveable { mutableStateOf(serverScope) }
     LaunchedEffect(serverScope) {
@@ -1629,14 +1660,10 @@ fun LibraryScreen(
             cached?.let { overlayHotTags = it.tags }
             val snapshot = if (cached != null && !localDiscovery && hotRevision == 0 && libraryRevision == 0 &&
                 System.currentTimeMillis() - cached.updatedAt < SearchDiscoveryRepository.TTL) cached else {
-                val tags = if (localDiscovery) {
-                    RoomLibraryLocalGateway(container.readerDatabase).fetch().flatMap { it.tags.distinct() }
-                        .groupingBy { it }.eachCount().map { (full, count) ->
-                            TagStat(if (':' in full) full.substringBefore(':') else null, full.substringAfter(':'), count)
-                        }
-                } else container.repository.getTags()
+                val tags = if (localDiscovery) localTagStats(container) else container.repository.getTags()
                 repository.save(historyScope, tags)
             }
+            namespaceCounts = snapshot.namespaces
             overlayHotTags = snapshot.tags
             hotUpdated = "更新于 " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
                 .format(java.util.Date(snapshot.updatedAt))
@@ -1658,13 +1685,15 @@ fun LibraryScreen(
             val personal = overlayHistory.flatMap { SearchQueryCodec.parse(it) }.groupingBy {
                 TagKnowledgeKey(if (':' in it.value) it.value.substringBefore(':') else "", it.value.substringAfter(':'))
             }.eachCount().mapValues { it.value.toLong() }
-            val known = container.tagKnowledgeRepository.suggestions(token.removeSuffix(":"), personalFrequency = personal, limit = 24)
-            val fallback = overlayHotTags.filter { it.full.contains(token, true) }.take(24).map { tag ->
-                TagSuggestion(TagDictionaryRecord(tag.namespace.orEmpty(), tag.text, dataVersion = "server-cache"),
-                    if (tag.full.startsWith(token, true)) TagMatchQuality.CANONICAL_PREFIX else TagMatchQuality.CANONICAL_CONTAINS,
-                    tag.weight.toDouble(), tag.weight.toLong(), 0L)
-            }
-            overlaySuggestions = (known + fallback).distinctBy { it.entry.namespace to it.entry.tagKey }.take(24)
+            // 词库按去尾冒号的写法查（`language:` 要能列出该命名空间下的标签），
+            // 但合并排序交给 TagCandidateBuilder，用完整 token 才能识别命名空间限定。
+            val known = container.tagKnowledgeRepository.suggestions(token.removeSuffix(":"), personalFrequency = personal, limit = SUGGESTION_LIMIT)
+            overlaySuggestions = TagCandidateBuilder.build(
+                token = token,
+                dictionary = known,
+                libraryTags = overlayHotTags,
+                limit = SUGGESTION_LIMIT,
+            )
             if (known.isEmpty() && container.tagKnowledgeRepository.current() == null) suggestionsError = "尚未安装标签词库；可用库内标签或直接搜索"
         } catch (cancelled: CancellationException) { throw cancelled
         } catch (error: Exception) { suggestionsError = "标签联想暂不可用：${error.message}"
@@ -1682,6 +1711,21 @@ fun LibraryScreen(
 
     var showFilter by remember {
         mutableStateOf(false)
+    }
+
+    // 排序面板要回答「这个排序字段在本库能不能生效」，所以打开时补齐一次命名空间分布。
+    // 已有缓存（搜索面板开过一次）就直接用，不重复请求；取不到时不阻断任何选项。
+    LaunchedEffect(showFilter, historyScope) {
+        if (!showFilter) return@LaunchedEffect
+        val repository = container.searchDiscoveryRepository
+        repository.namespaceCounts(historyScope)?.let {
+            namespaceCounts = it
+            return@LaunchedEffect
+        }
+        runCatching {
+            val tags = if (localDiscovery) localTagStats(container) else container.repository.getTags()
+            namespaceCounts = repository.save(historyScope, tags).namespaces
+        }
     }
 
     var showPresetPanel by remember {
@@ -2022,6 +2066,17 @@ fun LibraryScreen(
         // ================================================================
         // 搜索面（EhViewer 式原地展开；结果内嵌其中，不再有独立搜索页）
         // ================================================================
+        val sortNote =
+            SORT_OPTIONS
+                .firstOrNull { it.first == state.sortby }
+                ?.let {
+                    (value, _) ->
+                    LibrarySortResolver.shortNote(
+                        value,
+                        LibrarySortResolver.report(value, namespaceCounts),
+                    )
+                }
+
         LibrarySearchOverlay(
             session = searchSession, visibility = searchTransition,
             onSubmit = { submitDraft() },
@@ -2052,7 +2107,7 @@ fun LibraryScreen(
             onRetryHot = { hotRevision++ },
             onOpenDictionary = { searchSession.phase = SearchPhase.CLOSED; MainTabBus.requestSettingsTab() },
             state = state, onClearSelection = vm::exitSelection, onOpenFilters = { showFilter = true },
-            onClearSearch = { vm.clearQuery(); searchSession.open("") }, backdrop = backdrop,
+            onClearSearch = { vm.clearQuery(); searchSession.open("") }, sortNote = sortNote, backdrop = backdrop,
             resultsContent = { modifier ->
                 LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
                     modifier = modifier, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp,
@@ -2112,6 +2167,7 @@ fun LibraryScreen(
                 showFilter = false
                 showCategoryManager = true
             },
+            namespaceCounts = namespaceCounts,
         )
     }
 
@@ -2865,6 +2921,8 @@ private fun FilterSheet(
     onDismiss: () -> Unit,
     onOpenPresets: () -> Unit,
     onOpenCategoryManager: () -> Unit,
+    /** 服务器命名空间分布；null 表示未知，此时所有排序字段一律可选用。 */
+    namespaceCounts: Map<String, Int>? = null,
 ) {
     var showSave by remember {
         mutableStateOf(false)
@@ -3082,17 +3140,66 @@ private fun FilterSheet(
                 SORT_OPTIONS.forEach {
                         (value, label) ->
 
+                    // 服务端把 sortby 当字面正则匹配命名空间：库里没有该命名空间时，
+                    // 「排序」既不报错也不退回上一个顺序，只给出任意顺序。这里提前标出来，
+                    // 不让用户在「看起来变了、其实随机」的结果里猜。
+                    val report =
+                        LibrarySortResolver.report(
+                            value,
+                            namespaceCounts,
+                        )
+
                     FilterChip(
                         selected =
                             state.sortby == value,
+                        leadingIcon =
+                            if (report.ineffective) {
+                                {
+                                    Icon(
+                                        Icons.Filled.Warning,
+                                        contentDescription = "该排序字段在本库不生效",
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            } else {
+                                null
+                            },
                         onClick = {
                             vm.setSort(value)
+                            LibrarySortResolver
+                                .explain(value, label, report)
+                                ?.let(vm::showMessage)
                         },
                         label = {
                             Text(label)
                         },
                     )
                 }
+            }
+
+            // 只列出「本库没有该命名空间」的字段，并把服务端实际使用的相近写法一并给出，
+            // 让用户知道不是应用坏了，而是库里根本没有这一套标签。
+            val ineffectiveSorts =
+                SORT_OPTIONS.filter {
+                    (value, _) ->
+                    LibrarySortResolver
+                        .report(value, namespaceCounts)
+                        .ineffective
+                }
+
+            if (ineffectiveSorts.isNotEmpty()) {
+                Text(
+                    ineffectiveSorts.joinToString("、") { (value, label) ->
+                        LibrarySortResolver.explain(
+                            value,
+                            label,
+                            LibrarySortResolver.report(value, namespaceCounts),
+                        ) ?: label
+                    } + "。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
             }
 
             Spacer(

@@ -156,12 +156,35 @@ class MixedLibraryRepository(
     }
 
     private fun entryComparator(q: LibraryQuery): Comparator<LibraryEntry> {
+        val namespaceKey = when (q.sort) {
+            LibrarySort.ARTIST, LibrarySort.LANGUAGE, LibrarySort.SERIES -> q.sort.wireValue
+            else -> null
+        }
         fun compare(a: LibraryEntry, b: LibraryEntry): Int {
+            if (namespaceKey != null) {
+                // 按命名空间排序：取该命名空间下的标签值。
+                // 命中不到该命名空间的条目一律留在末尾，**且不随升/降序翻转** ——
+                // 与服务端一致（Search.pm:616-621 先 reverse 排序结果，再把未命中项 push 到末尾）。
+                // 两端都缺该命名空间时返回 0 保持原有顺序，绝不再退回 tags.firstOrNull()：
+                // 那会用「标签列表里的第一个标签」（可能是语言、可能是时间戳）去打乱整份顺序，
+                // 表现正是用户报过的「排序规则没生效」。
+                val av = a.namespaceValue(namespaceKey)
+                val bv = b.namespaceValue(namespaceKey)
+                if (av.isEmpty() || bv.isEmpty()) {
+                    return when {
+                        av.isEmpty() && bv.isEmpty() -> 0
+                        av.isEmpty() -> 1
+                        else -> -1
+                    }
+                }
+                val order = av.lowercase().compareTo(bv.lowercase())
+                return if (q.direction == SortDirection.ASC) order else -order
+            }
             val primary = when (q.sort) {
                 LibrarySort.TITLE -> a.title.lowercase().compareTo(b.title.lowercase())
                 LibrarySort.LAST_READ -> a.lastReadAt.compareTo(b.lastReadAt)
                 LibrarySort.DATE_ADDED -> a.dateAdded.compareTo(b.dateAdded)
-                else -> a.tags.firstOrNull()?.lowercase().orEmpty().compareTo(b.tags.firstOrNull()?.lowercase().orEmpty())
+                else -> 0
             }
             // 并列时返回 0：Kotlin 的 sortedWith 是稳定排序，于是保持「服务器返回顺序」。
             // 原先并列会退回按 sourceKey(arcid) 排，而服务端 sortby=date_added/lastread 的
@@ -171,4 +194,11 @@ class MixedLibraryRepository(
         }
         return Comparator { a, b -> compare(a, b) }
     }
+
+    /** 该命名空间下的第一个标签值；库里没有这个命名空间（或写法不同）时返回空串。 */
+    private fun LibraryEntry.namespaceValue(namespace: String): String = tags
+        .firstOrNull { it.substringBefore(':', "").trim().equals(namespace, ignoreCase = true) }
+        ?.substringAfter(':')
+        ?.trim()
+        .orEmpty()
 }

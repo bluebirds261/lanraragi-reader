@@ -59,10 +59,13 @@ import com.kyant.backdrop.Backdrop
 import com.lanraragi.reader.data.catalog.SearchQueryCodec
 import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.data.tags.TagNamespaceRegistry
-import com.lanraragi.reader.data.tags.knowledge.TagSuggestion
+import com.lanraragi.reader.data.tags.knowledge.TagCandidate
 import com.lanraragi.reader.ui.components.glass.liquidGlassCapsule
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.rememberTagText
+
+/** 联想列表默认展示的行数；超出部分由「更多」展开。 */
+private const val SUGGESTION_PREVIEW = 8
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
@@ -76,10 +79,12 @@ fun LibrarySearchOverlay(
     historyHidden: Boolean, historyPaused: Boolean,
     onHistoryHidden: (Boolean) -> Unit, onHistoryPaused: (Boolean) -> Unit,
     onRemoveHistory: (String, Boolean) -> Unit, onClearHistory: (Boolean) -> Unit,
-    suggestions: List<TagSuggestion>, suggestionsLoading: Boolean, suggestionsError: String?,
+    suggestions: List<TagCandidate>, suggestionsLoading: Boolean, suggestionsError: String?,
     hotTags: List<TagStat>, hotLoading: Boolean, hotError: String?, hotUpdated: String?, hotLocal: Boolean,
     onRetryHot: () -> Unit, onOpenDictionary: () -> Unit,
     state: LibraryState, onClearSelection: () -> Unit, onOpenFilters: () -> Unit, onClearSearch: () -> Unit,
+    /** 当前排序字段在本库不生效时的短提示（见 LibrarySortResolver），null 表示不提示。 */
+    sortNote: String? = null,
     backdrop: Backdrop?, resultsContent: @Composable (Modifier) -> Unit,
 ) {
     val view = LocalView.current
@@ -87,11 +92,14 @@ fun LibrarySearchOverlay(
     DisposableEffect(visibility.currentState || visibility.targetState, lightSurface) {
         var context = view.context
         while (context is ContextWrapper && context !is Activity) context = context.baseContext
-        val window = (context as? Activity)?.window
-        val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+        val controller = (context as? Activity)?.window?.let { WindowCompat.getInsetsController(it, view) }
         val previous = controller?.isAppearanceLightStatusBars
-        if (visibility.currentState || visibility.targetState) controller?.isAppearanceLightStatusBars = lightSurface
-        onDispose { if (previous != null) controller?.isAppearanceLightStatusBars = previous }
+        if (controller != null && (visibility.currentState || visibility.targetState)) {
+            controller.isAppearanceLightStatusBars = lightSurface
+        }
+        onDispose {
+            if (controller != null && previous != null) controller.isAppearanceLightStatusBars = previous
+        }
     }
     val keyboard = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
@@ -105,6 +113,7 @@ fun LibrarySearchOverlay(
     var namespace by rememberSaveable { mutableStateOf("") }
     var clearHistory by remember { mutableStateOf<Boolean?>(null) }
     var help by remember { mutableStateOf(false) }
+    var suggestionsExpanded by rememberSaveable { mutableStateOf(false) }
     var historyMenu by remember { mutableStateOf(false) }
     var hotMenu by remember { mutableStateOf(false) }
     var resultMenu by remember { mutableStateOf(false) }
@@ -124,6 +133,8 @@ fun LibrarySearchOverlay(
     val query = session.draft.text
     val conditions = remember(query) { SearchQueryCodec.parse(query).filter { it.exact && it.value.isNotBlank() } }
     val inputToken = SearchQueryCodec.active(query, session.draft.selection.start).value.substringAfter(':')
+    // 输入态默认只铺前若干条：键盘打开时首屏要留给真正可能被点到的候选，其余由「更多」展开。
+    val visibleSuggestions = if (suggestionsExpanded) suggestions else suggestions.take(SUGGESTION_PREVIEW)
     val corner by animateDpAsState(if (session.expanded) 14.dp else 24.dp, tween(240), label = "searchShape")
     // AnimatedVisibility retains the outgoing subtree until collapse finishes.
     AnimatedVisibility(visibleState = visibility,
@@ -189,7 +200,7 @@ fun LibrarySearchOverlay(
                         IconButton(onClick = { resultMenu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "结果选项", Modifier.size(18.dp)) }
                         DropdownMenu(resultMenu, { resultMenu = false }) {
                             DropdownMenuItem(text = { Text("已加载 ${state.items.size} 项", fontSize = 12.sp) }, enabled = false, onClick = {})
-                            DropdownMenuItem(text = { Text(searchScopeSummary(state), fontSize = 12.sp) }, onClick = { resultMenu = false; onOpenFilters() })
+                            DropdownMenuItem(text = { Text(if (sortNote == null) searchScopeSummary(state) else "$sortNote\n${searchScopeSummary(state)}", fontSize = 12.sp) }, onClick = { resultMenu = false; onOpenFilters() })
                             DropdownMenuItem(text = { Text("清除搜索") }, onClick = { resultMenu = false; onClearSearch() })
                         }
                     }
@@ -212,28 +223,40 @@ fun LibrarySearchOverlay(
                             Text(error, Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             TextButton(onClick = onOpenDictionary) { Text("词库设置", fontSize = 12.sp) }
                         } }
-                        items(suggestions, key = { "tag:${it.entry.namespace}:${it.entry.tagKey}" }) { suggestion ->
-                            val entry = suggestion.entry
-                            val full = if (entry.namespace.isBlank()) entry.tagKey else "${entry.namespace}:${entry.tagKey}"
-                            var menu by remember { mutableStateOf(false) }
+                        items(visibleSuggestions, key = { "tag:${it.full.lowercase()}" }) { candidate ->
+                            var menu by remember(candidate.full) { mutableStateOf(false) }
                             Row(Modifier.fillMaxWidth().heightIn(min = 44.dp)
-                                .combinedClickable(onClick = { onAppendTag(full, null) }, onLongClick = { menu = true })
+                                .combinedClickable(onClick = { onAppendTag(candidate.full, null) }, onLongClick = { menu = true })
                                 .padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
-                                    Text(highlight(full, inputToken), fontSize = 13.sp, lineHeight = 17.sp,
-                                        color = rememberTagColor(entry.namespace), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                    entry.translatedName?.takeIf { it != full }?.let {
+                                    Text(highlight(candidate.full, inputToken), fontSize = 13.sp, lineHeight = 17.sp,
+                                        color = rememberTagColor(candidate.namespace), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    candidate.translatedName?.takeIf { it != candidate.full && it != candidate.tagKey }?.let {
                                         Text(highlight(it, inputToken), fontSize = 11.sp, lineHeight = 15.sp,
                                             color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                     }
                                 }
+                                // 来源与频次必须如实标出：词库（EhTagTranslation，英文命名空间）
+                                // 与服务器实际标签常常是两套平行词汇，用户得看得出哪一条是
+                                // 「本库里真的有」的。全站频次也不能写成「本库 N 本」。
+                                Text(candidate.sourceLabel, fontSize = 10.sp, maxLines = 1,
+                                    color = if (candidate.inLibrary) MaterialTheme.colorScheme.primary
+                                        else MaterialTheme.colorScheme.onSurfaceVariant)
                                 Box {
                                     IconButton(onClick = { menu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "标签操作", Modifier.size(16.dp)) }
                                     DropdownMenu(menu, { menu = false }) {
-                                        DropdownMenuItem(text = { Text("包含") }, onClick = { menu = false; onAppendTag(full, false) })
-                                        DropdownMenuItem(text = { Text("排除") }, onClick = { menu = false; onAppendTag(full, true) })
+                                        DropdownMenuItem(text = { Text(if (candidate.inLibrary) "本库 ${candidate.libraryCount} 本" else "词库候选；本库没有该标签", fontSize = 12.sp) }, enabled = false, onClick = {})
+                                        if (candidate.personalCount > 0) DropdownMenuItem(text = { Text("你的历史用过 ${candidate.personalCount} 次", fontSize = 12.sp) }, enabled = false, onClick = {})
+                                        DropdownMenuItem(text = { Text("包含") }, onClick = { menu = false; onAppendTag(candidate.full, false) })
+                                        DropdownMenuItem(text = { Text("排除") }, onClick = { menu = false; onAppendTag(candidate.full, true) })
                                     }
                                 }
+                            }
+                        }
+                        if (suggestions.size > SUGGESTION_PREVIEW) item("suggestion-more") {
+                            TextButton(onClick = { suggestionsExpanded = !suggestionsExpanded },
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp), modifier = Modifier.height(32.dp)) {
+                                Text(if (suggestionsExpanded) "收起" else "更多（${suggestions.size}）", fontSize = 12.sp)
                             }
                         }
                         if (!suggestionsLoading && suggestions.isEmpty() && suggestionsError == null) item("suggestion-empty") {
