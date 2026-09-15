@@ -9,6 +9,8 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -16,7 +18,10 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.FilterList
 import androidx.compose.material.icons.filled.ExpandMore
@@ -26,10 +31,10 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalView
@@ -82,7 +87,7 @@ fun LibrarySearchOverlay(
     suggestions: List<TagCandidate>, suggestionsLoading: Boolean, suggestionsError: String?,
     hotTags: List<TagStat>, hotLoading: Boolean, hotError: String?, hotUpdated: String?, hotLocal: Boolean,
     onRetryHot: () -> Unit, onOpenDictionary: () -> Unit,
-    state: LibraryState, onClearSelection: () -> Unit, onOpenFilters: () -> Unit, onClearSearch: () -> Unit,
+    state: LibraryState, onClearSelection: () -> Unit, onOpenFilters: () -> Unit, onOpenSortView: () -> Unit, onClearSearch: () -> Unit,
     /** 当前排序字段在本库不生效时的短提示（见 LibrarySortResolver），null 表示不提示。 */
     sortNote: String? = null,
     backdrop: Backdrop?, resultsContent: @Composable (Modifier) -> Unit,
@@ -135,6 +140,31 @@ fun LibrarySearchOverlay(
     val inputToken = SearchQueryCodec.active(query, session.draft.selection.start).value.substringAfter(':')
     // 输入态默认只铺前若干条：键盘打开时首屏要留给真正可能被点到的候选，其余由「更多」展开。
     val visibleSuggestions = if (suggestionsExpanded) suggestions else suggestions.take(SUGGESTION_PREVIEW)
+    /*
+     * 键盘高亮。
+     *
+     * EhViewer 与 JHenTai 都没有实现建议列表的上下键选择（EhViewer 靠 Compose 焦点系统，
+     * JHenTai 全仓没有 arrowUp/arrowDown 处理），外接键盘与平板场景下只能点。
+     * 这里用「高亮下标」而不是 moveFocus：建议行是 combinedClickable 的 Row、不是可聚焦节点，
+     * 原先的 `moveFocus(Down)` 实际是空操作。下标 -1 表示高亮回到输入框本身。
+     */
+    val suggestionListState = rememberLazyListState()
+    var highlighted by remember { mutableStateOf(-1) }
+    // 输入变化后旧的候选已经被换掉，高亮下标不再对应任何东西。
+    LaunchedEffect(query, suggestions) { highlighted = -1 }
+    /** 输入态里排在高亮候选之前的行数（直接搜索 / 命中历史 / 加载条 / 错误行）。 */
+    val matchedHistory = if (historyHidden) emptyList() else history.filter { it.contains(query, true) }.take(3)
+    val suggestionRowOffset =
+        if (query.isNotBlank()) {
+            1 + matchedHistory.size +
+                (if (suggestionsLoading) 1 else 0) +
+                (if (suggestionsError != null) 1 else 0)
+        } else {
+            0
+        }
+    LaunchedEffect(highlighted, suggestionRowOffset) {
+        if (highlighted >= 0) suggestionListState.animateScrollToItem(suggestionRowOffset + highlighted)
+    }
     val corner by animateDpAsState(if (session.expanded) 14.dp else 24.dp, tween(240), label = "searchShape")
     // AnimatedVisibility retains the outgoing subtree until collapse finishes.
     AnimatedVisibility(visibleState = visibility,
@@ -162,12 +192,23 @@ fun LibrarySearchOverlay(
                         modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).wrapContentHeight()
                             .focusRequester(focusRequester)
                             .onFocusChanged { if (it.isFocused && session.submitted) session.phase = SearchPhase.EDITING }
-                            .onPreviewKeyEvent {
-                                when {
-                                    it.type != KeyEventType.KeyUp -> false
-                                    it.key == Key.Escape -> { back(); true }
-                                    it.key == Key.DirectionDown -> focusManager.moveFocus(FocusDirection.Down)
-                                    it.key == Key.Enter -> { onSubmit(); true }
+                            .onPreviewKeyEvent { event ->
+                                if (event.type != KeyEventType.KeyUp) return@onPreviewKeyEvent false
+                                when (event.key) {
+                                    Key.Escape -> { back(); true }
+                                    Key.DirectionDown -> {
+                                        if (visibleSuggestions.isEmpty()) false
+                                        else { highlighted = (highlighted + 1).coerceAtMost(visibleSuggestions.lastIndex); true }
+                                    }
+                                    Key.DirectionUp -> {
+                                        if (highlighted < 0) false else { highlighted -= 1; true }
+                                    }
+                                    Key.Enter -> {
+                                        // 高亮着候选时回车 = 采用该候选；否则才是提交搜索。
+                                        val picked = visibleSuggestions.getOrNull(highlighted)
+                                        if (picked != null) { onAppendTag(picked.full, null); highlighted = -1 } else onSubmit()
+                                        true
+                                    }
                                     else -> false
                                 }
                             })
@@ -193,8 +234,11 @@ fun LibrarySearchOverlay(
                     Text(if (state.loading) "搜索中…" else state.total?.let { "$it 项结果" }
                         ?: "已加载 ${state.items.size} 项", Modifier.weight(1f),
                         style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    IconButton(onClick = onOpenSortView, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.Tune, "排序与视图", Modifier.size(18.dp))
+                    }
                     IconButton(onClick = onOpenFilters, modifier = Modifier.size(36.dp)) {
-                        Icon(Icons.Default.FilterList, "范围与排序", Modifier.size(18.dp))
+                        Icon(Icons.Default.FilterList, "筛选", Modifier.size(18.dp))
                     }
                     Box {
                         IconButton(onClick = { resultMenu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "结果选项", Modifier.size(18.dp)) }
@@ -211,11 +255,11 @@ fun LibrarySearchOverlay(
                 }
                 resultsContent(Modifier.weight(1f).fillMaxWidth())
             } else {
-                LazyColumn(Modifier.widthIn(max = 720.dp).fillMaxWidth().weight(1f),
+                LazyColumn(state = suggestionListState, modifier = Modifier.widthIn(max = 720.dp).fillMaxWidth().weight(1f),
                     contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
                     if (query.isNotBlank()) {
                         item("direct") { SearchSuggestionRow("搜索「$query」", onClick = onSubmit, searchIcon = true) }
-                        if (!historyHidden) items(history.filter { it.contains(query, true) }.take(3), key = { "match:$it" }) { h ->
+                        items(matchedHistory, key = { "match:$it" }) { h ->
                             SearchSuggestionRow(translatedQuery(h), onClick = { onSubmitHistory(h) }, subtitle = "历史")
                         }
                         if (suggestionsLoading) item("suggestion-loading") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -223,10 +267,15 @@ fun LibrarySearchOverlay(
                             Text(error, Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             TextButton(onClick = onOpenDictionary) { Text("词库设置", fontSize = 12.sp) }
                         } }
-                        items(visibleSuggestions, key = { "tag:${it.full.lowercase()}" }) { candidate ->
+                        itemsIndexed(visibleSuggestions, key = { _, it -> "tag:${it.full.lowercase()}" }) { index, candidate ->
                             var menu by remember(candidate.full) { mutableStateOf(false) }
+                            val active = index == highlighted
                             Row(Modifier.fillMaxWidth().heightIn(min = 44.dp)
-                                .combinedClickable(onClick = { onAppendTag(candidate.full, null) }, onLongClick = { menu = true })
+                                .background(
+                                    if (active) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent,
+                                    RoundedCornerShape(8.dp),
+                                )
+                                .combinedClickable(onClick = { highlighted = index; onAppendTag(candidate.full, null) }, onLongClick = { menu = true })
                                 .padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
                                     Text(highlight(candidate.full, inputToken), fontSize = 13.sp, lineHeight = 17.sp,
@@ -269,16 +318,13 @@ fun LibrarySearchOverlay(
                                 Icon(if (historyExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                                     if (historyExpanded) "收起历史" else "展开历史", Modifier.size(18.dp))
                             }
-                            if (managing) TextButton(onClick = { managing = false }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("完成", fontSize = 12.sp) }
                             Box {
                                 IconButton(onClick = { historyMenu = true }, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.MoreVert, "历史选项", Modifier.size(18.dp)) }
                                 DropdownMenu(historyMenu, { historyMenu = false }) {
-                                    DropdownMenuItem(text = { Text("管理历史") }, onClick = { historyMenu = false; managing = true; onHistoryHidden(false) })
                                     DropdownMenuItem(text = { Text(if (historyHidden) "显示历史" else "隐藏历史") }, onClick = { historyMenu = false; onHistoryHidden(!historyHidden) })
                                     DropdownMenuItem(text = { Text(if (historyPaused) "恢复记录" else "暂停记录") }, onClick = { historyMenu = false; onHistoryPaused(!historyPaused) })
                                     if (legacyHistory.isNotEmpty()) DropdownMenuItem(text = { Text(if (legacyExpanded) "收起旧历史" else "查看旧历史") },
                                         onClick = { historyMenu = false; legacyExpanded = !legacyExpanded; onHistoryHidden(false) })
-                                    DropdownMenuItem(text = { Text("清空历史") }, onClick = { historyMenu = false; clearHistory = false })
                                 }
                             }
                         } }
@@ -296,6 +342,37 @@ fun LibrarySearchOverlay(
                                                 DropdownMenuItem(text = { Text("删除") }, onClick = { menu = false; onRemoveHistory(h, false) })
                                             }
                                         }
+                                    }
+                                }
+                            }
+                            if (history.isNotEmpty()) item("history-actions") {
+                                /*
+                                 * 历史管理入口：JHenTai 用的就是垃圾桶图标（`Icons.delete`，
+                                 * search_page_mixin.dart:261-275），图标常态用 error 色；进入删除模式后
+                                 * 变成 ×，「清空」与「完成」作为删除模式里的显式按钮出现。
+                                 *
+                                 * 与 JHenTai 的差别：它把「清空全部」藏在这个图标的长按上（:264），
+                                 * 几乎不可能被发现；这里不这么做，但保留它的图标语义与位置。
+                                 */
+                                Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                                    Spacer(Modifier.weight(1f))
+                                    if (managing) {
+                                        TextButton(onClick = { clearHistory = false }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("清空", fontSize = 12.sp) }
+                                        TextButton(onClick = { managing = false }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("完成", fontSize = 12.sp) }
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            if (managing) managing = false
+                                            else { managing = true; historyExpanded = true; onHistoryHidden(false) }
+                                        },
+                                        modifier = Modifier.size(32.dp),
+                                    ) {
+                                        Icon(
+                                            imageVector = if (managing) Icons.Default.Close else Icons.Default.Delete,
+                                            contentDescription = if (managing) "退出管理历史" else "管理历史",
+                                            modifier = Modifier.size(18.dp),
+                                            tint = if (managing) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                                        )
                                     }
                                 }
                             }

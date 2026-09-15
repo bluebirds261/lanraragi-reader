@@ -51,6 +51,7 @@ import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
@@ -1713,10 +1714,14 @@ fun LibraryScreen(
         mutableStateOf(false)
     }
 
+    var showSortView by remember {
+        mutableStateOf(false)
+    }
+
     // 排序面板要回答「这个排序字段在本库能不能生效」，所以打开时补齐一次命名空间分布。
     // 已有缓存（搜索面板开过一次）就直接用，不重复请求；取不到时不阻断任何选项。
-    LaunchedEffect(showFilter, historyScope) {
-        if (!showFilter) return@LaunchedEffect
+    LaunchedEffect(showFilter, showSortView, historyScope) {
+        if (!showFilter && !showSortView) return@LaunchedEffect
         val repository = container.searchDiscoveryRepository
         repository.namespaceCounts(historyScope)?.let {
             namespaceCounts = it
@@ -2037,6 +2042,25 @@ fun LibraryScreen(
                 leading = {
                     // 与搜索区共享同一个玻璃壳，但各自保留点击区与无障碍语义。
                     // 高度跟随胶囊，点击区因此也是整条高度。
+                    //
+                    // 两个键，因为这是两个决策：「排序与视图」决定怎么排、怎么显示，
+                    // 「筛选」决定看哪些。混成一个入口时用户为了换个列数要先越过一整屏筛选条件。
+                    Box(
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .width(topBarCapsuleHeight)
+                            .clip(CircleShape)
+                            .clickable {
+                                showSortView = true
+                            },
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Tune,
+                            contentDescription = "排序与视图",
+                            modifier = Modifier.size(20.dp),
+                        )
+                    }
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
@@ -2049,7 +2073,7 @@ fun LibraryScreen(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.FilterList,
-                            contentDescription = "排序与筛选",
+                            contentDescription = "筛选",
                             modifier = Modifier.size(20.dp),
                         )
                         if (state.categoryId.isNotBlank() || state.selectedTags.isNotEmpty() || state.newOnly || state.untaggedOnly || state.hideCompleted || state.source != LibrarySource.ALL) {
@@ -2107,6 +2131,7 @@ fun LibraryScreen(
             onRetryHot = { hotRevision++ },
             onOpenDictionary = { searchSession.phase = SearchPhase.CLOSED; MainTabBus.requestSettingsTab() },
             state = state, onClearSelection = vm::exitSelection, onOpenFilters = { showFilter = true },
+            onOpenSortView = { showSortView = true },
             onClearSearch = { vm.clearQuery(); searchSession.open("") }, sortNote = sortNote, backdrop = backdrop,
             resultsContent = { modifier ->
                 LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
@@ -2150,7 +2175,7 @@ fun LibraryScreen(
     }
 
     // ================================================================
-    // 排序 / 筛选 / 视图 / 网格大小统一面板
+    // 筛选面板（搜什么 / 只看哪一类）
     // ================================================================
     if (showFilter) {
         FilterSheet(
@@ -2166,6 +2191,16 @@ fun LibraryScreen(
             onOpenCategoryManager = {
                 showFilter = false
                 showCategoryManager = true
+            },
+        )
+    }
+
+    if (showSortView) {
+        SortViewSheet(
+            state = state,
+            vm = vm,
+            onDismiss = {
+                showSortView = false
             },
             namespaceCounts = namespaceCounts,
         )
@@ -2910,6 +2945,258 @@ private fun PresetSummaryChip(text: String) {
     }
 }
 
+/**
+ * 「排序与视图」独立面板。
+ *
+ * 为什么和「筛选」分开：排序字段、排序方向、视图模式、网格大小回答的是「怎么排、怎么显示」，
+ * 与「搜什么 / 只看哪一类」不是同一个决策。混在一个面板里，用户既不容易找到排序，
+ * 每次只想换个列数也要先越过一整屏筛选条件 —— EhViewer 把视图切换藏在设置页、
+ * JHenTai 的搜索页干脆没有排序入口，都是同一类问题的不同表现。
+ *
+ * 入口有两处：收起态顶栏胶囊左侧的「排序与视图」键，以及搜索结果头的排序键。
+ */
+@OptIn(
+    ExperimentalMaterial3Api::class,
+    ExperimentalLayoutApi::class,
+)
+@Composable
+private fun SortViewSheet(
+    state: LibraryState,
+    vm: LibraryViewModel,
+    onDismiss: () -> Unit,
+    /** 服务器命名空间分布；null 表示未知，此时所有排序字段一律可选用。 */
+    namespaceCounts: Map<String, Int>? = null,
+) {
+    val sheetState =
+        rememberModalBottomSheetState()
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+    ) {
+
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(
+                    rememberScrollState()
+                )
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 24.dp),
+        ) {
+
+            Row(
+                verticalAlignment =
+                    Alignment.CenterVertically,
+            ) {
+
+                Text(
+                    "排序与视图",
+                    style =
+                        MaterialTheme.typography.titleMedium,
+                    modifier =
+                        Modifier.weight(1f),
+                )
+
+                TextButton(
+                    onClick = onDismiss,
+                ) {
+                    Text("完成")
+                }
+            }
+
+            // ============================================================
+            // 排序：字段 + 方向
+            // 「按什么排」与「往哪边排」是同一个决策，合并成一组：方向是二选一，
+            // 用右侧的小分段控件表达，比两个并列的 FilterChip 更像一个开关而不是筛选项。
+            // ============================================================
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "排序",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+
+                SegmentedControl(
+                    segments = listOf(
+                        Segment("升序", Icons.Filled.ArrowUpward),
+                        Segment("倒序", Icons.Filled.ArrowDownward),
+                    ),
+                    selectedIndex = if (state.order == "desc") 1 else 0,
+                    onSelect = { vm.setOrder(if (it == 1) "desc" else "asc") },
+                    modifier = Modifier.width(156.dp),
+                    compact = true,
+                )
+            }
+
+            Spacer(
+                Modifier.height(8.dp)
+            )
+
+            FlowRow(
+                horizontalArrangement =
+                    Arrangement.spacedBy(8.dp),
+            ) {
+
+                SORT_OPTIONS.forEach {
+                        (value, label) ->
+
+                    // 服务端把 sortby 当字面正则匹配命名空间：库里没有该命名空间时，
+                    // 「排序」既不报错也不退回上一个顺序，只给出任意顺序。这里提前标出来，
+                    // 不让用户在「看起来变了、其实随机」的结果里猜。
+                    val report =
+                        LibrarySortResolver.report(
+                            value,
+                            namespaceCounts,
+                        )
+
+                    FilterChip(
+                        selected =
+                            state.sortby == value,
+                        leadingIcon =
+                            if (report.ineffective) {
+                                {
+                                    Icon(
+                                        Icons.Filled.Warning,
+                                        contentDescription = "该排序字段在本库不生效",
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            } else {
+                                null
+                            },
+                        onClick = {
+                            vm.setSort(value)
+                            LibrarySortResolver
+                                .explain(value, label, report)
+                                ?.let(vm::showMessage)
+                        },
+                        label = {
+                            Text(label)
+                        },
+                    )
+                }
+            }
+
+            // 只列出「本库没有该命名空间」的字段，并把服务端实际使用的相近写法一并给出，
+            // 让用户知道不是应用坏了，而是库里根本没有这一套标签。
+            val ineffectiveSorts =
+                SORT_OPTIONS.filter {
+                    (value, _) ->
+                    LibrarySortResolver
+                        .report(value, namespaceCounts)
+                        .ineffective
+                }
+
+            if (ineffectiveSorts.isNotEmpty()) {
+                Text(
+                    ineffectiveSorts.joinToString("、") { (value, label) ->
+                        LibrarySortResolver.explain(
+                            value,
+                            label,
+                            LibrarySortResolver.report(value, namespaceCounts),
+                        ) ?: label
+                    } + "。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 6.dp),
+                )
+            }
+
+            Spacer(
+                Modifier.height(12.dp)
+            )
+
+            // ============================================================
+            // 视图模式（排在网格大小之前：先定「怎么显示」，再定「一行几本」）
+            // 三选一是典型的分段控件场景，等宽铺满比三个散落的 Chip 更像「模式切换」。
+            // ============================================================
+            Text(
+                "视图模式",
+                style =
+                    MaterialTheme.typography.labelMedium,
+                color =
+                    MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            Spacer(
+                Modifier.height(8.dp)
+            )
+
+            SegmentedControl(
+                segments = listOf(
+                    Segment("松散网格", Icons.Filled.GridView),
+                    Segment("紧凑网格", Icons.Filled.GridOn),
+                    Segment("列表", Icons.AutoMirrored.Filled.ViewList),
+                ),
+                selectedIndex = when (state.viewMode) {
+                    "compact" -> 1
+                    "list" -> 2
+                    else -> 0
+                },
+                onSelect = { index ->
+                    vm.setViewMode(
+                        when (index) {
+                            1 -> "compact"
+                            2 -> "list"
+                            else -> "grid"
+                        },
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+            )
+
+            Spacer(
+                Modifier.height(16.dp)
+            )
+
+            // ============================================================
+            // 网格大小
+            // 列表视图下每行固定一本，列数不参与布局，因此置灰并在右侧说明，
+            // 避免出现「改了没反应」的控件。2..8 用等宽分段一次点到位，比 7 个 Chip 更省空间。
+            // ============================================================
+            val columnsEffective = state.viewMode != "list"
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "网格大小",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+
+                Text(
+                    text = if (columnsEffective) "${state.columns} 列" else "列表视图不适用",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            Spacer(
+                Modifier.height(8.dp)
+            )
+
+            SegmentedControl(
+                segments = (2..8).map { Segment("$it") },
+                selectedIndex = (state.columns - 2).coerceIn(0, 6),
+                onSelect = { vm.setColumns(it + 2) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = columnsEffective,
+                compact = true,
+            )
+
+            Spacer(
+                Modifier.height(12.dp)
+            )
+        }
+    }
+}
+
 @OptIn(
     ExperimentalMaterial3Api::class,
     ExperimentalLayoutApi::class,
@@ -2921,8 +3208,6 @@ private fun FilterSheet(
     onDismiss: () -> Unit,
     onOpenPresets: () -> Unit,
     onOpenCategoryManager: () -> Unit,
-    /** 服务器命名空间分布；null 表示未知，此时所有排序字段一律可选用。 */
-    namespaceCounts: Map<String, Int>? = null,
 ) {
     var showSave by remember {
         mutableStateOf(false)
@@ -2959,7 +3244,7 @@ private fun FilterSheet(
             ) {
 
                 Text(
-                    "排序与筛选",
+                    "筛选",
                     style =
                         MaterialTheme.typography.titleMedium,
                     modifier =
@@ -3100,199 +3385,6 @@ private fun FilterSheet(
                     Modifier.height(12.dp)
                 )
             }
-
-            // ============================================================
-            // 排序：字段 + 方向
-            // 「按什么排」与「往哪边排」是同一个决策，合并成一组：方向是二选一，
-            // 用右侧的小分段控件表达，比两个并列的 FilterChip 更像一个开关而不是筛选项。
-            // ============================================================
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "排序",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                )
-
-                SegmentedControl(
-                    segments = listOf(
-                        Segment("升序", Icons.Filled.ArrowUpward),
-                        Segment("倒序", Icons.Filled.ArrowDownward),
-                    ),
-                    selectedIndex = if (state.order == "desc") 1 else 0,
-                    onSelect = { vm.setOrder(if (it == 1) "desc" else "asc") },
-                    modifier = Modifier.width(156.dp),
-                    compact = true,
-                )
-            }
-
-            Spacer(
-                Modifier.height(8.dp)
-            )
-
-            FlowRow(
-                horizontalArrangement =
-                    Arrangement.spacedBy(8.dp),
-            ) {
-
-                SORT_OPTIONS.forEach {
-                        (value, label) ->
-
-                    // 服务端把 sortby 当字面正则匹配命名空间：库里没有该命名空间时，
-                    // 「排序」既不报错也不退回上一个顺序，只给出任意顺序。这里提前标出来，
-                    // 不让用户在「看起来变了、其实随机」的结果里猜。
-                    val report =
-                        LibrarySortResolver.report(
-                            value,
-                            namespaceCounts,
-                        )
-
-                    FilterChip(
-                        selected =
-                            state.sortby == value,
-                        leadingIcon =
-                            if (report.ineffective) {
-                                {
-                                    Icon(
-                                        Icons.Filled.Warning,
-                                        contentDescription = "该排序字段在本库不生效",
-                                        modifier = Modifier.size(16.dp),
-                                    )
-                                }
-                            } else {
-                                null
-                            },
-                        onClick = {
-                            vm.setSort(value)
-                            LibrarySortResolver
-                                .explain(value, label, report)
-                                ?.let(vm::showMessage)
-                        },
-                        label = {
-                            Text(label)
-                        },
-                    )
-                }
-            }
-
-            // 只列出「本库没有该命名空间」的字段，并把服务端实际使用的相近写法一并给出，
-            // 让用户知道不是应用坏了，而是库里根本没有这一套标签。
-            val ineffectiveSorts =
-                SORT_OPTIONS.filter {
-                    (value, _) ->
-                    LibrarySortResolver
-                        .report(value, namespaceCounts)
-                        .ineffective
-                }
-
-            if (ineffectiveSorts.isNotEmpty()) {
-                Text(
-                    ineffectiveSorts.joinToString("、") { (value, label) ->
-                        LibrarySortResolver.explain(
-                            value,
-                            label,
-                            LibrarySortResolver.report(value, namespaceCounts),
-                        ) ?: label
-                    } + "。",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 6.dp),
-                )
-            }
-
-            Spacer(
-                Modifier.height(12.dp)
-            )
-
-            Spacer(
-                Modifier.height(16.dp)
-            )
-
-            // ============================================================
-            // 视图模式（排在网格大小之前：先定「怎么显示」，再定「一行几本」）
-            // 三选一是典型的分段控件场景，等宽铺满比三个散落的 Chip 更像「模式切换」。
-            // ============================================================
-            Text(
-                "视图模式",
-                style =
-                    MaterialTheme.typography.labelMedium,
-                color =
-                    MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-
-            Spacer(
-                Modifier.height(8.dp)
-            )
-
-            SegmentedControl(
-                segments = listOf(
-                    Segment("松散网格", Icons.Filled.GridView),
-                    Segment("紧凑网格", Icons.Filled.GridOn),
-                    Segment("列表", Icons.AutoMirrored.Filled.ViewList),
-                ),
-                selectedIndex = when (state.viewMode) {
-                    "compact" -> 1
-                    "list" -> 2
-                    else -> 0
-                },
-                onSelect = { index ->
-                    vm.setViewMode(
-                        when (index) {
-                            1 -> "compact"
-                            2 -> "list"
-                            else -> "grid"
-                        },
-                    )
-                },
-                modifier = Modifier.fillMaxWidth(),
-            )
-
-            Spacer(
-                Modifier.height(16.dp)
-            )
-
-            // ============================================================
-            // 网格大小
-            // 列表视图下每行固定一本，列数不参与布局，因此置灰并在右侧说明，
-            // 避免出现「改了没反应」的控件。2..8 用等宽分段一次点到位，比 7 个 Chip 更省空间。
-            // ============================================================
-            val columnsEffective = state.viewMode != "list"
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text(
-                    "网格大小",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
-                )
-
-                Text(
-                    text = if (columnsEffective) "${state.columns} 列" else "列表视图不适用",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-
-            Spacer(
-                Modifier.height(8.dp)
-            )
-
-            SegmentedControl(
-                segments = (2..8).map { Segment("$it") },
-                selectedIndex = (state.columns - 2).coerceIn(0, 6),
-                onSelect = { vm.setColumns(it + 2) },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = columnsEffective,
-                compact = true,
-            )
-
-            Spacer(
-                Modifier.height(12.dp)
-            )
 
             // ============================================================
             // 分类
