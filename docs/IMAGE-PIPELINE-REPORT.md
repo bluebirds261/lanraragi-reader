@@ -75,6 +75,67 @@
 - 图库列表里的 `local_` 卡片仍走远程缩略图组件（`LibraryResultsContent` 不传 offlineCover），
   会被服务端按 40 位 id 契约拒绝 —— **推断**，未真机实测，表现为占位图标。
 
+## 缺陷修复：详情页前 12 张预览图显示「no thumbnail」（2026-09-15）
+
+### 成因
+
+`ApiClient.pageThumbnailUrl` 请求页缩略图时**没有带 `no_fallback`**。服务端
+`Model/Archive.pm:213-228` 在该页缩略图**还没生成**时：
+
+| 请求 | 服务端响应 |
+| --- | --- |
+| 不带 `no_fallback` | `render_file ./public/img/noThumb.png` → **HTTP 200 + 一张占位图** |
+| 带 `no_fallback=true` | 入队 `thumbnail_task`，**202 + {job}** |
+
+「200 + 占位图」与真图在协议上无法区分，Coil 把它当成功结果并按 `pagethumb:<arcid>:<page>`
+**写入内存与磁盘缓存**，之后即使服务端已经生成好，客户端也一直读那份占位图。
+
+为什么偏偏是**前 12 张**：详情页预览网格首屏一次渲染 `visiblePreviewCount` 格，默认值就是
+**12**（`DetailScreen.kt` 的 `UiState`）。这 12 个请求全部赶在生成完成之前发出，
+于是集体落进占位图；后续批次（滚动加载出来的格子）发起时生成早已完成，所以正常。
+
+### 修复（三处，缺一不可）
+
+1. **`ApiClient.pageThumbnailUrl` 默认带 `no_fallback=true`**（可显式关掉）。
+   未生成时服务端改为 202，客户端能明确知道「还没好」，而不是收到一张冒充真图的占位图。
+2. **页缩略图一律不读写磁盘缓存**（`diskCachePolicy(DISABLED)`，阅读器时间线与详情页两处）。
+   两个理由：202 的响应体是 JSON，被 Coil 落盘后每次解码都失败；旧版本还留下了 noThumb 的
+   磁盘条目 —— 不读不写一次掐掉这两类脏数据。内存缓存只在成功解码后写入，保留。
+3. **详情页补上「先等生成完成」**：`DetailViewModel.previewThumbs` 仍然是
+   `IDLE/GENERATING/READY/FAILED`，入队 `POST /files/thumbnails` 后按 2s 轮询
+   `minionPageThumbProgress`（与阅读器时间线同一套做法）；**只有 READY 时网格才用缩略图 URL**，
+   其余情况走既有的整页原图回退。选封面网格同样接了 `thumbsReady` 参数。
+   这样既不会在生成期间发一堆注定失败的请求，也不会出现 12 张占位图。
+
+### 真机验证（可复核）
+
+应用内置 `HttpLoggingInterceptor(Level.BASIC)`，直接看实际请求：
+
+```
+--> GET /api/archives/<id>/thumbnail?page=1&no_fallback=true
+<-- 200 ... (246ms, 78399-byte body)
+…共 12 个请求，全部 200，响应体大小全部不同：
+   6559 / 13486 / 78399 / 79605 / 86406 / 91555 / 93925 / 98242 / 101834 / 106054 / 106111 / 111223
+```
+
+**判据**：若仍拿到 `noThumb.png`，12 个响应体大小必然完全相同（同一个文件）；
+12 个各不相同即 12 张真实页缩略图。日志中没有任何 202 或非 200 响应。
+
+### 顺带记下的两条服务端事实
+
+- `/page` 在 `enable_resize=1` 下恒以 `format => "jpg"` 下发（`Model/Archive.pm:278`），
+  但页字节数**不超过** `sizethreshold` 时 `resize_image` 会原样返回（`Model/Reader.pm:40`）——
+  也就是**原始 PNG/WebP 字节被贴上 jpeg 的 content-type**。客户端不能靠 content-type 或
+  URL 后缀判断格式，要按字节嗅探（Coil 默认即如此）。
+- `resize_page` 的缓存键含 `quality` 与 `threshold`（`Model/Archive.pm:267`），改服务器画质
+  立即生效、不需要重启，也不会读到旧质量的缓存；**「改了设置还看到旧图」只可能来自客户端缓存**。
+
+### 本次未覆盖
+
+用两份真实档案复验时，服务端都已有页缩略图（`POST /files/thumbnails` 返回 200 而非 202），
+所以**「缩略图确实缺失 → 202 → 回退整页原图」这条分支没有在真机上走到**，
+只有代码层面保证。要构造它，需要找一本从未打开过详情的档案。
+
 ## 不确定 / 未验证
 
 1. **运行中服务端的实际配置**（`enableresize` / `hqthumbpages` / `jxlthumbpages`）无法从代码

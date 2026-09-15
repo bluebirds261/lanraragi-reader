@@ -20,7 +20,10 @@ class PageSourceTest {
             source.pageModel(0),
         )
         assertEquals(
-            "http://lanraragi.local/api/archives/arc-1/thumbnail?page=2",
+            // 必须带 no_fallback=true：服务端在该页缩略图未生成时，不带这个参数会返回
+            // public/img/noThumb.png（HTTP 200 + 占位图），客户端无法与真图区分，
+            // Coil 会把它当成功结果缓存，之后即使生成好也一直显示「no thumbnail」。
+            "http://lanraragi.local/api/archives/arc-1/thumbnail?page=2&no_fallback=true",
             (source.thumbnailModel(1) as PageModel.RemotePage).url,
         )
         assertEquals(source.revision, source.snapshot().revision)

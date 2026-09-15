@@ -86,9 +86,22 @@ object ApiClient {
     /** 单行本封面（A11）：`GET /api/tankoubons/{id}/thumbnail`。 */
     fun tankoubonThumbnailUrl(id: String): String = "${SENTINEL_BASE}api/tankoubons/$id/thumbnail"
 
-    /** 某页的低分辨率缩略图 URL（省流量模式用；page 从 1 起）。 */
-    fun pageThumbnailUrl(arcid: String, pageIndex: Int): String =
-        "${SENTINEL_BASE}api/archives/$arcid/thumbnail?page=${pageIndex + 1}"
+    /**
+     * 某页的低分辨率缩略图 URL（page 从 1 起）。
+     *
+     * 默认带 `no_fallback=true`。服务端（`Model/Archive.pm:213-228`）在该页缩略图**还没生成**
+     * 时：不带这个参数 → 直接返回 `public/img/noThumb.png`（HTTP 200 + 一张占位图）；
+     * 带上 → 返回 202 + job，客户端能明确知道「还没好」。
+     *
+     * 不带参数的那种「200 + 占位图」是无法与真图区分的，Coil 会把它当成功结果缓存下来，
+     * 之后即使服务端已经生成好也一直显示「no thumbnail」——这正是详情页首屏 12 张预览
+     * （visiblePreviewCount 默认 12）在生成完成前发起请求后就再也不恢复的成因。
+     * 因此**任何**消费页缩略图的地方都必须带这个参数。
+     */
+    fun pageThumbnailUrl(arcid: String, pageIndex: Int, noFallback: Boolean = true): String {
+        val base = "${SENTINEL_BASE}api/archives/$arcid/thumbnail?page=${pageIndex + 1}"
+        return if (noFallback) "$base&no_fallback=true" else base
+    }
 
     /** 把 /files 返回的相对分页 URL 转成绝对地址（占位 host，拦截器会改写为真实服务器）。 */
     fun toAbsoluteUrl(pathOrUrl: String): String {

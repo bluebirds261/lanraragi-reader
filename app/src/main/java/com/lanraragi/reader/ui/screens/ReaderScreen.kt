@@ -141,6 +141,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 import com.lanraragi.reader.data.AUTO_SCROLL_MAX_SECONDS
 import com.lanraragi.reader.data.AUTO_SCROLL_MIN_SECONDS
@@ -339,14 +340,21 @@ data class TimelineThumbState(
     val total: Int = 0,
 )
 
-/** 时间线页缩略图请求：`GET api/archives/{id}/thumbnail?page=N`，记忆键带档案与页号，避免与整页原图缓存互扰。 */
+/**
+ * 时间线页缩略图请求：`GET api/archives/{id}/thumbnail?page=N&no_fallback=true`，
+ * 记忆键带档案与页号，避免与整页原图缓存互扰。
+ *
+ * **不用磁盘缓存**：缩略图未生成时服务端返回 202 + job（JSON 响应体），Coil 会把那份
+ * 响应体落盘，之后每次都解码失败；旧版本还可能留下 noThumb 占位图的磁盘条目。
+ * 「不读不写磁盘」一次掐掉这两类脏数据；内存缓存只会在成功解码后写入，可以留着。
+ */
 @Composable
 private fun timelineThumbImageModel(arcid: String, page: Int): Any {
     val context = LocalContext.current
     return ImageRequest.Builder(context)
         .data(ApiClient.pageThumbnailUrl(arcid, page))
         .memoryCacheKey("pagethumb:$arcid:$page")
-        .diskCacheKey("pagethumb:$arcid:$page")
+        .diskCachePolicy(CachePolicy.DISABLED)
         .build()
 }
 

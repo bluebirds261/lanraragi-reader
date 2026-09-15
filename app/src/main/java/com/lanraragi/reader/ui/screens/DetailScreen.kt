@@ -101,6 +101,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 import com.kyant.backdrop.Backdrop
 import com.kyant.backdrop.backdrops.layerBackdrop
@@ -172,11 +173,14 @@ import com.lanraragi.reader.ui.screens.FilterBus
 import com.lanraragi.reader.ui.screens.LibraryRefreshBus
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -185,6 +189,14 @@ import java.util.UUID
 
 /** D2 支持精确抓取完整元数据的原生来源（EH/nHentai 走现有 native fetch）。 */
 internal val NATIVE_FETCH_PROVIDERS = setOf("ehentai", "nhentai")
+
+/*
+ * 预览网格页缩略图的轮询节奏，与阅读器时间线（ReaderScreen 的 THUMB_POLL_*）取同一组值：
+ * 服务端任务是逐个档案排队执行的，2s 足够看出进度，也不会把服务器打满；
+ * 上限给到 3 分钟是为了让大档案也能在这一次停留里跑完。
+ */
+private const val PREVIEW_THUMB_POLL_INTERVAL_MS = 2_000L
+private const val PREVIEW_THUMB_POLL_MAX_MS = 180_000L
 
 
 class DetailViewModel(
@@ -230,6 +242,13 @@ class DetailViewModel(
 
     private val _state = MutableStateFlow(UiState())
     val state = _state.asStateFlow()
+
+    private val _previewThumbs = MutableStateFlow(ThumbPhase.IDLE)
+
+    /** 预览网格的页缩略图生成状态；只有 READY 时网格才会请求缩略图，见 [ensurePreviewThumbnails]。 */
+    val previewThumbs = _previewThumbs.asStateFlow()
+
+    private var previewThumbJob: Job? = null
 
     private var lastArchFailed = false
     private var categoryMutationInFlight = false
@@ -1180,20 +1199,58 @@ class DetailViewModel(
     }
 
     /**
-     * 预览区首次展示时静默入队服务端页缩略图生成。
+     * 预览网格的页缩略图管线（服务器档案）：入队 + 轮询，与阅读器时间线同一套做法。
      *
-     * 失败不提示：预览网格在缩略图加载失败时会自动回退整页原图，
-     * 不因生成任务失败而影响预览可用性。
+     * **必须先等到 READY 再让网格请求缩略图**。服务端在该页缩略图还没生成时，不带
+     * `no_fallback` 会直接返回 `public/img/noThumb.png`（HTTP 200 + 占位图），客户端无法
+     * 与真图区分，Coil 会把它当成功结果缓存下来 —— 这正是「有的画廊详情页前 12 张预览图
+     * 一直显示 no thumbnail」的成因：首屏那 12 格（`visiblePreviewCount` 默认 12）
+     * 在生成完成之前就发起了请求。
+     *
+     * 失败不提示：网格在未就绪或加载失败时回退整页原图，不因生成任务失败影响预览可用性。
      */
     fun ensurePreviewThumbnails() {
-        viewModelScope.launch {
-            try {
+        if (previewThumbJob?.isActive == true) return
+        if (_previewThumbs.value == ThumbPhase.READY) return
+        previewThumbJob = viewModelScope.launch {
+            _previewThumbs.value = ThumbPhase.GENERATING
+            val queued = try {
                 container.repository.queuePageThumbnails(arcid)
             } catch (e: CancellationException) {
+                _previewThumbs.value = ThumbPhase.IDLE
                 throw e
             } catch (_: Exception) {
-                // 静默失败，预览网格按整页原图回退。
+                null
             }
+            val jobId = when (queued) {
+                PageThumbQueue.AlreadyAvailable -> {
+                    _previewThumbs.value = ThumbPhase.READY
+                    return@launch
+                }
+                is PageThumbQueue.Queued -> queued.jobId
+                else -> {
+                    _previewThumbs.value = ThumbPhase.FAILED
+                    return@launch
+                }
+            }
+            val deadline = System.currentTimeMillis() + PREVIEW_THUMB_POLL_MAX_MS
+            while (isActive && System.currentTimeMillis() < deadline) {
+                val progress = try {
+                    container.repository.minionPageThumbProgress(jobId)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+                if (progress != null) {
+                    val (done, pages) = progress
+                    if (pages > 0 && done >= pages) break
+                }
+                delay(PREVIEW_THUMB_POLL_INTERVAL_MS)
+            }
+            // 轮询结束（完成或超时）按可用处理：个别页仍缺失时带 no_fallback 会拿到 202，
+            // 单元格据此回退整页原图，不会退化成服务端的 noThumb 占位图。
+            _previewThumbs.value = ThumbPhase.READY
         }
     }
 
@@ -2060,6 +2117,17 @@ fun DetailScreen(
             initialValue = null,
         )
 
+    /*
+     * 页缩略图生成状态。只有 READY 时预览网格与选封面网格才用缩略图；
+     * 其余情况回退整页原图 —— 那两条路径都不会拿到服务端的 noThumb 占位图。
+     */
+    val previewThumbs by
+    vm.previewThumbs.collectAsStateWithLifecycle(
+        initialValue = com.lanraragi.reader.ui.screens.ThumbPhase.IDLE,
+    )
+
+    val previewThumbsReady = previewThumbs == ThumbPhase.READY
+
     val showFab =
         settings?.showFloatingButton ?: true
 
@@ -2792,6 +2860,7 @@ fun DetailScreen(
                                                     PreviewPageImage(
                                                         arcid = archive.arcid,
                                                         page = pageIndex,
+                                                        useThumbnail = previewThumbsReady,
                                                         fallbackModel = url,
                                                         modifier =
                                                             Modifier
@@ -3051,6 +3120,7 @@ fun DetailScreen(
             CoverPickerSheet(
                 arcid = arcid,
                 pageCount = state.pageUrls.size,
+                thumbsReady = previewThumbsReady,
                 onPick = { page ->
                     vm.changeCover(page)
                     showCoverPicker = false
@@ -3863,16 +3933,19 @@ private fun mergeCandidateTagRows(
 
 
 /**
- * 预览网格单元格：远程档案优先加载服务端页缩略图
- * （`GET api/archives/{id}/thumbnail?page=N`，缓存键 `pagethumb:arcid:page`
- * 与阅读器时间线共享）；
- * 缩略图加载失败时回退整页原图 model；
+ * 预览网格单元格：远程档案在**服务端页缩略图已就绪**时加载页缩略图
+ * （`GET api/archives/{id}/thumbnail?page=N&no_fallback=true`，缓存键 `pagethumb:arcid:page`
+ * 与阅读器时间线共享）；未就绪或加载失败时回退整页原图；
  * 本地/离线档案（arcid 以 local_ 开头）没有服务端缩略图管线，直接用整页原图。
+ *
+ * [useThumbnail] 来自 `DetailViewModel.previewThumbs == READY`，不要恒为 true：
+ * 生成完成前请求缩略图只会拿到 202（解码失败）或服务端的 noThumb 占位图。
  */
 @Composable
 private fun PreviewPageImage(
     arcid: String,
     page: Int,
+    useThumbnail: Boolean,
     fallbackModel: Any?,
     modifier: Modifier = Modifier,
     contentScale: androidx.compose.ui.layout.ContentScale =
@@ -3889,18 +3962,24 @@ private fun PreviewPageImage(
     /*
      * 缩略图请求用 remember 固定实例：
      * LoadingImage 以 model 判等管理加载态，避免重组时重复发起请求。
+     *
+     * 关键：**不读不写磁盘缓存**。页缩略图未生成时服务端返回 202 + job（JSON），
+     * 那份响应体会被 Coil 落盘导致之后每次解码都失败；旧版本还可能留下 noThumb
+     * 占位图的磁盘条目（就是「前 12 张一直是 no thumbnail」的那批）。
+     * 内存缓存只会在成功解码后写入，可以留着。
      */
     val thumbModel =
         remember(arcid, page) {
             ImageRequest.Builder(context)
                 .data(ApiClient.pageThumbnailUrl(arcid, page))
                 .memoryCacheKey("pagethumb:$arcid:$page")
-                .diskCacheKey("pagethumb:$arcid:$page")
+                .diskCachePolicy(CachePolicy.DISABLED)
                 .build()
         }
 
     val useServerThumb =
-        !arcid.startsWith("local_") &&
+        useThumbnail &&
+                !arcid.startsWith("local_") &&
                 !thumbFailed
 
     LoadingImage(
@@ -3924,11 +4003,15 @@ private fun PreviewPageImage(
 private fun CoverPickerSheet(
     arcid: String,
     pageCount: Int,
+    thumbsReady: Boolean,
     onPick: (Int) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val sheetState =
         rememberModalBottomSheetState()
+
+    val context =
+        LocalContext.current
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -3946,6 +4029,18 @@ private fun CoverPickerSheet(
                     MaterialTheme.typography.titleMedium,
             )
 
+            if (!thumbsReady) {
+                Text(
+                    "页缩略图生成中，稍后重试或先等预览网格出图",
+                    style =
+                        MaterialTheme.typography.labelSmall,
+                    color =
+                        MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier =
+                        Modifier.padding(top = 4.dp),
+                )
+            }
+
             Spacer(
                 Modifier.height(12.dp),
             )
@@ -3962,12 +4057,22 @@ private fun CoverPickerSheet(
                         .heightIn(max = 480.dp),
             ) {
                 items(pageCount) { index ->
+                    /*
+                     * 与预览网格同一套约束：带 no_fallback（未生成时得到 202 而不是
+                     * noThumb 占位图），并且**不读写磁盘缓存** —— 否则那份 202 的 JSON
+                     * 响应体会被落盘，之后每次解码都失败。
+                     */
+                    val model =
+                        remember(arcid, index) {
+                            ImageRequest.Builder(context)
+                                .data(ApiClient.pageThumbnailUrl(arcid, index))
+                                .diskCachePolicy(CachePolicy.DISABLED)
+                                .build()
+                        }
+
                     LoadingImage(
                         model =
-                            ApiClient.pageThumbnailUrl(
-                                arcid,
-                                index,
-                            ),
+                            model,
                         contentDescription =
                             "第 ${index + 1} 页",
                         modifier =
