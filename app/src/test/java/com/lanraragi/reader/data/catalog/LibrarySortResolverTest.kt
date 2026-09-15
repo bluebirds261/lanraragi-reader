@@ -82,7 +82,7 @@ class LibrarySortResolverTest {
     @Test
     fun explainMentionsTheSimilarSpellingWhenKnown() {
         val text = LibrarySortResolver.explain("language", "语言", LibrarySortResolver.report("language", counts))
-        assertEquals("本库没有 language 命名空间的标签，「语言」排序不会生效（库里相近的写法是「语言」）", text)
+        assertEquals("本库没有 language 命名空间的标签，「语言」排序不会生效（库里实际使用的是「语言」命名空间）", text)
     }
 
     @Test

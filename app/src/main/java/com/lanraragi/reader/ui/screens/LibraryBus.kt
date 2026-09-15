@@ -4,7 +4,16 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** 跨屏幕轻量通信：详情页点标签 → 图库按标签过滤；删除档案后 → 图库刷新。 */
+/**
+ * 跨屏幕轻量通信的中枢。
+ *
+ * **每个总线在这里只能有一份定义。** 历史上 `FilterBus` 与 `LibraryRefreshBus` 在
+ * `com.lanraragi.reader.ui` 与 `com.lanraragi.reader.ui.screens` 各有一份同名 object，
+ * 详情页/阅读器写了 `ui.*`，图库收的是 `screens.*` —— 于是「详情页点标签回图库过滤」
+ * 「收藏 / 改标签 / 阅读进度之后刷新图库」这些跨屏动作静默失效，日志里也不会报错。
+ * 重复定义已删除，统一到本文件。
+ */
+
 object FilterBus {
     val filter = MutableStateFlow<String?>(null)
 }
@@ -15,11 +24,6 @@ object LibraryRefreshBus {
 
 // 封面破缓存总线已统一到 com.lanraragi.reader.ui.CoverChangeBus（按 arcid 记录，
 // 避免换一张封面就让全库封面缓存失效）。此处原有的同名重复定义已删除。
-
-/** 搜索页提交的关键词 → 图库按关键词过滤。 */
-object SearchBus {
-    val query = MutableStateFlow<String?>(null)
-}
 
 /** D2 多选模式是否激活：MainScreen 据此隐藏液态底栏。 */
 object SelectionModeBus {

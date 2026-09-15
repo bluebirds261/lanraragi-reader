@@ -165,7 +165,10 @@ fun LibrarySearchOverlay(
     LaunchedEffect(highlighted, suggestionRowOffset) {
         if (highlighted >= 0) suggestionListState.animateScrollToItem(suggestionRowOffset + highlighted)
     }
-    val corner by animateDpAsState(if (session.expanded) 14.dp else 24.dp, tween(240), label = "searchShape")
+    // 圆角跟着**开合动画**走（而不是 phase 一变就跳）：收起态胶囊是 24dp 全圆角
+    // （48dp 高的一半），展开到面板时收到 14dp。两者用同一个 240ms，视觉上才是
+    // 「同一个面在变形」，而不是「先变圆角、再长出面板」。
+    val corner by animateDpAsState(if (visibility.targetState) 14.dp else 24.dp, tween(240), label = "searchShape")
     // AnimatedVisibility retains the outgoing subtree until collapse finishes.
     AnimatedVisibility(visibleState = visibility,
         enter = expandVertically(expandFrom = Alignment.Top, animationSpec = tween(240)) + fadeIn(tween(160)),

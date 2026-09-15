@@ -19,8 +19,17 @@
 
 - `:app:assembleDebug` 构建通过。
 - 全部 304 项 JVM 单元测试通过，包含新增查询语法、光标编辑、短页/续页/重试、作用域、混合来源失败、计数、会话取消、词库缓存与 DataStore 历史并发测试。
-- 标准 `:app:testDebugUnitTest` 的 Gradle worker 在此 Windows 环境因非 ASCII 缓存路径而启动失败（`ClassNotFoundException: worker.org.gradle.process.internal.worker.GradleWorkerMain`）。测试不是因此跳过：通过 Gradle 导出准确运行时和编译输出，使用包含 URI 编码 classpath 的 manifest JAR 启动相同 JUnit 测试。
-- 可复现命令：`powershell -File tools/Run-LocalUnitTests.ps1`（依赖本机 JDK 21 与 Python，JDK 可用 `-JavaHome` 指定）。日志位于 `.verify/local-junit.log`；脚本不修改全局 Gradle 配置。
+- 本机跑测试必须给 Gradle 的 JVM 加 `-Dfile.encoding=GBK`，否则 Gradle 测试 worker 起不来（`ClassNotFoundException: worker.org.gradle.process.internal.worker.GradleWorkerMain`）。根因是 Windows 上 Gradle 用户目录含非 ASCII 字符、而 JVM 默认编码与系统 ANSI 代码页不一致，classpath 在传给 worker 时被解错。
+  已实测两种写法：不加该参数 → 复现 ClassNotFoundException；加上 → 通过。
+  可复现命令（PowerShell）：
+
+  ```powershell
+  $env:JAVA_HOME='<你的 JDK 21>'; $env:ANDROID_HOME='<你的 Android SDK>'
+  .\gradlew.bat :app:testDebugUnitTest --console=plain `
+    "-Dorg.gradle.jvmargs=-Xmx4096m -XX:MaxMetaspaceSize=1g -Dfile.encoding=GBK"
+  ```
+
+  早期为此写过一个 `tools/Run-LocalUnitTests.ps1`（导出 classpath + 手工构造 manifest JAR + 用 Python 起 JUnit）。它把本机 JDK 绝对路径写死在脚本里，换台机器就不能用，而且会把用户名带进仓库；上面的单参数写法已经解决问题，该脚本与目录已删除。
 - `git diff --check` 通过。
 - 初次实现时无设备；随后已完成连接设备的核心流程验收，详情见 [真机验收记录](SEARCH_DEVICE_ACCEPTANCE.md)。中文 IME 组词、读屏、断网/鉴权故障注入及性能专项仍未完成。
 
@@ -34,3 +43,110 @@
 6. 结果视图复用既有卡片能力，未新增 E-Hentai 图搜、URL 直达、语义检索或另一套预设存储。
 
 APK：`app/build/outputs/apk/debug/app-debug.apk`。
+
+---
+
+# 第二轮：用户实测问题修复（2026-09-15 续）
+
+基线 `0a9d92f`，产出提交 `e92390b`（第一期落库）→ `d14b688` → `94e02d4` → `c092ad3`。
+对应讨论稿：[标签归一化讨论稿](TAG-NORMALIZATION-DISCUSSION.md)。
+
+## 1. 用真实库数据定位出的三个「看起来在工作、其实没生效」
+
+定位手段：把设备上缓存的服务器标签统计（`shared_prefs/search_tag_stats.xml`，1788 个标签对）
+拉下来做分布分析，并对照 LANraragi 0.9.81 源码。**该库的标签是中英双词汇并存的**：
+
+```
+艺术家 422 | 女性 394 | 团队 222 | 角色 190 | 男性 171 | artist 132 | group 89
+原作 61 | character 34 | 其他 28 | 语言 12 | female 8 | 混合 6 | 重新分类 5
+location 5 | parody 3 | male 2 | 地点 2 | mixed 1 | other 1
+```
+
+中文命名空间约占 84%，而 EhTagTranslation 词库只有英文命名空间 —— 这决定了下面三件事。
+
+### 1.1 排序「语言 / 系列」在这台服务器上等于随机顺序
+
+服务端把 `sortby` 当**字面正则**去标签串里匹配命名空间（`Model/Search.pm:576`
+`my $re = qr/$sortkey/;` 与 `:595` `$tags =~ m/.*${re}:(.*?)(\,.*|$)/`），命中不到时
+既不报错也不退回上一个顺序，全部条目进 `@unkeyed_ids` 并保持底层索引顺序（`:621`）。
+客户端发的是英文 wire 值（`LibraryQuery.kt:55-58`），而库里没有 `language:` / `series:` 标签。
+
+对照实验（另一台可连通的 0.9.81 服务器，10 本档案、只有 `date_added:` 标签）：
+
+| sortby | recordsTotal | data | 顺序 |
+| --- | --- | --- | --- |
+| `title` | 10 | 9 | 按标题有序 |
+| `artist` | 10 | 9 | 与下一行逐条完全相同 |
+| `zzzznosuchns` | 10 | 9 | 与上一行逐条完全相同 |
+
+顺带修正一处误判：`recordsTotal/recordsFiltered` **不受影响**（`Search.pm:78` 用的是
+`$#filtered + 1` 与库总量，不是 keyed 计数），所以结果头不会显示 0 项。
+
+修复（`d14b688`）：
+
+- 新增 `data/catalog/LibrarySortResolver.kt`：拿服务器自己的标签统计判断「这个排序键在本库
+  有没有对应命名空间」，只判真伪、**不改写** —— 把「艺术家」映射回 `artist` 属于归一化范畴，
+  在讨论稿结论出来之前客户端不擅自替换服务器使用的写法。
+- `SearchDiscoveryRepository` 的缓存新增 `namespaces` 字段，刻意保存**服务器原文**：
+  归一化会改写命名空间写法，用它判断会把不存在的排序键误判成可用。旧缓存缺该字段按「未知」降级。
+- 「排序与视图」面板给不生效的字段加警示图标 + 说明行，点选时提示一次；结果摘要也带一行短提示。
+- `LibraryCatalog.entryComparator` 的命名空间分支改为按目标命名空间取值。
+  原先落到 `else -> tags.firstOrNull()`（标签列表里的**第一个**标签，可能是语言、可能是时间戳），
+  等于用无关字段重排一遍；现在命中不到该命名空间的条目留在末尾且**不随升/降序翻转**，
+  与服务端 `:616-621`（先 reverse、再把未命中项 push 到末尾）一致。
+
+### 1.2 词库联想把服务器上不存在的标签排在前面
+
+原先 `known + fallback` 直接拼接，词库命中无差别优先。成因不只是拼接顺序：
+词库排序器把「命名空间的**前缀**命中」（输入 `ama` 命中命名空间 `artist`）排在
+「标签值的**前缀**命中」之上（`TagMatchQuality` 450 > 400），于是本库的 `团队:amam`
+（值前缀命中，但整串 `团队:amam` 并不以 `ama` 开头）在文本相关度上被系统性压低。
+
+修复（`d14b688`）：新增 `TagCandidate` / `TagCandidateBuilder`，用**独立于 `TagMatchQuality`
+的文本相关度档位**排序（值前缀 > 值包含 > 命名空间前缀），同级时本库真的有这个标签的排前面；
+每行标注「本库 N 本」/「词库」，并在标签菜单里说明是词库候选而非本库标签。
+
+真机实测（输入 `ama`，用户真实库）：`团队:amam`（本库 12）排在 `artist:amairo ayame`、
+`artist:ama natsuna`（词库）之前，每行都带来源标记。
+
+### 1.3 跨屏总线有重复定义，详情页/阅读器的刷新与筛选信号全部丢失
+
+`FilterBus` 与 `LibraryRefreshBus` 在 `com.lanraragi.reader.ui` 与
+`com.lanraragi.reader.ui.screens` **各有一份同名 object**。详情页与阅读器 import 的是 `ui.*`，
+图库收集的是 `screens.*`（同包内不需要 import）。后果：
+
+- 「详情页点标签 → 回图库按该标签过滤」不生效；
+- 详情页收藏 / 改标签 / 删除、阅读器写进度、设置页改配置之后，图库**不会刷新**。
+
+写进了一个没人读的 StateFlow，既不生效也不报错。修复（`c092ad3`）：删除重复定义，
+统一到 `screens/LibraryBus.kt`，并在文件头写明「每个总线只能有一份定义」。
+
+## 2. 用户上一轮明确要求的回补与新增交互
+
+| 项 | 说明 |
+| --- | --- |
+| 历史垃圾桶入口 | 上一轮紧凑化把「管理历史」收进了 `⋮` 菜单，本轮恢复 JHenTai 式的 `Icons.Delete`（error 色）放在历史 chips 下方右对齐；进入删除模式后变 ×，并出现「清空」「完成」。与 JHenTai 的差别：不把「清空全部」藏在图标长按上（它 `search_page_mixin.dart:264` 就是这么做的）。 |
+| 联想键盘导航 | EhViewer 与 JHenTai 都没有。用高亮下标而不是 `moveFocus`（建议行是 `combinedClickable` 的 `Row`、不是可聚焦节点，原先的 `moveFocus(Down)` 是空操作）；上下键移动并自动滚动到可见位置，回车采用高亮候选、无高亮才是提交，Esc 返回。 |
+| 联想「更多」 | 候选上限 40，默认展示 8 行，其余由「更多（N）」展开。 |
+| 排序与视图独立面板 | 从「排序与筛选」拆出排序字段/方向、视图模式、网格大小 → 新的 `SortViewSheet`；筛选面板改名「筛选」。收起态顶栏胶囊左侧改为两个独立点击区 `[排序与视图][筛选]`，搜索结果头同样两个键。理由：EhViewer 把视图切换藏在设置页、JHenTai 搜索页完全没有排序入口，都是同一类问题。 |
+| 胶囊连续形变 | 圆角改为跟**开合动画**同步（收起态 24dp 全圆角 → 展开 14dp，同一个 240ms），不再「先变圆角、再长出面板」。 |
+| 顶栏随滚动上滑隐藏 | 移植 EhViewer `GalleryListScreen.kt:511-526` 的 `NestedScrollConnection`，只观察不消费；位移上限为状态栏高度 + 胶囊高度 + 上边距，保证完全移出屏幕。换查询 / 进多选 / 切视图时复位。 |
+| 开合期间只挂载一个列表 | 底层图库改为在**动画真正结束**后才卸载/重挂（`searchTransition.currentState`），避免「面板还没盖住、底层先消失」的跳变。 |
+
+## 3. 死代码与文档
+
+- 删除 `SearchBus`（独立搜索页删除后已无写入方）。
+- 删除无人引用的 `ui/components/glass/LiquidGlassButton.kt`。
+- 删除 `tools/Run-LocalUnitTests.ps1`：它把本机 JDK 绝对路径写死在脚本里（换台机器不可用，
+  且会把 Windows 用户名带进仓库）。根因与单参数解法见本文「验证」一节。
+
+## 4. 仍未做 / 边界
+
+1. **命名空间中英归一未实施**，按用户要求先讨论。方案、风险与 13 个待拍板问题见
+   [标签归一化讨论稿](TAG-NORMALIZATION-DISCUSSION.md)。
+2. 排序只做「判真伪 + 提示」，没有自动把 `language` 改写成 `语言` —— 同上，属于归一化范畴。
+3. `TagNamespaceRegistry` 的别名索引仍不含中文 label，服务器上占 84% 的中文命名空间在 APP 内
+   仍走 fallback（灰色、排在全部内置命名空间之后）；`TagRules.artistOf` 与 `StatisticsScreen`
+   仍硬编码英文命名空间。这些都归入归一化讨论。
+4. 本轮真机验收未覆盖：中文 IME 组词、TalkBack、断网/鉴权故障注入、1k/10k 库性能、
+   横屏/平板/放大字体矩阵。硬件键盘导航已用 `input keyevent` 实测通过。

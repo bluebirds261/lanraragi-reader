@@ -99,7 +99,9 @@ object LibrarySortResolver {
             append(" 命名空间的标签，「")
             append(label)
             append("」排序不会生效")
-            report.similarNamespace?.let { append("（库里相近的写法是「").append(it).append("」）") }
+            // 只在库里确实存在另一套写法时给这句。它同时是「中文命名空间没被 APP 认出来」
+            // 这个已知问题的可见面：先把服务端实际在用的名字告诉用户，别让人以为是应用坏了。
+            report.similarNamespace?.let { append("（库里实际使用的是「").append(it).append("」命名空间）") }
         }
     }
 

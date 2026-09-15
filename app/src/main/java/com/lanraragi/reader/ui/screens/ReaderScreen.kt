@@ -176,10 +176,10 @@ import com.lanraragi.reader.domain.reader.ReaderPageMapping
 import com.lanraragi.reader.di.AppContainer
 import com.lanraragi.reader.ui.ErrorBox
 import com.lanraragi.reader.ui.CoverChangeBus
-import com.lanraragi.reader.ui.LibraryRefreshBus
 import com.lanraragi.reader.ui.LoadingBox
 import com.lanraragi.reader.ui.edgeSwipeBack
 import com.lanraragi.reader.ui.asImageRequest
+import com.lanraragi.reader.ui.screens.LibraryRefreshBus
 import java.security.MessageDigest
 import kotlin.math.abs
 import kotlin.math.roundToInt

@@ -18,14 +18,17 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.verticalScroll
@@ -89,10 +92,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
@@ -174,6 +182,7 @@ import kotlinx.coroutines.launch
 import java.util.Collections
 import java.util.UUID
 import java.nio.charset.StandardCharsets
+import kotlin.math.roundToInt
 
 private val SORT_OPTIONS = listOf(
     "title" to "标题",
@@ -419,19 +428,6 @@ class LibraryViewModel(
                     }
 
                     FilterBus.filter.value = null
-                    refresh()
-                }
-            }
-        }
-
-        viewModelScope.launch {
-            SearchBus.query.collect { q ->
-                if (q != null) {
-                    _state.update {
-                        it.copy(filter = q)
-                    }
-
-                    SearchBus.query.value = null
                     refresh()
                 }
             }
@@ -1611,6 +1607,14 @@ fun LibraryScreen(
     val searchTransition = remember { MutableTransitionState(false) }
     searchTransition.targetState = searchSession.expanded
     val searchExpanded = searchTransition.currentState || searchTransition.targetState
+    /**
+     * 开合动画**真正结束**之后才为 true。
+     *
+     * 用它（而不是 [searchExpanded]）决定底层图库是否挂载：`searchExpanded` 在点击瞬间就翻转，
+     * 底层内容会在展开面板盖住它之前先消失，画面上是一次突兀的跳变；收起时同理，
+     * 面板还在收、图库已经「先回来了」。开合期间始终只挂载一个活跃列表。
+     */
+    val searchFullyOpen = searchTransition.currentState
     LaunchedEffect(state.filter) {
         if (searchSession.submitted && state.filter != searchSession.committed) searchSession.accept(state.filter)
     }
@@ -1776,6 +1780,35 @@ fun LibraryScreen(
     val adaptiveLayout = adaptiveLayout(LocalConfiguration.current.screenWidthDp.dp)
     var detailSelection by rememberSaveable { mutableStateOf<String?>(null) }
 
+    /*
+     * 顶栏随滚动上滑隐藏。
+     *
+     * 移植自 EhViewer（`GalleryListScreen.kt:511-526`）：用一个只观察、不消费的
+     * NestedScrollConnection 累计滚动位移，把顶栏往上推；上限就是顶栏自己的预留高度
+     * （[topBarClearance]），所以最坏情况是胶囊藏到状态栏后面，不会飞出屏幕。
+     * 用 `onPostScroll` 的 `consumed` 而不是原始手势位移，才能和下拉刷新、惯性滑动对齐。
+     */
+    var topBarOffsetY by remember { mutableFloatStateOf(0f) }
+    // 顶栏是浮在屏幕最上沿的兄弟节点（不是 Scaffold 的 topBar），所以「藏起来」=
+    // 越过状态栏再叠上胶囊自身的高度与上边距，否则会停在状态栏上继续可见。
+    val topBarHideRangePx =
+        WindowInsets.statusBars.getTop(LocalDensity.current) +
+            with(LocalDensity.current) { (topBarVerticalPadding + topBarCapsuleHeight).toPx() }
+    val topBarScrollConnection = remember(topBarHideRangePx) {
+        object : NestedScrollConnection {
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                // consumed.y < 0 表示内容向上走（用户在往下翻）。
+                topBarOffsetY = (topBarOffsetY + consumed.y).coerceIn(-topBarHideRangePx, 0f)
+                return Offset.Zero
+            }
+        }
+    }
+    // 换查询、进入多选、切换视图都会重建列表，此时顶栏必须回到原位，
+    // 否则用户会看到「刚刷新的库没有搜索框」。
+    LaunchedEffect(state.queryGeneration, state.selectedIds.isNotEmpty(), state.viewMode, searchFullyOpen) {
+        topBarOffsetY = 0f
+    }
+
     // Keep a selection keyed by archive id across refreshes/recomposition. If the
     // selected row disappears, clear it rather than showing stale details.
     LaunchedEffect(state.items, adaptiveLayout) {
@@ -1937,7 +1970,10 @@ fun LibraryScreen(
                 snackbarHost = { if (!searchExpanded) SnackbarHost(snackbarHostState) },
             ) { padding ->
 
-            if (!searchExpanded) {
+            if (!searchFullyOpen) {
+                // nestedScroll 只挂在这里观察：连接本身不消费任何位移（返回 Offset.Zero），
+                // 下拉刷新与惯性滑动照旧。
+                Box(Modifier.fillMaxSize().nestedScroll(topBarScrollConnection)) {
                 AdaptiveLayoutHost(
                     layout = adaptiveLayout,
                     master = {
@@ -1981,6 +2017,7 @@ fun LibraryScreen(
                                 }
                             },
                 )
+                }
             }
         }
         }
@@ -2012,6 +2049,13 @@ fun LibraryScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
+                /*
+                 * 随滚动上滑隐藏（EhViewer GalleryListScreen.kt:511-526 的做法）：
+                 * 顶栏是浮在内容之上的兄弟节点，向下滚动时把它推到状态栏后面，
+                 * 让画廊真正占满屏幕；向上滚回一点就立刻恢复。
+                 * 位移上限就是顶栏自己的预留高度，不会把胶囊推到看不见的位置。
+                 */
+                .offset { IntOffset(0, topBarOffsetY.roundToInt()) }
                 .padding(
                     horizontal = 8.dp,
                     vertical = topBarVerticalPadding,
