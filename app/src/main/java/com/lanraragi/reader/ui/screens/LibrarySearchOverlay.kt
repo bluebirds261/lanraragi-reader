@@ -3,6 +3,8 @@ package com.lanraragi.reader.ui.screens
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.foundation.*
@@ -33,9 +35,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.platform.LocalView
 import android.app.Activity
 import android.content.ContextWrapper
@@ -71,6 +80,20 @@ import com.lanraragi.reader.ui.rememberTagText
 /** 联想列表默认展示的行数；超出部分由「更多」展开。 */
 private const val SUGGESTION_PREVIEW = 8
 
+/** 搜索面展开/收起的时长（圆形揭示与圆角形变共用）。库页延迟卸载底层列表也用它。 */
+internal const val SEARCH_REVEAL_MS = 320
+
+/** 圆心到屏幕最远角的距离：保证揭示圆最终一定盖满整屏。 */
+private fun farthestCornerDistance(origin: Offset, size: IntSize): Float {
+    val corners = listOf(
+        Offset(0f, 0f),
+        Offset(size.width.toFloat(), 0f),
+        Offset(0f, size.height.toFloat()),
+        Offset(size.width.toFloat(), size.height.toFloat()),
+    )
+    return corners.maxOf { (it - origin).getDistance() }
+}
+
 @OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun LibrarySearchOverlay(
@@ -86,6 +109,11 @@ fun LibrarySearchOverlay(
     suggestions: List<TagCandidate>, suggestionsLoading: Boolean, suggestionsError: String?,
     hotTags: List<TagStat>, hotLoading: Boolean, hotError: String?, hotUpdated: String?, hotLocal: Boolean,
     onRetryHot: () -> Unit, onOpenDictionary: () -> Unit,
+    /**
+     * 「以搜索栏为中心展开覆盖全屏」的圆心（根坐标，通常是收起态搜索胶囊的中心）。
+     * null 表示尚未量到，退化为屏幕上方居中。
+     */
+    revealOrigin: Offset? = null,
     backdrop: Backdrop?,
 ) {
     val view = LocalView.current
@@ -163,13 +191,44 @@ fun LibrarySearchOverlay(
         if (highlighted >= 0) suggestionListState.animateScrollToItem(suggestionRowOffset + highlighted)
     }
     // 圆角跟着**开合动画**走（而不是 phase 一变就跳）：收起态胶囊是 24dp 全圆角
-    // （48dp 高的一半），展开到面板时收到 14dp。两者用同一个 240ms，视觉上才是
+    // （48dp 高的一半），展开到面板时收到 14dp。用同一个时长，视觉上才是
     // 「同一个面在变形」，而不是「先变圆角、再长出面板」。
-    val corner by animateDpAsState(if (visibility.targetState) 14.dp else 24.dp, tween(240), label = "searchShape")
-    // AnimatedVisibility retains the outgoing subtree until collapse finishes.
-    AnimatedVisibility(visibleState = visibility,
-        enter = expandVertically(expandFrom = Alignment.Top, animationSpec = tween(240)) + fadeIn(tween(160)),
-        exit = shrinkVertically(shrinkTowards = Alignment.Top, animationSpec = tween(240)) + fadeOut(tween(160))) {
+    val corner by animateDpAsState(if (visibility.targetState) 14.dp else 24.dp, tween(SEARCH_REVEAL_MS), label = "searchShape")
+
+    /*
+     * 「以搜索栏为中心展开覆盖全屏」。
+     *
+     * 不用 AnimatedVisibility 的 expandVertically：那是从顶部边界往里裁，
+     * 展开方向与用户的点击点无关。这里用**圆形揭示**——以搜索胶囊的中心为圆心，
+     * 半径从 0 涨到「屏幕最远角」，面板像从这个胶囊里长出来一样铺满全屏，
+     * 收起时原路缩回去。
+     *
+     * 子树生命周期自己管：`mounted` 在展开时立刻置真，收起时等半径真正归零再卸载。
+     * `AnimatedVisibility` 做不到这一点（它要么立刻卸载、要么用一段可见的淡出陪跑，
+     * 淡出会和圆形揭示叠成「一边缩一边变淡」，不再是干净的中心展开）。
+     */
+    val reveal by animateFloatAsState(
+        targetValue = if (visibility.targetState) 1f else 0f,
+        animationSpec = tween(SEARCH_REVEAL_MS, easing = FastOutSlowInEasing),
+        label = "searchReveal",
+    )
+    var mounted by remember { mutableStateOf(visibility.targetState) }
+    LaunchedEffect(visibility.targetState, reveal) {
+        if (visibility.targetState) mounted = true else if (reveal == 0f) mounted = false
+    }
+    var rootSize by remember { mutableStateOf(IntSize.Zero) }
+    if (mounted) {
+        val origin = revealOrigin ?: Offset(rootSize.width / 2f, rootSize.height * 0.12f)
+        val radius = if (rootSize == IntSize.Zero) 1f else reveal * farthestCornerDistance(origin, rootSize)
+        Box(
+            Modifier
+                .fillMaxSize()
+                .onSizeChanged { rootSize = it }
+                .drawWithContent {
+                    if (radius <= 0f) return@drawWithContent
+                    clipPath(Path().apply { addOval(Rect(center = origin, radius = radius)) }) { this@drawWithContent.drawContent() }
+                },
+        ) {
         LaunchedEffect(session.phase) {
             if (session.phase == SearchPhase.EDITING) { focusRequester.requestFocus(); keyboard?.show() }
             else { keyboard?.hide(); focusManager.clearFocus(); managing = false }
@@ -408,6 +467,7 @@ fun LibrarySearchOverlay(
                         } else if (!hotLoading && hotError == null) item("hot-empty") { Text("暂无标签", Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                 }
+        }
         }
     }
     clearHistory?.let { legacy -> AlertDialog(onDismissRequest = { clearHistory = null },

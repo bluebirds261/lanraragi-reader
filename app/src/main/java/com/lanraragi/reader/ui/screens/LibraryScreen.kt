@@ -10,6 +10,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,7 +19,6 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -28,7 +28,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.verticalScroll
@@ -93,14 +92,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
-import androidx.compose.ui.input.nestedscroll.NestedScrollSource
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
@@ -182,7 +179,6 @@ import kotlinx.coroutines.launch
 import java.util.Collections
 import java.util.UUID
 import java.nio.charset.StandardCharsets
-import kotlin.math.roundToInt
 
 private val SORT_OPTIONS = listOf(
     "title" to "标题",
@@ -1608,13 +1604,21 @@ fun LibraryScreen(
     searchTransition.targetState = searchSession.expanded
     val searchExpanded = searchTransition.currentState || searchTransition.targetState
     /**
-     * 开合动画**真正结束**之后才为 true。
+     * 展开动画**真正结束**之后才为 true。
      *
-     * 用它（而不是 [searchExpanded]）决定底层图库是否挂载：`searchExpanded` 在点击瞬间就翻转，
-     * 底层内容会在展开面板盖住它之前先消失，画面上是一次突兀的跳变；收起时同理，
-     * 面板还在收、图库已经「先回来了」。开合期间始终只挂载一个活跃列表。
+     * 用它（而不是 [searchExpanded]）决定底层图库是否挂载：圆形揭示期间圆外仍然是图库，
+     * 底层必须先留着，否则展开过程中会被一块空白顶掉；展开结束后再卸载，
+     * 保证开合期间始终只有一个活跃列表（两个 LazyGrid 共用同一份 gridState 会打架）。
      */
-    val searchFullyOpen = searchTransition.currentState
+    var searchFullyOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(searchSession.expanded) {
+        if (searchSession.expanded) {
+            delay(SEARCH_REVEAL_MS.toLong())
+            searchFullyOpen = true
+        } else {
+            searchFullyOpen = false
+        }
+    }
     // 图库页上的清除（胶囊的 ×、空结果的「清除搜索条件」）会直接改 state.filter；
     // 同步回会话的「已提交查询」，否则下次打开搜索面会拿旧查询当草稿。
     LaunchedEffect(state.filter) {
@@ -1787,33 +1791,18 @@ fun LibraryScreen(
     var detailSelection by rememberSaveable { mutableStateOf<String?>(null) }
 
     /*
-     * 顶栏随滚动上滑隐藏。
+     * 顶栏**不随滚动隐藏**。
      *
-     * 移植自 EhViewer（`GalleryListScreen.kt:511-526`）：用一个只观察、不消费的
-     * NestedScrollConnection 累计滚动位移，把顶栏往上推；上限就是顶栏自己的预留高度
-     * （[topBarClearance]），所以最坏情况是胶囊藏到状态栏后面，不会飞出屏幕。
-     * 用 `onPostScroll` 的 `consumed` 而不是原始手势位移，才能和下拉刷新、惯性滑动对齐。
+     * 曾经移植过 EhViewer 的 NestedScrollConnection 上滑隐藏（`GalleryListScreen.kt:511-526`），
+     * 真机用下来不合适：库页顶栏是「搜索入口 + 排序筛选入口」两个主动作，
+     * 藏起来之后想搜索必须先往回滚一点，多一步无谓操作；
+     * 而且位移上限要越过状态栏才能真正藏住，滑到一半停住时半截胶囊更难看。
+     * 顶栏常驻，让画廊从它下方穿过即可。
+     *
+     * 搜索面的展开原点（用于「以搜索栏为中心展开覆盖全屏」）在这里量取。
      */
-    var topBarOffsetY by remember { mutableFloatStateOf(0f) }
-    // 顶栏是浮在屏幕最上沿的兄弟节点（不是 Scaffold 的 topBar），所以「藏起来」=
-    // 越过状态栏再叠上胶囊自身的高度与上边距，否则会停在状态栏上继续可见。
-    val topBarHideRangePx =
-        WindowInsets.statusBars.getTop(LocalDensity.current) +
-            with(LocalDensity.current) { (topBarVerticalPadding + topBarCapsuleHeight).toPx() }
-    val topBarScrollConnection = remember(topBarHideRangePx) {
-        object : NestedScrollConnection {
-            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
-                // consumed.y < 0 表示内容向上走（用户在往下翻）。
-                topBarOffsetY = (topBarOffsetY + consumed.y).coerceIn(-topBarHideRangePx, 0f)
-                return Offset.Zero
-            }
-        }
-    }
-    // 换查询、进入多选、切换视图都会重建列表，此时顶栏必须回到原位，
-    // 否则用户会看到「刚刷新的库没有搜索框」。
-    LaunchedEffect(state.queryGeneration, state.selectedIds.isNotEmpty(), state.viewMode, searchFullyOpen) {
-        topBarOffsetY = 0f
-    }
+    var searchBarOrigin by remember { mutableStateOf(Offset.Zero) }
+    var searchBarOriginReady by remember { mutableStateOf(false) }
 
     // Keep a selection keyed by archive id across refreshes/recomposition. If the
     // selected row disappears, clear it rather than showing stale details.
@@ -1977,9 +1966,6 @@ fun LibraryScreen(
             ) { padding ->
 
             if (!searchFullyOpen) {
-                // nestedScroll 只挂在这里观察：连接本身不消费任何位移（返回 Offset.Zero），
-                // 下拉刷新与惯性滑动照旧。
-                Box(Modifier.fillMaxSize().nestedScroll(topBarScrollConnection)) {
                 AdaptiveLayoutHost(
                     layout = adaptiveLayout,
                     master = {
@@ -2027,7 +2013,6 @@ fun LibraryScreen(
                                 }
                             },
                 )
-                }
             }
         }
         }
@@ -2059,13 +2044,6 @@ fun LibraryScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                /*
-                 * 随滚动上滑隐藏（EhViewer GalleryListScreen.kt:511-526 的做法）：
-                 * 顶栏是浮在内容之上的兄弟节点，向下滚动时把它推到状态栏后面，
-                 * 让画廊真正占满屏幕；向上滚回一点就立刻恢复。
-                 * 位移上限就是顶栏自己的预留高度，不会把胶囊推到看不见的位置。
-                 */
-                .offset { IntOffset(0, topBarOffsetY.roundToInt()) }
                 .padding(
                     horizontal = 8.dp,
                     vertical = topBarVerticalPadding,
@@ -2086,9 +2064,16 @@ fun LibraryScreen(
                 },
                 modifier =
                     Modifier
-                        .weight(1f),
+                        .weight(1f)
+                        // 量取这条胶囊在根坐标里的中心：搜索面「以搜索栏为中心展开覆盖全屏」
+                        // 的圆心就是它。顶栏常驻，所以开合前后这个值都是有效的。
+                        .onGloballyPositioned { coordinates ->
+                            val bounds = coordinates.boundsInRoot()
+                            searchBarOrigin = Offset(bounds.center.x, bounds.center.y)
+                            searchBarOriginReady = true
+                        },
                 backdrop = backdrop,
-                hint = "搜索标题或标签…",
+                hint = "搜索",
                 readOnly = true,
                 capsuleClickable = true,
                 clearContentDescription = "清除搜索词",
@@ -2101,12 +2086,17 @@ fun LibraryScreen(
                     // 排序 / 视图 / 筛选合并成一个键：它们都是「怎么看这个库」的同一次决策，
                     // 拆成两个键时用户为了换个列数要先越过一整屏筛选条件。
                     // 放在最右侧（主操作侧），图标沿用「排序与视图」的 Tune。
+                    // 按压反馈与底栏一致：`indication = null`，不要 Material 的灰色衬底
+                    // （MainScreen.kt:3293 的每个底栏键都是这个写法）。
                     Box(
                         modifier = Modifier
                             .fillMaxHeight()
                             .width(topBarCapsuleHeight)
                             .clip(CircleShape)
-                            .clickable {
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                            ) {
                                 showFilter = true
                             },
                         contentAlignment = Alignment.Center,
@@ -2134,6 +2124,8 @@ fun LibraryScreen(
         // ================================================================
         LibrarySearchOverlay(
             session = searchSession, visibility = searchTransition,
+            // 「以搜索栏为中心展开覆盖全屏」的圆心。取不到时按屏幕上方居中兜底。
+            revealOrigin = searchBarOrigin.takeIf { searchBarOriginReady },
             onSubmit = { submitDraft() },
             onSubmitHistory = { submitDraft(it) },
             onAppendTag = { full, excluded ->

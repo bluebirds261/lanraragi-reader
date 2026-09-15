@@ -1,6 +1,7 @@
 package com.lanraragi.reader.ui.components.glass
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
@@ -18,6 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -117,7 +119,15 @@ fun LiquidGlassSearchBar(
                     .weight(1f)
                     .then(
                         if (readOnly && capsuleClickable) {
+                            /*
+                             * 与底栏一致：**不要灰色衬底**（`indication = null`）。
+                             * 玻璃表面本身已经是浮在内容之上的材质，再叠一层 Material
+                             * 的按压色块会把它压成「一块按钮」，也在浅色主题下明显发灰。
+                             * 底栏的每个键同样是指示为空 + 圆形裁剪（MainScreen.kt:3293）。
+                             */
                             Modifier.clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
                                 onClick = onClick,
                             )
                         } else {
