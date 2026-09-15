@@ -29,12 +29,15 @@ object TagSuggestionRanker {
         frequencies: Iterable<TagFrequencyRecord> = emptyList(),
         personalFrequency: Map<TagKnowledgeKey, Long> = emptyMap(),
         limit: Int = 10,
+        checkpoint: () -> Unit = {},
     ): List<TagSuggestion> {
         if (limit <= 0) return emptyList()
         val freq = frequencies.groupBy { TagKnowledgeKey(it.namespace, it.tagKey) }
             .mapValues { (_, rows) -> rows.sumOf { it.count.coerceAtLeast(0L) } }
         val positive = query.positiveTokens
+        var visited = 0
         return entries.asSequence().mapNotNull { entry ->
+            if (visited++ % 128 == 0) checkpoint()
             val key = TagKnowledgeKey(entry.namespace, entry.tagKey)
             val total = freq[key] ?: 0L
             val personal = personalFrequency[key] ?: 0L

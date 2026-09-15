@@ -115,6 +115,9 @@ interface ProgressTaskDao {
 
 @Dao
 interface LocalMetadataDao {
+    @Query("SELECT * FROM local_metadata")
+    suspend fun all(): List<LocalMetadataEntity>
+
     @Query("SELECT * FROM local_metadata WHERE sourceKey = :sourceKey")
     fun observe(sourceKey: String): Flow<LocalMetadataEntity?>
 

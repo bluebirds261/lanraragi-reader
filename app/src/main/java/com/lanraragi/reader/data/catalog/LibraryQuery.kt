@@ -3,6 +3,7 @@ package com.lanraragi.reader.data.catalog
 /** Single source of truth for Library filters. Values are deliberately UI-agnostic. */
 data class LibraryQuery(
     val text: String = "",
+    val serverScope: String = "",
     val tags: Set<String> = emptySet(),
     val categoryId: String? = null,
     val source: LibrarySource = LibrarySource.ALL,

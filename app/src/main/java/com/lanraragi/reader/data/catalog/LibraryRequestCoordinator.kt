@@ -19,6 +19,7 @@ data class LibraryRequestState(
     val loading: Boolean = false,
     val loadingMore: Boolean = false,
     val error: Throwable? = null,
+    val warning: String? = null,
     val hasMore: Boolean = true,
     /** Zero-based cursor for the next append; valid only after a successful load. */
     val nextPage: Int = 0,
@@ -74,10 +75,10 @@ class LibraryRequestCoordinator(
     }
 
     override fun cancel() {
-        nextGeneration.incrementAndGet()
+        val generation = nextGeneration.incrementAndGet()
         job?.cancel()
         job = null
-        _state.update { it.copy(loading = false, loadingMore = false) }
+        _state.update { it.copy(generation = generation, loading = false, loadingMore = false, hasMore = false) }
     }
 
     private suspend fun load(generation: Long, query: LibraryQuery, page: Int = 0, append: Boolean) {
@@ -86,9 +87,11 @@ class LibraryRequestCoordinator(
             if (nextGeneration.get() != generation) return
             val merged = if (append) (_state.value.items + result.items).distinctBy(LibraryEntry::sourceKey) else result.items
             _state.update {
+                if (it.generation != generation) return@update it
                 it.copy(
                     items = merged,
                     total = result.total,
+                    warning = result.warning,
                     loading = false,
                     loadingMore = false,
                     hasMore = result.hasMore,
@@ -100,7 +103,7 @@ class LibraryRequestCoordinator(
             throw cancelled
         } catch (error: Exception) {
             if (nextGeneration.get() != generation) return
-            _state.update { it.copy(loading = false, loadingMore = false, error = error) }
+            _state.update { if (it.generation == generation) it.copy(loading = false, loadingMore = false, error = error) else it }
         }
     }
 }

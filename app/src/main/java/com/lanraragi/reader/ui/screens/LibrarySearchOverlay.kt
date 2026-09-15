@@ -1,37 +1,14 @@
 package com.lanraragi.reader.ui.screens
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.*
 import androidx.compose.animation.core.tween
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.interaction.MutableInteractionSource
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.MutableTransitionState
+import androidx.compose.foundation.*
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -39,485 +16,409 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.FilterList
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusDirection
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.platform.LocalView
+import android.app.Activity
+import android.content.ContextWrapper
+import androidx.core.view.WindowCompat
+import androidx.compose.ui.input.key.*
+import androidx.compose.ui.platform.LocalClipboard
+import androidx.compose.ui.platform.ClipEntry
+import android.content.ClipData
+import kotlinx.coroutines.launch
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import com.kyant.backdrop.Backdrop
+import com.lanraragi.reader.data.catalog.SearchQueryCodec
 import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.data.tags.TagNamespaceRegistry
+import com.lanraragi.reader.data.tags.knowledge.TagSuggestion
 import com.lanraragi.reader.ui.components.glass.liquidGlassCapsule
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.rememberTagText
 
-/**
- * 搜索面（库页顶栏胶囊的原地展开层）—— 合并两份参考实现的长处：
- *
- * - **EhViewer 1.14.6 `ui/screen/SearchBarScreen.kt`**：胶囊原地展开成面板、背后压 scrim、
- *   展开区里直接铺联想；联想把「历史 + 标签」合进同一条列表。
- * - **JHenTai `pages/search`**：历史是 EHTag 造形的胶囊（高 24 / 圆角 8 / 字号 12）、
- *   垃圾桶图标进入删除模式、标签行显示命名空间着色 + 词库译名、
- *   **结果留在搜索面里**（`bodyType` 在「联想/历史」与「结果」之间切换）。
- *
- * 与本项目现状的取舍（按用户裁决）：
- * - 「标签浏览」独立页已删除，标签联想与热门标签都在这里；
- * - 面板里不再显示「排序与筛选」（与搜索无关；库页顶栏左侧键仍是它）；
- * - 结果不另画一套网格，由调用方传入 [resultsContent]（复用库页同一份列表状态）；
- * - 浅色主题下玻璃底面加厚（[baseSurfaceAlpha]），否则文字读不清。
- */
-@OptIn(ExperimentalLayoutApi::class)
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun LibrarySearchOverlay(
-    expanded: Boolean,
-    submitted: Boolean,
-    query: String,
-    onQueryChange: (String) -> Unit,
+    session: SearchSessionState,
+    visibility: MutableTransitionState<Boolean>,
     onSubmit: () -> Unit,
     onSubmitHistory: (String) -> Unit,
-    onCollapse: () -> Unit,
-    onAppendTag: (fullTag: String, excluded: Boolean) -> Unit,
-    history: List<String>,
-    onRemoveHistory: (String) -> Unit,
-    onClearHistory: () -> Unit,
-    suggestions: List<TagStat>,
-    hotTags: List<TagStat>,
-    hotNamespaces: List<String>,
-    hotNamespace: String,
-    onHotNamespaceChange: (String) -> Unit,
-    resultCount: Int,
-    backdrop: Backdrop?,
-    resultsContent: @Composable (Modifier) -> Unit,
-    modifier: Modifier = Modifier,
+    onAppendTag: (String, Boolean?) -> Unit,
+    history: List<String>, legacyHistory: List<String>,
+    historyHidden: Boolean, historyPaused: Boolean,
+    onHistoryHidden: (Boolean) -> Unit, onHistoryPaused: (Boolean) -> Unit,
+    onRemoveHistory: (String, Boolean) -> Unit, onClearHistory: (Boolean) -> Unit,
+    suggestions: List<TagSuggestion>, suggestionsLoading: Boolean, suggestionsError: String?,
+    hotTags: List<TagStat>, hotLoading: Boolean, hotError: String?, hotUpdated: String?, hotLocal: Boolean,
+    onRetryHot: () -> Unit, onOpenDictionary: () -> Unit,
+    state: LibraryState, onClearSelection: () -> Unit, onOpenFilters: () -> Unit, onClearSearch: () -> Unit,
+    backdrop: Backdrop?, resultsContent: @Composable (Modifier) -> Unit,
 ) {
-    if (!expanded) return
-
-    val lightTheme = MaterialTheme.colorScheme.surface.luminance() > 0.5f
-    // 浅色主题下纯玻璃几乎读不清（用户实测反馈），垫一层较厚的 surface；深色主题保留通透感。
-    val baseAlpha = if (lightTheme) 0.86f else 0.42f
-    val scrimAlpha by animateFloatAsState(
-        targetValue = if (submitted) 1f else if (lightTheme) 0.94f else 0.86f,
-        animationSpec = tween(durationMillis = 240),
-        label = "searchScrim",
-    )
-    val corner by animateDpAsState(
-        targetValue = if (submitted) 14.dp else 18.dp,
-        animationSpec = tween(durationMillis = 260),
-        label = "searchCorner",
-    )
-    val focusRequester = remember { FocusRequester() }
-    val scrimInteraction = remember { MutableInteractionSource() }
-
-    var deleteMode by remember { mutableStateOf(false) }
-    var hideHistory by remember { mutableStateOf(false) }
-
-    LaunchedEffect(expanded) {
-        if (expanded) runCatching { focusRequester.requestFocus() }
+    val view = LocalView.current
+    val lightSurface = MaterialTheme.colorScheme.background.luminance() > 0.5f
+    DisposableEffect(visibility.currentState || visibility.targetState, lightSurface) {
+        var context = view.context
+        while (context is ContextWrapper && context !is Activity) context = context.baseContext
+        val window = (context as? Activity)?.window
+        val controller = window?.let { WindowCompat.getInsetsController(it, view) }
+        val previous = controller?.isAppearanceLightStatusBars
+        if (visibility.currentState || visibility.targetState) controller?.isAppearanceLightStatusBars = lightSurface
+        onDispose { if (previous != null) controller?.isAppearanceLightStatusBars = previous }
     }
-
-    Box(modifier.fillMaxSize()) {
-        // scrim 单独一层：只负责「点空白收起」，不覆盖面板（否则会把输入框的焦点/手势吃掉）
-        Box(
-            Modifier
-                .matchParentSize()
-                .background(MaterialTheme.colorScheme.background.copy(alpha = scrimAlpha))
-                .clickable(indication = null, interactionSource = scrimInteraction) { onCollapse() },
-        )
-
-        Column(
-            Modifier
-                .fillMaxSize()
-                .statusBarsPadding()
-                .imePadding()
-                .padding(horizontal = 8.dp, vertical = 6.dp),
-        ) {
-            // ============================================================
-            // 面板：收起 + 输入 + 清除（形变中的玻璃：胶囊 → 圆角矩形）
-            // ============================================================
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .liquidGlassCapsule(
-                        backdrop = backdrop,
-                        outline = true,
-                        shape = RoundedCornerShape(corner),
-                        baseSurfaceAlpha = baseAlpha,
-                    )
-                    .padding(horizontal = 6.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                IconButton(onClick = onCollapse) {
-                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "收起搜索")
-                }
-                Box(Modifier.weight(1f)) {
-                    if (query.isEmpty()) {
-                        Text(
-                            "搜索标题或标签…",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    BasicTextField(
-                        value = query,
-                        onValueChange = onQueryChange,
-                        singleLine = true,
-                        textStyle =
-                            MaterialTheme.typography.bodyLarge.copy(
-                                color = MaterialTheme.colorScheme.onSurface,
-                            ),
+    val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
+    val focusRequester = remember { FocusRequester() }
+    val clipboard = LocalClipboard.current
+    val scope = rememberCoroutineScope()
+    var managing by rememberSaveable { mutableStateOf(false) }
+    var historyExpanded by rememberSaveable { mutableStateOf(false) }
+    var legacyExpanded by rememberSaveable { mutableStateOf(false) }
+    var hotExpanded by rememberSaveable { mutableStateOf(false) }
+    var namespace by rememberSaveable { mutableStateOf("") }
+    var clearHistory by remember { mutableStateOf<Boolean?>(null) }
+    var help by remember { mutableStateOf(false) }
+    var historyMenu by remember { mutableStateOf(false) }
+    var hotMenu by remember { mutableStateOf(false) }
+    var resultMenu by remember { mutableStateOf(false) }
+    val imeVisible = WindowInsets.isImeVisible
+    val back: () -> Unit = {
+        keyboard?.hide()
+        focusManager.clearFocus()
+        when {
+            managing -> managing = false
+            state.selectedIds.isNotEmpty() -> if (!state.batchBusy) onClearSelection()
+            else -> session.back()
+        }
+    }
+    BackHandler(visibility.currentState || visibility.targetState) {
+        if (imeVisible) { keyboard?.hide(); focusManager.clearFocus() } else back()
+    }
+    val query = session.draft.text
+    val conditions = remember(query) { SearchQueryCodec.parse(query).filter { it.exact && it.value.isNotBlank() } }
+    val inputToken = SearchQueryCodec.active(query, session.draft.selection.start).value.substringAfter(':')
+    val corner by animateDpAsState(if (session.expanded) 14.dp else 24.dp, tween(240), label = "searchShape")
+    // AnimatedVisibility retains the outgoing subtree until collapse finishes.
+    AnimatedVisibility(visibleState = visibility,
+        enter = expandVertically(expandFrom = Alignment.Top, animationSpec = tween(240)) + fadeIn(tween(160)),
+        exit = shrinkVertically(shrinkTowards = Alignment.Top, animationSpec = tween(240)) + fadeOut(tween(160))) {
+        LaunchedEffect(session.phase) {
+            if (session.phase == SearchPhase.EDITING) { focusRequester.requestFocus(); keyboard?.show() }
+            else { keyboard?.hide(); focusManager.clearFocus(); managing = false }
+        }
+        LaunchedEffect(hotLocal, hotTags) { if (hotTags.none { it.namespace.orEmpty() == namespace }) namespace = "" }
+        Column(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)
+            .statusBarsPadding().navigationBarsPadding().imePadding().padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalAlignment = Alignment.CenterHorizontally) {
+            Row(Modifier.widthIn(max = 720.dp).fillMaxWidth()
+                .liquidGlassCapsule(backdrop = backdrop, outline = true, shape = RoundedCornerShape(corner), baseSurfaceAlpha = 0.94f),
+                verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = back, modifier = Modifier.size(40.dp)) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回搜索", Modifier.size(20.dp)) }
+                Box(Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
+                    if (query.isEmpty()) Text("搜索标题或标签…", style = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    BasicTextField(value = session.draft, onValueChange = { session.edit(it) }, singleLine = true,
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurface),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                         keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
-                        modifier =
-                            Modifier
-                                .fillMaxWidth()
-                                .focusRequester(focusRequester),
-                    )
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp).wrapContentHeight()
+                            .focusRequester(focusRequester)
+                            .onFocusChanged { if (it.isFocused && session.submitted) session.phase = SearchPhase.EDITING }
+                            .onPreviewKeyEvent {
+                                when {
+                                    it.type != KeyEventType.KeyUp -> false
+                                    it.key == Key.Escape -> { back(); true }
+                                    it.key == Key.DirectionDown -> focusManager.moveFocus(FocusDirection.Down)
+                                    it.key == Key.Enter -> { onSubmit(); true }
+                                    else -> false
+                                }
+                            })
                 }
-                if (query.isNotEmpty()) {
-                    IconButton(onClick = { onQueryChange("") }) {
-                        Icon(Icons.Filled.Clear, contentDescription = "清除")
+                if (query.isNotEmpty()) IconButton(onClick = { session.edit(TextFieldValue()) }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.Clear, "清除输入", Modifier.size(18.dp)) }
+                IconButton(onClick = onSubmit, enabled = query.isNotBlank() && session.draft.composition == null,
+                    modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Search, "提交搜索", Modifier.size(20.dp)) }
+            }
+            if (!session.submitted && conditions.isNotEmpty()) {
+                Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    conditions.forEach { clause ->
+                        SearchChip(text = translatedQuery(query.substring(clause.start, clause.end)) + " ×", onClick = {
+                            val revised = SearchQueryCodec.parse(query).filter { it.start != clause.start }
+                                .map { query.substring(it.start, it.end).trim() }.filter(String::isNotBlank).joinToString(",")
+                            session.edit(TextFieldValue(revised, androidx.compose.ui.text.TextRange(revised.length)))
+                        })
                     }
                 }
             }
-
-            if (submitted) {
-                // ------------------------------------------------------------
-                // 结果内嵌：与库页共用同一份列表状态（[resultsContent]）
-                // ------------------------------------------------------------
-                Text(
-                    "$resultCount 个结果",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp),
-                )
-                resultsContent(Modifier.fillMaxSize())
-                return@Column
-            }
-
-            // ------------------------------------------------------------
-            // 联想 / 历史态（JHenTai 的 suggestionAndHistory）
-            // ------------------------------------------------------------
-            LazyColumn(
-                Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                if (history.isNotEmpty()) {
-                    item(key = "history-header") {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                "搜索历史",
-                                style = MaterialTheme.typography.titleSmall,
-                                modifier =
-                                    Modifier
-                                        .weight(1f)
-                                        .padding(start = 8.dp),
-                            )
-                            // JHenTai：垃圾桶图标切换删除模式；隐藏时换成「眼睛」
-                            IconButton(onClick = { deleteMode = !deleteMode }) {
-                                Icon(
-                                    Icons.Filled.Delete,
-                                    contentDescription = if (deleteMode) "退出删除模式" else "管理历史",
-                                    modifier = Modifier.size(20.dp),
-                                    tint =
-                                        if (deleteMode) {
-                                            MaterialTheme.colorScheme.error
-                                        } else {
-                                            MaterialTheme.colorScheme.onSurfaceVariant
-                                        },
-                                )
-                            }
-                            IconButton(onClick = { hideHistory = !hideHistory }) {
-                                Icon(
-                                    Icons.Filled.Visibility,
-                                    contentDescription = if (hideHistory) "显示历史" else "隐藏历史",
-                                    modifier = Modifier.size(20.dp),
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                            Text(
-                                "清空",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier =
-                                    Modifier
-                                        .clickable(onClick = onClearHistory)
-                                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                            )
+            session.error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(8.dp)) }
+            if (session.submitted || (!visibility.targetState && session.hasResults)) {
+                Row(Modifier.fillMaxWidth().padding(start = 6.dp).heightIn(min = 36.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(if (state.loading) "搜索中…" else state.total?.let { "$it 项结果" }
+                        ?: "已加载 ${state.items.size} 项", Modifier.weight(1f),
+                        style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    IconButton(onClick = onOpenFilters, modifier = Modifier.size(36.dp)) {
+                        Icon(Icons.Default.FilterList, "范围与排序", Modifier.size(18.dp))
+                    }
+                    Box {
+                        IconButton(onClick = { resultMenu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "结果选项", Modifier.size(18.dp)) }
+                        DropdownMenu(resultMenu, { resultMenu = false }) {
+                            DropdownMenuItem(text = { Text("已加载 ${state.items.size} 项", fontSize = 12.sp) }, enabled = false, onClick = {})
+                            DropdownMenuItem(text = { Text(searchScopeSummary(state), fontSize = 12.sp) }, onClick = { resultMenu = false; onOpenFilters() })
+                            DropdownMenuItem(text = { Text("清除搜索") }, onClick = { resultMenu = false; onClearSearch() })
                         }
                     }
-                    if (deleteMode) {
-                        item(key = "history-hint") {
-                            Text(
-                                "点历史条目即可删除，再点垃圾桶退出",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error,
-                                modifier = Modifier.padding(start = 12.dp, bottom = 4.dp),
-                            )
+                }
+                if (state.selectedIds.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("已选 ${state.selectedIds.size} 项")
+                    TextButton(onClick = onClearSelection, enabled = !state.batchBusy) { Text("退出多选") }
+                }
+                resultsContent(Modifier.weight(1f).fillMaxWidth())
+            } else {
+                LazyColumn(Modifier.widthIn(max = 720.dp).fillMaxWidth().weight(1f),
+                    contentPadding = PaddingValues(top = 4.dp, bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (query.isNotBlank()) {
+                        item("direct") { SearchSuggestionRow("搜索「$query」", onClick = onSubmit, searchIcon = true) }
+                        if (!historyHidden) items(history.filter { it.contains(query, true) }.take(3), key = { "match:$it" }) { h ->
+                            SearchSuggestionRow(translatedQuery(h), onClick = { onSubmitHistory(h) }, subtitle = "历史")
                         }
-                    }
-                    item(key = "history-chips") {
-                        AnimatedVisibility(
-                            visible = !hideHistory,
-                            enter = expandVertically() + fadeIn(),
-                            exit = shrinkVertically() + fadeOut(),
-                        ) {
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(7.dp),
-                                modifier = Modifier.padding(horizontal = 12.dp),
-                            ) {
-                                history.forEach { h ->
-                                    EhTagChip(
-                                        text = h,
-                                        inDeleteMode = deleteMode,
-                                        onClick = {
-                                            if (deleteMode) onRemoveHistory(h) else onSubmitHistory(h)
-                                        },
-                                    )
+                        if (suggestionsLoading) item("suggestion-loading") { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+                        suggestionsError?.let { error -> item("suggestion-error") {
+                            Text(error, Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            TextButton(onClick = onOpenDictionary) { Text("词库设置", fontSize = 12.sp) }
+                        } }
+                        items(suggestions, key = { "tag:${it.entry.namespace}:${it.entry.tagKey}" }) { suggestion ->
+                            val entry = suggestion.entry
+                            val full = if (entry.namespace.isBlank()) entry.tagKey else "${entry.namespace}:${entry.tagKey}"
+                            var menu by remember { mutableStateOf(false) }
+                            Row(Modifier.fillMaxWidth().heightIn(min = 44.dp)
+                                .combinedClickable(onClick = { onAppendTag(full, null) }, onLongClick = { menu = true })
+                                .padding(start = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
+                                    Text(highlight(full, inputToken), fontSize = 13.sp, lineHeight = 17.sp,
+                                        color = rememberTagColor(entry.namespace), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    entry.translatedName?.takeIf { it != full }?.let {
+                                        Text(highlight(it, inputToken), fontSize = 11.sp, lineHeight = 15.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                    }
+                                }
+                                Box {
+                                    IconButton(onClick = { menu = true }, modifier = Modifier.size(36.dp)) { Icon(Icons.Default.MoreVert, "标签操作", Modifier.size(16.dp)) }
+                                    DropdownMenu(menu, { menu = false }) {
+                                        DropdownMenuItem(text = { Text("包含") }, onClick = { menu = false; onAppendTag(full, false) })
+                                        DropdownMenuItem(text = { Text("排除") }, onClick = { menu = false; onAppendTag(full, true) })
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-
-                // ---- 联想（有输入时）----
-                if (suggestions.isNotEmpty()) {
-                    item(key = "suggestion-header") {
-                        Text(
-                            "标签联想（点选=包含，长按=排除）",
-                            style = MaterialTheme.typography.titleSmall,
-                            modifier = Modifier.padding(start = 8.dp, top = 4.dp),
-                        )
-                    }
-                    items(suggestions, key = { "s:${it.full}" }) { tag ->
-                        val ns = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
-                        SearchRow(
-                            leading = {
-                                Icon(
-                                    Icons.Filled.Search,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp),
-                                    tint = rememberTagColor(ns),
-                                )
-                            },
-                            title = "${ns.ifBlank { tag.namespace.orEmpty() }}:${tag.text}",
-                            subtitle = rememberTagText(ns, tag.text),
-                            titleColor = rememberTagColor(ns),
-                            onClick = { onAppendTag(tag.full, false) },
-                            onLongClick = { onAppendTag(tag.full, true) },
-                        )
-                    }
-                } else if (query.isNotBlank()) {
-                    item(key = "direct") {
-                        SearchRow(
-                            leading = {
-                                Icon(
-                                    Icons.Filled.Search,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                            },
-                            title = "搜索「$query」",
-                            subtitle = null,
-                            titleColor = MaterialTheme.colorScheme.primary,
-                            onClick = { onSubmit() },
-                        )
-                    }
-                }
-
-                // ---- 热门标签：单独一块区域（JHenTai 的标签面板做法）----
-                if (query.isBlank() && hotTags.isNotEmpty()) {
-                    item(key = "hot-header") {
-                        Text(
-                            "热门标签",
-                            style = MaterialTheme.typography.titleSmall,
-                            modifier = Modifier.padding(start = 8.dp, top = 8.dp),
-                        )
-                    }
-                    item(key = "hot-namespaces") {
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                            modifier = Modifier.padding(horizontal = 12.dp),
-                        ) {
-                            hotNamespaces.forEach { ns ->
-                                FilterChipLike(
-                                    text = ns.ifBlank { "全部" },
-                                    selected = ns == hotNamespace,
-                                    tint =
-                                        if (ns.isBlank()) {
-                                            MaterialTheme.colorScheme.primary
-                                        } else {
-                                            rememberTagColor(
-                                                TagNamespaceRegistry.canonicalNamespace(ns).orEmpty(),
-                                            )
-                                        },
-                                    onClick = { onHotNamespaceChange(ns) },
-                                )
+                        if (!suggestionsLoading && suggestions.isEmpty() && suggestionsError == null) item("suggestion-empty") {
+                            Text("暂无标签建议", Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    } else {
+                        item("history-title") { Row(Modifier.heightIn(min = 36.dp), verticalAlignment = Alignment.CenterVertically) {
+                            SearchSection(if (historyPaused) "历史 · 已暂停" else if (history.isEmpty()) "历史 · 暂无" else "历史", Modifier.weight(1f))
+                            if (history.isNotEmpty() && !managing && !historyHidden) IconButton(onClick = { historyExpanded = !historyExpanded }, modifier = Modifier.size(32.dp)) {
+                                Icon(if (historyExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                                    if (historyExpanded) "收起历史" else "展开历史", Modifier.size(18.dp))
+                            }
+                            if (managing) TextButton(onClick = { managing = false }, contentPadding = PaddingValues(horizontal = 8.dp)) { Text("完成", fontSize = 12.sp) }
+                            Box {
+                                IconButton(onClick = { historyMenu = true }, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.MoreVert, "历史选项", Modifier.size(18.dp)) }
+                                DropdownMenu(historyMenu, { historyMenu = false }) {
+                                    DropdownMenuItem(text = { Text("管理历史") }, onClick = { historyMenu = false; managing = true; onHistoryHidden(false) })
+                                    DropdownMenuItem(text = { Text(if (historyHidden) "显示历史" else "隐藏历史") }, onClick = { historyMenu = false; onHistoryHidden(!historyHidden) })
+                                    DropdownMenuItem(text = { Text(if (historyPaused) "恢复记录" else "暂停记录") }, onClick = { historyMenu = false; onHistoryPaused(!historyPaused) })
+                                    if (legacyHistory.isNotEmpty()) DropdownMenuItem(text = { Text(if (legacyExpanded) "收起旧历史" else "查看旧历史") },
+                                        onClick = { historyMenu = false; legacyExpanded = !legacyExpanded; onHistoryHidden(false) })
+                                    DropdownMenuItem(text = { Text("清空历史") }, onClick = { historyMenu = false; clearHistory = false })
+                                }
+                            }
+                        } }
+                        if (!historyHidden) {
+                            if (history.isNotEmpty()) item("history") {
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), maxLines = if (historyExpanded || managing) Int.MAX_VALUE else 2) {
+                                    history.forEach { h ->
+                                        var menu by remember(h) { mutableStateOf(false) }
+                                        Box {
+                                            SearchChip(translatedQuery(h), onClick = { if (managing) onRemoveHistory(h, false) else onSubmitHistory(h) },
+                                                onLongClick = { menu = true }, deleting = managing)
+                                            DropdownMenu(menu, { menu = false }) {
+                                                DropdownMenuItem(text = { Text("编辑后搜索") }, onClick = { menu = false; session.edit(TextFieldValue(h, androidx.compose.ui.text.TextRange(h.length))) })
+                                                DropdownMenuItem(text = { Text("复制") }, onClick = { menu = false; scope.launch { clipboard.setClipEntry(ClipEntry(ClipData.newPlainText("搜索历史", h))) } })
+                                                DropdownMenuItem(text = { Text("删除") }, onClick = { menu = false; onRemoveHistory(h, false) })
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (legacyHistory.isNotEmpty() && legacyExpanded) item("legacy") {
+                                SearchSection("旧历史")
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    legacyHistory.forEach { h -> SearchChip(translatedQuery(h),
+                                        onClick = { if (managing) onRemoveHistory(h, true) else onSubmitHistory(h) }, deleting = managing) }
+                                }
+                                if (managing) TextButton(onClick = { clearHistory = true }) { Text("清空旧历史", fontSize = 12.sp) }
                             }
                         }
-                    }
-                    item(key = "hot-chips") {
-                        val visible = remember(hotTags, hotNamespace) {
-                            hotTags.filter { hotNamespace.isBlank() || it.namespace == hotNamespace }
-                        }
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalArrangement = Arrangement.spacedBy(7.dp),
-                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
-                        ) {
-                            visible.take(60).forEach { tag ->
-                                val ns = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
-                                EhTagChip(
-                                    text = rememberTagText(ns, tag.text),
-                                    tint = rememberTagColor(ns),
-                                    onClick = { onAppendTag(tag.full, false) },
-                                )
+                        item("hot-title") { Row(Modifier.padding(top = 6.dp).heightIn(min = 36.dp), verticalAlignment = Alignment.CenterVertically) {
+                            SearchSection("热门标签", Modifier.weight(1f))
+                            if (hotLoading) CircularProgressIndicator(Modifier.padding(8.dp).size(14.dp), strokeWidth = 1.5.dp)
+                            Box {
+                                IconButton(onClick = { hotMenu = true }, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.MoreVert, "热门标签选项", Modifier.size(18.dp)) }
+                                DropdownMenu(hotMenu, { hotMenu = false }) {
+                                    DropdownMenuItem(text = { Text("刷新") }, enabled = !hotLoading, onClick = { hotMenu = false; onRetryHot() })
+                                    DropdownMenuItem(text = { Text(if (hotLocal) "按本地标签频次排序" else "按服务器标签频次排序", fontSize = 12.sp) }, enabled = false, onClick = {})
+                                    hotUpdated?.let { updated -> DropdownMenuItem(text = { Text(updated, fontSize = 11.sp) }, enabled = false, onClick = {}) }
+                                    DropdownMenuItem(text = { Text("搜索帮助") }, onClick = { hotMenu = false; help = true })
+                                }
                             }
-                        }
+                        } }
+                        if (hotError != null) item("hot-error") { Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(if (hotTags.isEmpty()) "标签暂不可用" else "暂用缓存", Modifier.weight(1f).padding(start = 8.dp),
+                                fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            TextButton(onClick = onRetryHot) { Text("重试", fontSize = 12.sp) }
+                        } }
+                        if (hotTags.isNotEmpty()) {
+                            item("namespaces") { Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                (listOf("") + hotTags.map { it.namespace.orEmpty() }.filter(String::isNotBlank).distinct()).forEach { ns ->
+                                    SearchChip(if (ns.isBlank()) "全部" else TagNamespaceRegistry.descriptor(ns)?.labelZh ?: ns,
+                                        onClick = { namespace = ns; hotExpanded = false }, selected = namespace == ns, outlined = true)
+                                }
+                            } }
+                            item("hot-tags") {
+                                val visible = hotTags.filter { namespace.isBlank() || it.namespace == namespace }
+                                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    visible.take(if (hotExpanded) 60 else 15).forEach { tag ->
+                                        var menu by remember(tag.full) { mutableStateOf(false) }
+                                        Box {
+                                            SearchChip(rememberTagText(tag.namespace.orEmpty(), tag.text),
+                                                onClick = { onAppendTag(tag.full, false) }, onLongClick = { menu = true })
+                                            DropdownMenu(menu, { menu = false }) {
+                                                DropdownMenuItem(text = { Text("${tag.full} · ${tag.weight}", fontSize = 12.sp) }, onClick = { menu = false })
+                                                DropdownMenuItem(text = { Text("直接搜索") }, onClick = {
+                                                    menu = false
+                                                    runCatching { SearchQueryCodec.exactTag(tag.full) }.onSuccess(onSubmitHistory)
+                                                        .onFailure { session.error = it.message }
+                                                })
+                                                DropdownMenuItem(text = { Text("排除此标签") }, onClick = { menu = false; onAppendTag(tag.full, true) })
+                                            }
+                                        }
+                                    }
+                                }
+                                if (visible.size > 15) TextButton(onClick = { hotExpanded = !hotExpanded }, contentPadding = PaddingValues(horizontal = 8.dp, vertical = 0.dp), modifier = Modifier.height(32.dp)) { Text(if (hotExpanded) "收起" else "更多", fontSize = 12.sp) }
+                            }
+                        } else if (!hotLoading && hotError == null) item("hot-empty") { Text("暂无标签", Modifier.padding(8.dp), fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                 }
             }
         }
     }
+    clearHistory?.let { legacy -> AlertDialog(onDismissRequest = { clearHistory = null },
+        title = { Text(if (legacy) "清空旧搜索历史？" else "清空当前范围的搜索历史？") },
+        text = { Text("清空后无法恢复，其他范围的历史不受影响。") },
+        confirmButton = { TextButton(onClick = { clearHistory = null; onClearHistory(legacy) }) { Text("清空") } },
+        dismissButton = { TextButton(onClick = { clearHistory = null }) { Text("取消") } }) }
+    if (help) AlertDialog(onDismissRequest = { help = false }, title = { Text("搜索标题或标签") },
+        text = { Text("多个条件用逗号分隔，表示同时满足。\n\nartist:name$：精确标签\n-language:english$：排除标签\npages:>100：超过 100 页\n* 和 ?：通配符\n\n中文标签请点选联想，应用会填入原文。当前服务器不支持 ~ 运算符。") },
+        confirmButton = { TextButton(onClick = { help = false }) { Text("知道了") } })
 }
 
-/** JHenTai 的 EHTag：高 24 / 圆角 8 / 水平 6 / 垂直 3 / 字号 12；删除模式下弹入 × 徽章。 */
-@Composable
-private fun EhTagChip(
-    text: String,
-    tint: Color = MaterialTheme.colorScheme.onSurface,
-    inDeleteMode: Boolean = false,
-    onClick: () -> Unit,
-) {
-    Row(
-        Modifier
-            .height(24.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .clickable(onClick = onClick)
-            .padding(horizontal = 6.dp, vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp, lineHeight = 12.sp),
-            color = tint,
-        )
-        AnimatedVisibility(visible = inDeleteMode, enter = fadeIn(), exit = fadeOut()) {
-            Box(
-                Modifier
-                    .padding(start = 4.dp)
-                    .size(13.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.error),
-                contentAlignment = Alignment.Center,
-            ) {
-                Icon(
-                    Icons.Filled.Clear,
-                    contentDescription = "删除",
-                    tint = MaterialTheme.colorScheme.onError,
-                    modifier = Modifier.size(10.dp),
-                )
-            }
-        }
-    }
+@Composable private fun SearchSection(text: String, modifier: Modifier = Modifier) {
+    Text(text, modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium))
 }
 
-/** 命名空间筛选小胶囊（热门标签区用）。 */
-@Composable
-private fun FilterChipLike(
-    text: String,
-    selected: Boolean,
-    tint: Color,
-    onClick: () -> Unit,
-) {
-    Row(
-        Modifier
-            .height(28.dp)
-            .clip(RoundedCornerShape(999.dp))
-            .background(
-                if (selected) {
-                    tint.copy(alpha = 0.22f)
-                } else {
-                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-                }
-            )
-            .clickable(onClick = onClick)
-            .padding(horizontal = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Text(
-            text,
-            style = MaterialTheme.typography.labelMedium,
-            color = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
-}
-
-/** 两行联想行（EhViewer 的 `ListItem` 造型 + JHenTai 的命名空间着色与译名）。 */
 @OptIn(ExperimentalFoundationApi::class)
-@Composable
-private fun SearchRow(
-    leading: @Composable () -> Unit,
-    title: String,
-    subtitle: String?,
-    titleColor: Color,
-    onClick: () -> Unit,
-    onLongClick: (() -> Unit)? = null,
+@Composable private fun SearchChip(
+    text: String, onClick: () -> Unit, onLongClick: (() -> Unit)? = null,
+    deleting: Boolean = false, selected: Boolean = false, outlined: Boolean = false,
 ) {
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(10.dp))
-            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-            .padding(horizontal = 12.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        leading()
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                title,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Medium),
-                color = titleColor,
-            )
-            if (!subtitle.isNullOrBlank() && subtitle != title) {
-                Text(
-                    subtitle,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+    val color = when {
+        selected -> MaterialTheme.colorScheme.secondaryContainer
+        outlined -> MaterialTheme.colorScheme.surface
+        else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+    }
+    Surface(shape = RoundedCornerShape(8.dp), color = color,
+        modifier = Modifier.padding(vertical = 2.dp).heightIn(min = 32.dp).widthIn(max = 240.dp)
+            .combinedClickable(role = Role.Button, onClick = onClick, onLongClick = onLongClick)) {
+        Text((if (deleting) "× " else "") + text, Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelMedium.copy(fontSize = 12.sp, lineHeight = 16.sp),
+            color = if (selected) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable private fun SearchSuggestionRow(text: String, onClick: () -> Unit, subtitle: String? = null, searchIcon: Boolean = false) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 40.dp).clickable(onClick = onClick).padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        if (searchIcon) Icon(Icons.Default.Search, null, Modifier.padding(end = 8.dp).size(18.dp), tint = MaterialTheme.colorScheme.primary)
+        Text(text, Modifier.weight(1f), fontSize = 13.sp, lineHeight = 18.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        subtitle?.let { Text(it, fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+}
+
+@Composable private fun highlight(text: String, query: String): AnnotatedString {
+    val color = MaterialTheme.colorScheme.primary
+    return buildAnnotatedString {
+        append(text)
+        if (query.isNotBlank()) {
+            var from = text.indexOf(query, ignoreCase = true)
+            while (from >= 0) {
+                addStyle(SpanStyle(color = color, fontWeight = FontWeight.Bold), from, from + query.length)
+                from = text.indexOf(query, from + query.length, ignoreCase = true)
             }
         }
     }
+}
+
+internal fun searchScopeSummary(state: LibraryState): String = buildList {
+    add(when (state.source) {
+        com.lanraragi.reader.data.catalog.LibrarySource.LOCAL -> "本地书架"
+        com.lanraragi.reader.data.catalog.LibrarySource.REMOTE -> "服务器"
+        else -> "全部来源（分组）"
+    })
+    if (state.categoryId.isNotBlank()) add(state.categories.firstOrNull { it.id == state.categoryId }?.name ?: "当前分类")
+    if (state.newOnly) add("仅新档案")
+    if (state.untaggedOnly) add("无标签")
+    if (state.hideCompleted) add("隐藏读完")
+    if (state.selectedTags.isNotEmpty()) add(state.selectedTags.joinToString("、"))
+    add((when (state.sortby) { "title" -> "标题"; "lastread" -> "最近阅读"; "date_added" -> "添加日期"; "artist" -> "作者"; "language" -> "语言"; "series" -> "系列"; else -> state.sortby }) +
+        if (state.order.equals("desc", true)) "降序" else "升序")
+}.joinToString(" · ")
+
+@Composable private fun translatedQuery(query: String): String {
+    val values = mutableListOf<String>()
+    SearchQueryCodec.parse(query).filter { it.value.isNotBlank() }.forEach { clause ->
+        if (clause.exact) {
+            val namespace = if (':' in clause.value) clause.value.substringBefore(':') else ""
+            val translated = rememberTagText(namespace, clause.value.substringAfter(':'))
+            values += (if (clause.excluded) "排除 " else "") + translated
+        } else values += query.substring(clause.start, clause.end).trim()
+    }
+    return values.joinToString("，")
 }

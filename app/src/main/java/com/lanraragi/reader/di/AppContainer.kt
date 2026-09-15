@@ -161,6 +161,7 @@ class AppContainer(val context: Context) {
     /** 开屏封面：用户在设置里从图库选的一张图片（私有目录副本）。 */
     val splashCoverStore = SplashCoverStore(context)
     val searchHistoryRepository = SearchHistoryRepository(context)
+    val searchDiscoveryRepository = com.lanraragi.reader.data.SearchDiscoveryRepository(context)
     val historyRepository = HistoryRepository(
         context,
         readerDatabase,

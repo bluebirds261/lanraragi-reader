@@ -30,6 +30,8 @@ object SelectionModeBus {
 object MainTabBus {
     /** 底栏第 2 键 = 下载页 Tab 的索引（MainScreen 的 mainTabs 顺序：首页/下载/设置）。 */
     const val DOWNLOAD_TAB = 1
+    const val SETTINGS_TAB = 2
+    fun requestSettingsTab() { target.value = SETTINGS_TAB }
 
     val target = MutableStateFlow<Int?>(null)
 

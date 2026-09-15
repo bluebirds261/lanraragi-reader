@@ -38,6 +38,7 @@ class ApiException(
 data class PageResult(
     val items: List<Archive>,
     val total: Int?,
+    val libraryTotal: Int? = null,
 )
 
 /**
@@ -104,7 +105,8 @@ class LanraragiRepository(
         val body = resp.body()?.string()
         ensureSuccess(resp, body)
         val (items, total) = JsonHelpers.parseArchiveList(body ?: "[]")
-        PageResult(items, total)
+        val counts = JsonHelpers.parseSearchCounts(body ?: "[]")
+        PageResult(items, counts.matched, counts.library)
     }
 
     suspend fun getMetadata(arcid: String): Archive = network {

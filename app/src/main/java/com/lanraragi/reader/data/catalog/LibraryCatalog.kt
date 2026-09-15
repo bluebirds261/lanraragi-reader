@@ -2,6 +2,9 @@ package com.lanraragi.reader.data.catalog
 
 import com.lanraragi.reader.domain.model.ArchiveCapabilities
 import com.lanraragi.reader.domain.model.ArchiveIdentity
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /** Unified remote/local row consumed by a future LibraryViewModel. */
 data class LibraryEntry(
@@ -33,15 +36,22 @@ data class LibraryEntry(
 
 data class LibraryPage(
     val items: List<LibraryEntry>,
-    val total: Int,
+    val total: Int?,
     val page: Int,
     val pageSize: Int,
     val hasMore: Boolean,
+    val warning: String? = null,
 )
 
 interface LibraryRemoteGateway {
     /** Return all rows matching the server-side portion of [query]. */
     suspend fun fetch(query: LibraryQuery): List<LibraryEntry>
+}
+
+data class RemoteLibraryPage(val items: List<LibraryEntry>, val total: Int?, val nextOffset: Int, val hasMore: Boolean)
+
+interface PagedLibraryRemoteGateway : LibraryRemoteGateway {
+    suspend fun fetchPage(query: LibraryQuery, offset: Int): RemoteLibraryPage
 }
 
 interface LibraryLocalGateway {
@@ -60,34 +70,79 @@ class MixedLibraryRepository(
     private val remote: LibraryRemoteGateway,
     private val local: LibraryLocalGateway,
 ) : LibraryRepository {
-    override suspend fun load(query: LibraryQuery, page: Int, pageSize: Int): LibraryPage {
-        require(page >= 0) { "page must be non-negative" }
-        require(pageSize > 0) { "pageSize must be positive" }
+    private val mutex = Mutex()
+    private data class Session(
+        val query: LibraryQuery,
+        val rows: List<LibraryEntry>,
+        val localCount: Int,
+        val nextOffset: Int = 0,
+        val remoteTotal: Int? = null,
+        val hasMore: Boolean = false,
+        val warning: String? = null,
+        val pageStarts: Map<Int, Int> = mapOf(0 to 0),
+    )
+    private var session: Session? = null
+
+    override suspend fun load(query: LibraryQuery, page: Int, pageSize: Int): LibraryPage = mutex.withLock {
+        require(page >= 0 && pageSize > 0)
         val q = query.normalized()
-        val candidates = buildList {
-            if (q.source != LibrarySource.LOCAL) addAll(remote.fetch(q))
-            if (q.source != LibrarySource.REMOTE) addAll(local.fetch())
+        require(SearchQueryCodec.validationError(q.text) == null) { SearchQueryCodec.validationError(q.text).orEmpty() }
+        val paged = remote as? PagedLibraryRemoteGateway
+        var initial = session?.takeIf { page > 0 && it.query == q }
+        if (initial == null) {
+            val localRows = if (q.source != LibrarySource.REMOTE) local.fetch().filter { it.matches(q) }
+                .distinctBy(LibraryEntry::sourceKey).sortedWith(entryComparator(q)) else emptyList()
+            if (paged == null && q.source != LibrarySource.LOCAL) {
+                val remoteRows = remote.fetch(q).filter { it.matches(q) }
+                val rows = (remoteRows + localRows).distinctBy(LibraryEntry::sourceKey).sortedWith(entryComparator(q))
+                initial = Session(q, rows, 0, remoteTotal = rows.size)
+            } else {
+                initial = Session(q, localRows, localRows.size, hasMore = q.source != LibrarySource.LOCAL,
+                    remoteTotal = if (q.source == LibrarySource.LOCAL) 0 else null)
+            }
         }
-        val rows = candidates.asSequence()
-            .distinctBy(LibraryEntry::sourceKey)
-            .filter { it.matches(q) }
-            .sortedWith(entryComparator(q))
-            .toList()
-        val from = (page * pageSize).coerceAtMost(rows.size)
-        val to = (from + pageSize).coerceAtMost(rows.size)
-        return LibraryPage(rows.subList(from, to), rows.size, page, pageSize, to < rows.size)
+        var current = requireNotNull(initial)
+        val from = current.pageStarts[page] ?: (page * pageSize).coerceAtMost(current.rows.size)
+        val required = from + pageSize
+        // Production mixed-source results are explicitly grouped: local first, server order next.
+        // Fetch at least the first remote page to expose counts/errors even if local fills the screen.
+        while (current.hasMore && (current.rows.size < required || current.nextOffset == 0)) {
+            try {
+                val fetched = requireNotNull(paged).fetchPage(q, current.nextOffset)
+                val rows = (current.rows + fetched.items.filter { it.matches(q) }).distinctBy(LibraryEntry::sourceKey)
+                current = current.copy(rows = rows, nextOffset = fetched.nextOffset, remoteTotal = fetched.total,
+                    hasMore = fetched.hasMore && fetched.nextOffset > current.nextOffset, warning = null)
+                if (current.rows.size > from) break
+            } catch (cancelled: CancellationException) { throw cancelled
+            } catch (error: Exception) {
+                if (current.rows.isEmpty() || page > 0) throw error
+                current = current.copy(warning = "服务器结果未加载：${error.message ?: "连接失败"}")
+                break
+            }
+        }
+        val to = (from + pageSize).coerceAtMost(current.rows.size)
+        session = current.copy(pageStarts = current.pageStarts + (page + 1 to to))
+        val total = when {
+            current.warning != null -> null
+            !current.hasMore -> current.rows.size
+            q.savedOnly || q.requiredCapabilities.isNotEmpty() -> null
+            else -> current.remoteTotal?.plus(current.localCount)
+        }
+        LibraryPage(current.rows.subList(from, to), total, page, pageSize,
+            to < current.rows.size || current.hasMore, current.warning)
     }
 
     private fun LibraryEntry.matches(q: LibraryQuery): Boolean {
         if (q.source != LibrarySource.ALL && source != q.source) return false
         if (q.savedOnly && !isSaved) return false
         if (!q.requiredCapabilities.all { hasCapability(it) }) return false
+        // Search/category membership and remote flags were already evaluated by LANraragi.
+        if (source == LibrarySource.REMOTE) return true
         if (q.newOnly && !isNew) return false
         if (q.untaggedOnly && tags.isNotEmpty()) return false
+        if (q.hideCompleted && pageCount > 0 && progress.toDouble() / pageCount > 0.85) return false
         if (q.categoryId != null && categoryId != q.categoryId) return false
-        val needle = q.text.trim().lowercase()
-        if (needle.isNotEmpty() && !("$title $summary ${tags.joinToString(" ")}".lowercase().contains(needle))) return false
-        return q.tags.all { wanted -> tags.any { it.equals(wanted, true) || it.startsWith("$wanted:", true) } }
+        return SearchQueryCodec.matches(q.remoteRequest().filter.orEmpty(), title, tags, pageCount, progress)
     }
 
     private fun LibraryEntry.hasCapability(capability: LibraryCapability): Boolean = when (capability) {

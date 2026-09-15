@@ -8,7 +8,7 @@ import com.lanraragi.reader.data.model.Archive
 import com.lanraragi.reader.domain.model.ArchiveIdentity
 import kotlinx.coroutines.flow.first
 
-/** LANraragi adapter. It exhausts the server result set so cross-source paging remains stable. */
+/** LANraragi offset paging. The legacy fetch method remains for non-paged callers. */
 class LanraragiLibraryRemoteGateway(
     private val repository: LanraragiRepository,
     private val serverScope: () -> String? = { null },
@@ -18,30 +18,34 @@ class LanraragiLibraryRemoteGateway(
      * 已配置但连不通的服务器仍照常抛错，保留错误提示与重试。
      */
     private val serverConfigured: () -> Boolean = { true },
-) : LibraryRemoteGateway {
-    override suspend fun fetch(query: LibraryQuery): List<LibraryEntry> {
-        if (!serverConfigured()) return emptyList()
+) : PagedLibraryRemoteGateway {
+    override suspend fun fetchPage(query: LibraryQuery, offset: Int): RemoteLibraryPage {
+        if (!serverConfigured()) return RemoteLibraryPage(emptyList(), 0, offset, false)
+        val scopeAtStart = com.lanraragi.reader.data.api.ApiClient.config.baseUrl.trimEnd('/')
+        check(query.serverScope.isBlank() || query.serverScope == scopeAtStart) { "服务器正在切换，请重试" }
         val request = query.remoteRequest()
+        val result = repository.getArchives(
+            page = offset, filter = request.filter, sortby = request.sort.wireValue,
+            order = request.direction.name.lowercase(), categoryId = request.categoryId,
+            newonly = request.newOnly, untaggedonly = request.untaggedOnly,
+            hideCompleted = request.hideCompleted,
+        )
+        check(scopeAtStart == com.lanraragi.reader.data.api.ApiClient.config.baseUrl.trimEnd('/')) { "服务器已切换，请重新搜索" }
+        val next = offset + result.items.size
+        return RemoteLibraryPage(
+            result.items.filter { it.arcid.isNotBlank() }.map { it.toLibraryEntry(query.serverScope.ifBlank { serverScope().orEmpty() }) },
+            result.total, next, result.items.isNotEmpty() && (result.total == null || next < result.total),
+        )
+    }
+
+    override suspend fun fetch(query: LibraryQuery): List<LibraryEntry> {
         val rows = mutableListOf<LibraryEntry>()
         var offset = 0
-        var expected: Int? = null
-        while (true) {
-            val result = repository.getArchives(
-                page = offset,
-                filter = request.filter,
-                sortby = request.sort.wireValue,
-                order = request.direction.name.lowercase(),
-                categoryId = request.categoryId,
-                newonly = request.newOnly,
-                untaggedonly = request.untaggedOnly,
-                hideCompleted = request.hideCompleted,
-            )
-            expected = result.total ?: expected
-            val received = result.items
-            rows += received.asSequence().filter { it.arcid.isNotBlank() }.map { it.toLibraryEntry(serverScope()) }
-            offset += received.size
-            if (received.isEmpty() || (expected != null && offset >= expected)) break
-        }
+        do {
+            val page = fetchPage(query, offset)
+            rows += page.items
+            offset = page.nextOffset
+        } while (page.hasMore)
         return rows.distinctBy(LibraryEntry::sourceKey)
     }
 }
@@ -51,8 +55,9 @@ class RoomLibraryLocalGateway(
     private val database: ReaderDatabase,
 ) : LibraryLocalGateway {
     override suspend fun fetch(): List<LibraryEntry> {
+        val metadata = database.localMetadataDao().all().associateBy { it.sourceKey }
         return database.localArchiveDao().observeAll().first().map { archive ->
-            archive.toLibraryEntry(database.localMetadataDao().find(archive.sourceKey))
+            archive.toLibraryEntry(metadata[archive.sourceKey])
         }
     }
 }

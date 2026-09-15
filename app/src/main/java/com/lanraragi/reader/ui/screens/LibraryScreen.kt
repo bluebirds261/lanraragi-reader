@@ -3,6 +3,7 @@ package com.lanraragi.reader.ui.screens
 import android.content.Context
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
@@ -90,6 +92,17 @@ import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.material3.SnackbarResult
+import com.lanraragi.reader.data.catalog.SearchQueryCodec
+import com.lanraragi.reader.data.SearchDiscoveryRepository
+import com.lanraragi.reader.data.catalog.RoomLibraryLocalGateway
+import com.lanraragi.reader.data.tags.knowledge.TagSuggestion
+import com.lanraragi.reader.data.tags.knowledge.TagDictionaryRecord
+import com.lanraragi.reader.data.tags.knowledge.TagMatchQuality
+import com.lanraragi.reader.data.tags.knowledge.TagKnowledgeKey
+import com.lanraragi.reader.data.tags.TagNamespaceRegistry
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
@@ -199,6 +212,9 @@ data class LibraryState(
     val error: String? = null,
     val hasMore: Boolean = true,
     val filter: String = "",
+    val source: LibrarySource = LibrarySource.ALL,
+    val serverScope: String = "",
+    val warning: String? = null,
     val selectedTags: List<String> = emptyList(),
     val sortby: String = "title",
     val order: String = "asc",
@@ -260,22 +276,31 @@ class LibraryViewModel(
         viewModelScope.launch { _scrollToTop.emit(Unit) }
     }
 
-    /** 提交一条搜索（展开层用）：记历史 + 写入 SearchBus，由本页收集后刷新。 */
-    fun submitSearch(query: String) {
-        val q = query.trim()
+    /** Commit immediately; persistence failure cannot prevent a search. */
+    fun submitSearch(text: String, historyScope: String = "") {
+        val q = text.trim().trimEnd(',')
         if (q.isEmpty()) return
+        val error = SearchQueryCodec.validationError(q)
+        if (error != null) { _state.update { it.copy(message = error) }; return }
+        if (_state.value.loading && _state.value.filter == q) return
+        _state.update { it.copy(filter = q, selectedIds = emptySet(), items = emptyList(), total = null, loading = true, error = null) }
+        refresh()
         viewModelScope.launch {
-            container.searchHistoryRepository.add(q)
-            SearchBus.query.value = q
+            try { container.searchHistoryRepository.add(q, historyScope) }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { _state.update { it.copy(message = "搜索已提交，但历史保存失败") } }
         }
     }
 
-    fun removeSearchHistory(query: String) {
-        viewModelScope.launch { container.searchHistoryRepository.remove(query) }
+    fun setSource(source: LibrarySource) {
+        _state.update { it.copy(source = source, selectedIds = emptySet()) }
+        refresh()
     }
 
-    fun clearSearchHistory() {
-        viewModelScope.launch { container.searchHistoryRepository.clear() }
+    fun setServerScope(serverScope: String) {
+        if (_state.value.serverScope == serverScope) return
+        _state.update { it.copy(serverScope = serverScope, categoryId = "", selectedIds = emptySet()) }
+        refresh()
     }
 
     init {
@@ -307,7 +332,7 @@ class LibraryViewModel(
                 val hideCompleted = _state.value.hideCompleted
                 val visibleItems = request.items
                     .filter { entry ->
-                        !hideCompleted || !(entry.pageCount > 0 && entry.progress.toFloat() / entry.pageCount > 0.85f)
+                        !hideCompleted || entry.source != LibrarySource.LOCAL || !(entry.pageCount > 0 && entry.progress.toFloat() / entry.pageCount > 0.85f)
                     }
                     .map { entry -> entry.toLegacyArchive() }
 
@@ -319,6 +344,7 @@ class LibraryViewModel(
                         loadingMore = request.loadingMore,
                         hasMore = request.hasMore,
                         error = request.error?.message ?: request.error?.javaClass?.simpleName,
+                        warning = request.warning,
                         queryGeneration = request.generation,
                     )
                 }
@@ -483,7 +509,8 @@ class LibraryViewModel(
                 text = s.filter,
                 tags = s.selectedTags.toSet(),
                 categoryId = s.categoryId.ifBlank { null },
-                source = LibrarySource.ALL,
+                source = s.source,
+                serverScope = s.serverScope,
                 newOnly = s.newOnly,
                 untaggedOnly = s.untaggedOnly,
                 hideCompleted = s.hideCompleted,
@@ -1557,58 +1584,100 @@ fun LibraryScreen(
 
     val backdrop = rememberLayerBackdrop()
 
-    /*
-     * 搜索胶囊的原地展开（参考 EhViewer 1.14.6 的 SearchBar 展开）：
-     * 展开层直接铺在库页之上，历史与联想列表就在里面；「标签浏览」再去完整搜索页。
-     */
-    var searchExpanded by rememberSaveable { mutableStateOf(false) }
-    var searchSubmitted by rememberSaveable { mutableStateOf(false) }
-    var overlayQuery by rememberSaveable { mutableStateOf("") }
-    val overlayHistory by container.searchHistoryRepository.history
-        .collectAsStateWithLifecycle(initialValue = emptyList())
-    var overlaySuggestions by remember { mutableStateOf<List<TagStat>>(emptyList()) }
-    // 热门标签（服务端标签统计）：展开时拉一次，排除日期类元数据后按热度排
-    var overlayHotTags by remember { mutableStateOf<List<TagStat>>(emptyList()) }
-    var overlayHotNamespace by remember { mutableStateOf("") }
-    val overlayHotNamespaces = remember(overlayHotTags) {
-        buildList {
-            add("")
-            overlayHotTags.mapNotNull { it.namespace?.trim()?.takeIf(String::isNotBlank) }
-                .groupingBy { it }
-                .eachCount()
-                .entries
-                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
-                .forEach { (ns, _) -> add(ns) }
+    val searchSession = rememberSaveable(saver = SearchSessionState.Saver) { SearchSessionState() }
+    val searchTransition = remember { MutableTransitionState(false) }
+    searchTransition.targetState = searchSession.expanded
+    val searchExpanded = searchTransition.currentState || searchTransition.targetState
+    LaunchedEffect(state.filter) {
+        if (searchSession.submitted && state.filter != searchSession.committed) searchSession.accept(state.filter)
+    }
+    val historyRepository = container.searchHistoryRepository
+    val serverScope by remember(container) {
+        container.settingsRepository.settings.map { (it.profiles.getOrNull(it.activeProfileIndex)?.url ?: it.baseUrl).trim().trimEnd('/') }.distinctUntilChanged()
+    }.collectAsStateWithLifecycle(initialValue = ApiClient.config.baseUrl)
+    val localDiscovery = state.source == LibrarySource.LOCAL || serverScope.isBlank()
+    val historyScope = if (localDiscovery) "local" else "server:$serverScope"
+    val overlayHistory by remember(historyScope) { historyRepository.history(historyScope) }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val legacyHistory by historyRepository.history.collectAsStateWithLifecycle(initialValue = emptyList())
+    val historyHidden by historyRepository.hidden.collectAsStateWithLifecycle(initialValue = false)
+    val historyPaused by historyRepository.paused.collectAsStateWithLifecycle(initialValue = false)
+    var overlaySuggestions by remember(historyScope) { mutableStateOf<List<TagSuggestion>>(emptyList()) }
+    var suggestionsLoading by remember { mutableStateOf(false) }
+    var suggestionsError by remember { mutableStateOf<String?>(null) }
+    var overlayHotTags by remember(historyScope) { mutableStateOf<List<TagStat>>(emptyList()) }
+    var hotLoading by remember(historyScope) { mutableStateOf(false) }
+    var hotError by remember(historyScope) { mutableStateOf<String?>(null) }
+    var hotUpdated by remember(historyScope) { mutableStateOf<String?>(null) }
+    var hotRevision by remember { mutableStateOf(0) }
+    val libraryRevision by LibraryRefreshBus.tick.collectAsStateWithLifecycle()
+    var previousServer by rememberSaveable { mutableStateOf(serverScope) }
+    LaunchedEffect(serverScope) {
+        if (previousServer != serverScope) {
+            searchSession.phase = SearchPhase.CLOSED
+            searchSession.hasResults = false
+            previousServer = serverScope
         }
+        vm.setServerScope(serverScope)
     }
-    LaunchedEffect(searchExpanded) {
-        if (!searchExpanded || overlayHotTags.isNotEmpty()) return@LaunchedEffect
-        overlayHotTags = runCatching {
-            container.repository.getTags()
-                .filterNot { it.isMetadataTag() }
-                .sortedWith(compareByDescending<TagStat> { it.weight }.thenBy { it.full.lowercase() })
-        }.getOrDefault(emptyList())
-    }
-
-    // 联想去抖：词库 FTS 查询（与搜索页同一条数据源）
-    LaunchedEffect(searchExpanded, overlayQuery) {
+    LaunchedEffect(searchExpanded, historyScope, hotRevision, libraryRevision) {
         if (!searchExpanded) return@LaunchedEffect
-        val q = overlayQuery.trim()
-        if (q.isEmpty()) {
-            overlaySuggestions = emptyList()
-            return@LaunchedEffect
-        }
-        kotlinx.coroutines.delay(220)
-        overlaySuggestions = runCatching {
-            container.tagKnowledgeRepository.suggestions(q, limit = 24)
-                .map { s ->
-                    TagStat(
-                        namespace = s.entry.namespace.takeIf(String::isNotBlank),
-                        text = s.entry.tagKey,
-                        weight = s.frequency.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-                    )
-                }
-        }.getOrDefault(emptyList())
+        hotLoading = true
+        hotError = null
+        try {
+            val repository = container.searchDiscoveryRepository
+            val cached = repository.cached(historyScope)
+            cached?.let { overlayHotTags = it.tags }
+            val snapshot = if (cached != null && !localDiscovery && hotRevision == 0 && libraryRevision == 0 &&
+                System.currentTimeMillis() - cached.updatedAt < SearchDiscoveryRepository.TTL) cached else {
+                val tags = if (localDiscovery) {
+                    RoomLibraryLocalGateway(container.readerDatabase).fetch().flatMap { it.tags.distinct() }
+                        .groupingBy { it }.eachCount().map { (full, count) ->
+                            TagStat(if (':' in full) full.substringBefore(':') else null, full.substringAfter(':'), count)
+                        }
+                } else container.repository.getTags()
+                repository.save(historyScope, tags)
+            }
+            overlayHotTags = snapshot.tags
+            hotUpdated = "更新于 " + java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.SHORT, java.text.DateFormat.SHORT)
+                .format(java.util.Date(snapshot.updatedAt))
+        } catch (cancelled: CancellationException) { throw cancelled
+        } catch (error: Exception) { hotError = if (overlayHotTags.isEmpty()) "标签暂不可用：${error.message}" else "正在显示缓存，刷新失败：${error.message}"
+        } finally { hotLoading = false }
+    }
+    val draft = searchSession.draft
+    LaunchedEffect(searchSession.phase, draft, historyScope, overlayHotTags) {
+        overlaySuggestions = emptyList()
+        suggestionsError = null
+        suggestionsLoading = false
+        if (!searchExpanded || searchSession.submitted || draft.composition != null) return@LaunchedEffect
+        val token = SearchQueryCodec.active(draft.text, draft.selection.start).value
+        if (token.isBlank()) return@LaunchedEffect
+        suggestionsLoading = true
+        delay(220)
+        try {
+            val personal = overlayHistory.flatMap { SearchQueryCodec.parse(it) }.groupingBy {
+                TagKnowledgeKey(if (':' in it.value) it.value.substringBefore(':') else "", it.value.substringAfter(':'))
+            }.eachCount().mapValues { it.value.toLong() }
+            val known = container.tagKnowledgeRepository.suggestions(token.removeSuffix(":"), personalFrequency = personal, limit = 24)
+            val fallback = overlayHotTags.filter { it.full.contains(token, true) }.take(24).map { tag ->
+                TagSuggestion(TagDictionaryRecord(tag.namespace.orEmpty(), tag.text, dataVersion = "server-cache"),
+                    if (tag.full.startsWith(token, true)) TagMatchQuality.CANONICAL_PREFIX else TagMatchQuality.CANONICAL_CONTAINS,
+                    tag.weight.toDouble(), tag.weight.toLong(), 0L)
+            }
+            overlaySuggestions = (known + fallback).distinctBy { it.entry.namespace to it.entry.tagKey }.take(24)
+            if (known.isEmpty() && container.tagKnowledgeRepository.current() == null) suggestionsError = "尚未安装标签词库；可用库内标签或直接搜索"
+        } catch (cancelled: CancellationException) { throw cancelled
+        } catch (error: Exception) { suggestionsError = "标签联想暂不可用：${error.message}"
+        } finally { suggestionsLoading = false }
+    }
+    fun submitDraft(value: String = searchSession.draft.text) {
+        if (searchSession.draft.composition != null) return
+        val q = value.trim().trimEnd(',')
+        if (q.isBlank()) return
+        val error = SearchQueryCodec.validationError(q)
+        if (error != null) { searchSession.error = error; return }
+        vm.submitSearch(q, historyScope)
+        searchSession.accept(q)
     }
 
     var showFilter by remember {
@@ -1674,7 +1743,7 @@ fun LibraryScreen(
     // /api/archives/{id}/metadata 这类只收 40 位 arcid 的接口上而失败。
     // ================================================================
     val openLibraryEntry: (Archive) -> Unit = { archive ->
-        if (adaptiveLayout == AdaptiveLayout.TABLET_MASTER_DETAIL) {
+        if (adaptiveLayout == AdaptiveLayout.TABLET_MASTER_DETAIL && !searchExpanded) {
             detailSelection = archive.arcid
         } else if (isTankArchiveId(archive.arcid)) {
             navController.navigate(Routes.tankReader(archive.arcid))
@@ -1816,279 +1885,22 @@ fun LibraryScreen(
                             .statusBarsPadding(),
                     )
                 },
-                snackbarHost = { SnackbarHost(snackbarHostState) },
+                snackbarHost = { if (!searchExpanded) SnackbarHost(snackbarHostState) },
             ) { padding ->
 
-            // ================================================================
-            // QuickFilterBar 已彻底删除
-            // ================================================================
-            Column(
-                Modifier
-                    .fillMaxSize()
-                    .padding(padding),
-            ) {
-
-                when {
-
-                    state.error != null &&
-                            state.items.isEmpty() -> {
-
-                        ErrorBox(
-                            state.error!!,
-                            onRetry = vm::refresh,
-                        )
-                    }
-
-                    state.loading &&
-                            state.items.isEmpty() -> {
-
-                        Box(
-                            Modifier.fillMaxSize(),
-                            contentAlignment = Alignment.Center,
-                        ) {
-                            CircularProgressIndicator()
-                        }
-                    }
-
-                    state.items.isEmpty() -> {
-
-                        Column(
-                            Modifier.fillMaxSize(),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.Center,
-                        ) {
-                            // D5 空态入口：可行动作 → 重新加载 / 扫描本地文件 / 上传到服务器 / 随机一本
-                            // 「重新加载」是必需的兜底：空态不在 PullToRefreshBox 内（那块只在有数据的分支里），
-                            // 一旦因为取消/失败留下空列表，用户此前没有任何在页面上重试的入口。
-                            EmptyBox(
-                                "没有找到档案。\n换个关键词或筛选条件，或检查服务器里的内容。",
-                                modifier = Modifier.weight(1f),
-                                actions = listOf(
-                                    "重新加载" to { vm.refresh() },
-                                    "扫描本地文件" to {
-                                        // 走总线常量而不是裸写 tab 下标，避免下标与底栏顺序再次脱钩。
-                                        MainTabBus.requestDownloadTab()
-                                        DownloadSubTabBus.local.value = true
-                                    },
-                                    "上传到服务器" to {
-                                        urlImportText = ""
-                                        showUrlImport = true
-                                    },
-                                    "随机一本" to {
-                                        // 随机入口统一收敛到第 4 键的「续读 / 随机」共用抽屉：
-                                        // 由 MainScreen 以随机模式打开抽屉，随机范围继承库页当前筛选
-                                        // （分类 / 关键词 / 标签 / 仅新 / 未标记 / 隐藏读完，经 FilterContextBus 传递），
-                                        // 不再直接取一本档案跳阅读器——那会绕过用户当前的筛选条件。
-                                        ReaderDrawerBus.requestRandom()
-                                    },
-                                ),
-                            )
-                        }
-                    }
-
-                    else -> {
-
-                        AdaptiveLayoutHost(
-                            layout = adaptiveLayout,
-                            master = {
-                                // 转圈指示器固定到悬浮顶栏胶囊下方：
-                                // 默认位置在容器顶部（现在就是状态栏下方），会被胶囊挡住，
-                                // 从玻璃后面升起几乎看不见。
-                                val refreshState = rememberPullToRefreshState()
-                                PullToRefreshBox(
-                                    isRefreshing = state.loading,
-                                    onRefresh = vm::refresh,
-                                    state = refreshState,
-                                    modifier = Modifier.fillMaxSize(),
-                                    indicator = {
-                                        PullToRefreshDefaults.Indicator(
-                                            state = refreshState,
-                                            isRefreshing = state.loading,
-                                            modifier = Modifier
-                                                .align(Alignment.TopCenter)
-                                                .padding(top = topBarClearance),
-                                        )
-                                    },
-                                ) {
-
-                            if (state.viewMode == "list") {
-
-                                // =================================================
-                                // 列表视图
-                                // =================================================
-                                val shouldLoadMore by remember {
-                                    derivedStateOf {
-                                        val info =
-                                            listState.layoutInfo
-
-                                        val last =
-                                            info.visibleItemsInfo
-                                                .lastOrNull()
-                                                ?.index ?: -1
-
-                                        info.totalItemsCount > 0 &&
-                                                last >=
-                                                info.totalItemsCount - 8
-                                    }
-                                }
-
-                                LaunchedEffect(
-                                    shouldLoadMore,
-                                ) {
-                                    if (shouldLoadMore) {
-                                        vm.loadMore()
-                                    }
-                                }
-
-                                LazyColumn(
-                                    state = listState,
-                                    contentPadding =
-                                        PaddingValues(
-                                            start = 12.dp,
-                                            // 首行落在悬浮顶栏下方（滚动时内容会从胶囊底下穿过）
-                                            top = topBarClearance,
-                                            end = 12.dp,
-                                            bottom = listBottomPad,
-                                        ),
-                                    verticalArrangement =
-                                        Arrangement.spacedBy(
-                                            8.dp,
-                                        ),
-                                    modifier =
-                                        Modifier.fillMaxSize(),
-                                ) {
-                                    items(
-                                        state.items,
-                                        key = { it.arcid },
-                                    ) { archive ->
-                                        ArchiveListRow(
-                                            archive = archive,
-                                            onClick = if (state.selectedIds.isNotEmpty()) {
-                                                { vm.toggleSelection(archive.arcid) }
-                                            } else {
-                                                { openLibraryEntry(archive) }
-                                            },
-                                            selectionMode = state.selectedIds.isNotEmpty(),
-                                            isSelected = archive.arcid in state.selectedIds,
-                                            onLongPress = { vm.enterSelection(archive.arcid) },
-                                            thumbnailContainer = container,
-                                            isCached = archive.arcid in state.offlineArcidSet,
-                                        )
-                                    }
-
-                                    if (state.loadingMore) {
-                                        item {
-                                            Box(
-                                                Modifier
-                                                    .fillMaxWidth()
-                                                    .padding(16.dp),
-                                                contentAlignment =
-                                                    Alignment.Center,
-                                            ) {
-                                                CircularProgressIndicator()
-                                            }
-                                        }
-                                    }
-                                }
-
-                            } else {
-
-                                // =================================================
-                                // 网格 / 紧凑网格
-                                // =================================================
-                                val shouldLoadMore by remember {
-                                    derivedStateOf {
-                                        val info =
-                                            gridState.layoutInfo
-
-                                        val last =
-                                            info.visibleItemsInfo
-                                                .lastOrNull()
-                                                ?.index ?: -1
-
-                                        info.totalItemsCount > 0 &&
-                                                last >=
-                                                info.totalItemsCount - 8
-                                    }
-                                }
-
-                                LaunchedEffect(
-                                    shouldLoadMore,
-                                ) {
-                                    if (shouldLoadMore) {
-                                        vm.loadMore()
-                                    }
-                                }
-
-                                val compactGrid =
-                                    state.viewMode == "compact"
-
-                                LazyVerticalGrid(
-                                    columns =
-                                        GridCells.Fixed(
-                                            state.columns,
-                                        ),
-                                    state = gridState,
-                                    contentPadding =
-                                        PaddingValues(
-                                            start = 12.dp,
-                                            // 首行落在悬浮顶栏下方（滚动时内容会从胶囊底下穿过）
-                                            top = topBarClearance,
-                                            end = 12.dp,
-                                            bottom = listBottomPad,
-                                        ),
-                                    verticalArrangement =
-                                        Arrangement.spacedBy(
-                                            8.dp,
-                                        ),
-                                    horizontalArrangement =
-                                        Arrangement.spacedBy(
-                                            8.dp,
-                                        ),
-                                    modifier =
-                                        Modifier.fillMaxSize(),
-                                ) {
-
-                                    items(
-                                        state.items,
-                                        key = { it.arcid },
-                                    ) { archive ->
-                                        ArchiveCard(
-                                            archive = archive,
-                                            onClick = if (state.selectedIds.isNotEmpty()) {
-                                                { vm.toggleSelection(archive.arcid) }
-                                            } else {
-                                                { openLibraryEntry(archive) }
-                                            },
-                                            selectionMode = state.selectedIds.isNotEmpty(),
-                                            isSelected = archive.arcid in state.selectedIds,
-                                            onLongPress = { vm.enterSelection(archive.arcid) },
-                                            thumbnailContainer = container,
-                                            compact = compactGrid,
-                                            isCached = archive.arcid in state.offlineArcidSet,
-                                            // 单行本的 archive_count（= 卷数）：> 0 时卡片渲染
-                                            // 「单行本 · N 卷」角标；普通档案恒为 0，不显示。
-                                            volumeCount = archive.archive_count,
-                                        )
-                                    }
-
-                                    if (state.loadingMore) {
-                                        item {
-                                            Box(
-                                                Modifier
-                                                    .fillMaxWidth()
-                                                    .padding(16.dp),
-                                                contentAlignment =
-                                                    Alignment.Center,
-                                            ) {
-                                                CircularProgressIndicator()
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                                }
-                            },
+            if (!searchExpanded) {
+                AdaptiveLayoutHost(
+                    layout = adaptiveLayout,
+                    master = {
+                        LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
+                            modifier = Modifier.fillMaxSize().padding(padding),
+                            contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = topBarClearance, bottom = listBottomPad),
+                            extraEmptyActions = {
+                                TextButton(onClick = { MainTabBus.requestDownloadTab(); DownloadSubTabBus.local.value = true }) { Text("扫描本地文件") }
+                                TextButton(onClick = { urlImportText = ""; showUrlImport = true }) { Text("上传到服务器") }
+                                TextButton(onClick = { ReaderDrawerBus.requestRandom() }) { Text("随机一本") }
+                            })
+                    },
                             detail = {
                                 val selected = state.items.firstOrNull { it.arcid == detailSelection }
                                 if (selected == null) {
@@ -2119,9 +1931,7 @@ fun LibraryScreen(
                                     )
                                 }
                             },
-                        )
-                    }
-                }
+                )
             }
         }
         }
@@ -2130,6 +1940,7 @@ fun LibraryScreen(
         // 浮动顶栏（兄弟节点）：多选模式下显示选择操作栏，
         // 否则排序按钮 + 搜索框（从背景采样层取景）
         // ================================================================
+        if (!searchExpanded) {
         if (state.selectedIds.isNotEmpty()) {
             SelectionActionBar(
                 count = state.selectedIds.size,
@@ -2159,12 +1970,7 @@ fun LibraryScreen(
             verticalAlignment = Alignment.CenterVertically,
         ) {
 
-            // 顶栏合并成「一条液态玻璃胶囊，内部两个点击区」：
-            //   左侧 = 排序 / 筛选键，右侧 = 搜索区（点按跳转搜索页，
-            //   SearchScreen 提交后经 SearchBus 写回本页由 ViewModel 收集刷新）。
-            // 玻璃表面与底栏同一份配方（liquidGlassCapsule），高度仍是原来的 40.dp。
-            // 原先搜索胶囊右侧的「预设搜索」按键已移除；预设仍可从
-            // 排序与筛选面板进入（FilterSheet → 预设）。
+            // One 48dp glass shell, with separate filter and search hit targets.
             LiquidGlassSearchBar(
                 value = state.filter,
                 // 只读模式下组件不会产生输入变更：value 只会被置空，
@@ -2173,10 +1979,7 @@ fun LibraryScreen(
                     vm.clearQuery()
                 },
                 onClick = {
-                    // EhViewer 式：点胶囊**原地展开**（历史 + 联想直接铺在库页上），
-                    // 需要按命名空间挑标签时再进「标签浏览」（原搜索页）。
-                    overlayQuery = state.filter
-                    searchExpanded = true
+                    searchSession.open(state.filter)
                 },
                 modifier =
                     Modifier
@@ -2205,73 +2008,60 @@ fun LibraryScreen(
                             contentDescription = "排序与筛选",
                             modifier = Modifier.size(20.dp),
                         )
+                        if (state.categoryId.isNotBlank() || state.selectedTags.isNotEmpty() || state.newOnly || state.untaggedOnly || state.hideCompleted || state.source != LibrarySource.ALL) {
+                            Box(Modifier.align(Alignment.TopEnd).padding(8.dp).size(6.dp).background(MaterialTheme.colorScheme.primary, CircleShape))
+                        }
                     }
                 },
             )
         }
         }
 
+        }
+
         // ================================================================
         // 搜索面（EhViewer 式原地展开；结果内嵌其中，不再有独立搜索页）
         // ================================================================
         LibrarySearchOverlay(
-            expanded = searchExpanded,
-            submitted = searchSubmitted,
-            query = overlayQuery,
-            onQueryChange = {
-                // 任何编辑都退回「历史 / 联想」态（JHenTai 的 bodyType 切换）
-                overlayQuery = it
-                searchSubmitted = false
+            session = searchSession, visibility = searchTransition,
+            onSubmit = { submitDraft() },
+            onSubmitHistory = { submitDraft(it) },
+            onAppendTag = { full, excluded ->
+                try {
+                    val value = searchSession.draft
+                    val edit = SearchQueryCodec.replace(value.text, value.selection.start, value.selection.end, full, excluded)
+                    searchSession.edit(TextFieldValue(edit.text, TextRange(edit.cursor)))
+                } catch (error: IllegalArgumentException) { searchSession.error = error.message }
             },
-            onSubmit = {
-                val q = overlayQuery.trim()
-                if (q.isNotEmpty()) {
-                    vm.submitSearch(q)
-                    searchSubmitted = true
+            history = overlayHistory, legacyHistory = legacyHistory,
+            historyHidden = historyHidden, historyPaused = historyPaused,
+            onHistoryHidden = { scope.launch { historyRepository.setHidden(it) } },
+            onHistoryPaused = { scope.launch { historyRepository.setPaused(it) } },
+            onRemoveHistory = { value, legacy ->
+                val targetScope = if (legacy) "" else historyScope
+                scope.launch {
+                    historyRepository.remove(value, targetScope)
+                    if (snackbarHostState.showSnackbar("已删除搜索历史", actionLabel = "撤销") == SnackbarResult.ActionPerformed) {
+                        historyRepository.add(value, targetScope, restoring = true)
+                    }
                 }
             },
-            onSubmitHistory = { h ->
-                overlayQuery = h
-                vm.submitSearch(h)
-                searchSubmitted = true
-            },
-            onCollapse = {
-                searchExpanded = false
-                searchSubmitted = false
-            },
-            onAppendTag = { full, excluded ->
-                // 与拼写在一起的写法一致：值用引号包住、结尾 $ 表示精确匹配（带空格的值更稳）
-                val token =
-                    (if (excluded) "-" else "") +
-                        full.substringBefore(':') + ":\"" + full.substringAfter(':') + "\$"
-                overlayQuery =
-                    if (overlayQuery.isBlank()) {
-                        token
-                    } else {
-                        "${overlayQuery.trimEnd()},$token"
-                    }
-                searchSubmitted = false
-            },
-            history = overlayHistory,
-            onRemoveHistory = { h -> vm.removeSearchHistory(h) },
-            onClearHistory = { vm.clearSearchHistory() },
-            suggestions = overlaySuggestions,
-            hotTags = overlayHotTags,
-            hotNamespaces = overlayHotNamespaces,
-            hotNamespace = overlayHotNamespace,
-            onHotNamespaceChange = { overlayHotNamespace = it },
-            resultCount = state.items.size,
-            backdrop = backdrop,
-            resultsContent = { m ->
-                SearchResultsGrid(
-                    modifier = m,
-                    state = state,
-                    vm = vm,
-                    container = container,
-                    onOpen = openLibraryEntry,
-                )
+            onClearHistory = { legacy -> scope.launch { historyRepository.clear(if (legacy) "" else historyScope) } },
+            suggestions = overlaySuggestions, suggestionsLoading = suggestionsLoading, suggestionsError = suggestionsError,
+            hotTags = overlayHotTags, hotLoading = hotLoading, hotError = hotError, hotUpdated = hotUpdated, hotLocal = localDiscovery,
+            onRetryHot = { hotRevision++ },
+            onOpenDictionary = { searchSession.phase = SearchPhase.CLOSED; MainTabBus.requestSettingsTab() },
+            state = state, onClearSelection = vm::exitSelection, onOpenFilters = { showFilter = true },
+            onClearSearch = { vm.clearQuery(); searchSession.open("") }, backdrop = backdrop,
+            resultsContent = { modifier ->
+                LibraryResultsContent(state, vm, container, listState, gridState, openLibraryEntry,
+                    modifier = modifier, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp,
+                        bottom = if (state.selectedIds.isNotEmpty()) 100.dp else 24.dp),
+                    onEdit = { searchSession.phase = SearchPhase.EDITING },
+                    onClearSearch = { vm.clearQuery(); searchSession.open("") })
             },
         )
+        if (searchExpanded) SnackbarHost(snackbarHostState, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().imePadding())
 
         // ================================================================
         // 批量操作条：多选模式下悬浮于底部（此时 MainScreen 液态底栏已隐藏）
@@ -3143,6 +2933,15 @@ private fun FilterSheet(
                 }
             }
 
+            Text("搜索范围", style = MaterialTheme.typography.titleSmall)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LibrarySource.entries.forEach { source ->
+                    FilterChip(selected = state.source == source, onClick = { vm.setSource(source) },
+                        label = { Text(when (source) { LibrarySource.ALL -> "全部"; LibrarySource.REMOTE -> "服务器"; LibrarySource.LOCAL -> "本地" }) })
+                }
+            }
+            if (state.source == LibrarySource.ALL) Text("按来源分组：本地在前，服务器在后，各组沿用当前排序。", style = MaterialTheme.typography.labelSmall)
+
             // ============================================================
             // 当前筛选条件
             // ============================================================
@@ -3591,68 +3390,4 @@ private fun LibraryDetailPane(
             TextButton(onClick = onRead) { Text("开始阅读") }
         }
     }
-}
-
-/*
- * ============================================================
- * 搜索面内嵌的结果列表（「结果内嵌」，JHenTai 的 SearchPageBodyType.galleries）
- *
- * 与库页网格共用同一份 LibraryViewModel 状态与 ArchiveCard，
- * 因此卡片外观、点击/长按语义、分页加载与库页完全一致，
- * 不会出现「两个列表两套行为」。差别只有顶部留白（结果从面板下方开始）。
- * ============================================================
- */
-@Composable
-private fun SearchResultsGrid(
-    modifier: Modifier,
-    state: LibraryState,
-    vm: LibraryViewModel,
-    container: AppContainer,
-    onOpen: (Archive) -> Unit,
-) {
-    val gridState = rememberLazyGridState()
-
-    // 触底续拉：与库页同一套 vm.loadMore()（可见尾项接近末尾时再拉一页）
-    LaunchedEffect(gridState) {
-        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
-            .collect { last ->
-                if (last >= state.items.size - 6 && state.hasMore && !state.loadingMore) {
-                    vm.loadMore()
-                }
-            }
-    }
-
-    LazyVerticalGrid(
-        columns = GridCells.Fixed(state.columns.coerceIn(2, 8)),
-        state = gridState,
-        modifier = modifier,
-        contentPadding = PaddingValues(start = 12.dp, top = 4.dp, end = 12.dp, bottom = 24.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        items(state.items, key = { it.arcid }) { archive ->
-            ArchiveCard(
-                archive = archive,
-                onClick = { onOpen(archive) },
-                selectionMode = false,
-                isSelected = false,
-                onLongPress = { vm.enterSelection(archive.arcid) },
-                thumbnailContainer = container,
-                isCached = archive.arcid in state.offlineArcidSet,
-            )
-        }
-    }
-}
-
-/** 热门标签要排除的机器元数据命名空间（日期/时间戳这类每个档案都有，会霸屏）。 */
-private val METADATA_NAMESPACES = setOf(
-    "date", "dates", "date_added", "timestamp", "timestamps", "temp", "temporary",
-    "日期", "添加日期", "时间戳", "临时",
-)
-
-private val DATE_LIKE = Regex("""^\d{4}-\d{2}-\d{2}([ T].*)?$""")
-
-private fun TagStat.isMetadataTag(): Boolean {
-    val ns = namespace?.trim()?.lowercase().orEmpty()
-    return ns in METADATA_NAMESPACES || DATE_LIKE.matches(text.trim())
 }

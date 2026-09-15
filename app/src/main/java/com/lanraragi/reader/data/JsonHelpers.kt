@@ -25,6 +25,14 @@ object JsonHelpers {
      *  - DataTables 对象：`{ "data": [...], "recordsTotal": n, "recordsFiltered": n }`
      * 返回 (items, total) ，total 在纯数组时为 null。
      */
+    data class SearchCounts(val matched: Int?, val library: Int?)
+
+    fun parseSearchCounts(body: String): SearchCounts {
+        val obj = json.parseToJsonElement(body) as? JsonObject ?: return SearchCounts(null, null)
+        fun count(key: String) = (obj[key] as? JsonPrimitive)?.content?.toIntOrNull()
+        return SearchCounts(count("recordsFiltered"), count("recordsTotal"))
+    }
+
     fun parseArchiveList(body: String): Pair<List<Archive>, Int?> {
         val el = json.parseToJsonElement(body)
         return when (el) {
