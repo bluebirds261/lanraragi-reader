@@ -31,7 +31,6 @@ import com.lanraragi.reader.ui.screens.DiagnosticsScreen
 import com.lanraragi.reader.ui.screens.HistoryScreen
 import com.lanraragi.reader.ui.screens.LocalDetailScreen
 import com.lanraragi.reader.ui.screens.ReaderScreen
-import com.lanraragi.reader.ui.screens.SearchScreen
 import com.lanraragi.reader.ui.screens.StatisticsScreen
 import com.lanraragi.reader.ui.screens.TankoubonBrowseScreen
 import com.lanraragi.reader.ui.setup.GuideScreen
@@ -51,7 +50,6 @@ object Routes {
     const val MAIN = "main"
     const val DETAIL = "detail"
     const val READER = "reader"
-    const val SEARCH = "search"
     const val HISTORY = "history"
     const val STATISTICS = "statistics"
     const val GUIDE = "guide"
@@ -191,9 +189,6 @@ fun AppRoot() {
                 initialPage = entry.arguments?.getString("page")?.toIntOrNull(),
                 onBack = { navController.popBackStack() },
             )
-        }
-        composable(Routes.SEARCH) {
-            SearchScreen(container, navController)
         }
         composable(Routes.CATEGORY) {
             CategoryBrowseScreen(container, navController, null)

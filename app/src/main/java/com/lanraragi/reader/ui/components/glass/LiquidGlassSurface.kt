@@ -57,7 +57,16 @@ fun Modifier.liquidGlassCapsule(
      * （圆角由调用方用 `animateDpAsState` 过渡，看起来就是胶囊长成了面板）。
      */
     shape: Shape = Capsule(),
+    /**
+     * 玻璃表面底下的不透明底色（0 = 纯玻璃）。浅色主题下玻璃背后往往是亮底，
+     * 文字对比度掉得厉害（实测「透明玻璃可读性太差」），这时需要垫一层 surface；
+     * 深色主题可以给得小一些。
+     */
+    baseSurfaceAlpha: Float = 0f,
 ): Modifier {
+    // 非 @Composable 的 onDrawSurface 里不能读 MaterialTheme，先取出来
+    val surfaceColor = MaterialTheme.colorScheme.surface
+
     val outlineModifier =
         if (outline) {
             Modifier.border(
@@ -128,6 +137,11 @@ fun Modifier.liquidGlassCapsule(
                 )
             },
             onDrawSurface = {
+                // 先垫底色（浅色主题的可读性），再叠 2% 白与可选的选中着色
+                if (baseSurfaceAlpha > 0f) {
+                    drawRect(surfaceColor.copy(alpha = baseSurfaceAlpha))
+                }
+
                 drawRect(Color.White.copy(alpha = 0.02f))
 
                 if (activeColor != null) {

@@ -4,15 +4,20 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -26,6 +31,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
@@ -33,15 +39,13 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Clear
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Search
-import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -50,13 +54,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
@@ -65,72 +68,83 @@ import androidx.compose.ui.unit.sp
 import com.kyant.backdrop.Backdrop
 import com.lanraragi.reader.data.model.TagStat
 import com.lanraragi.reader.data.tags.TagNamespaceRegistry
+import com.lanraragi.reader.ui.components.glass.liquidGlassCapsule
 import com.lanraragi.reader.ui.rememberTagColor
 import com.lanraragi.reader.ui.rememberTagText
-import com.lanraragi.reader.ui.components.glass.liquidGlassCapsule
 
 /**
- * 库页顶栏搜索胶囊的**原地展开层**（参考 EhViewer 1.14.6 的 `SearchBarScreen`：
- * M3 `SearchBar(expanded=…)` 的展开交互 —— 胶囊在原地长成一块面板，背后压一层 scrim，
- * 展开区内直接铺联想列表；联想列表把**历史与标签合并成一条列表**，历史行右侧带 ✕ 删除）。
+ * 搜索面（库页顶栏胶囊的原地展开层）—— 合并两份参考实现的长处：
  *
- * 与参考实现的差异（有意保留我们自己的语言）：
- * - 表面仍是自家的液态玻璃（[liquidGlassCapsule] 支持传入形状），形变过程用
- *   `animateDpAsState` 过渡圆角，观感上是「胶囊长成面板」而不是 M3 的通用容器；
- * - 联想的命名空间沿用 [rememberTagColor]，标签文本走词库译名（JHenTai 的做法）；
- * - 收起后回到原本的搜索胶囊（不新增路由），「标签浏览」另有入口进入完整搜索页。
+ * - **EhViewer 1.14.6 `ui/screen/SearchBarScreen.kt`**：胶囊原地展开成面板、背后压 scrim、
+ *   展开区里直接铺联想；联想把「历史 + 标签」合进同一条列表。
+ * - **JHenTai `pages/search`**：历史是 EHTag 造形的胶囊（高 24 / 圆角 8 / 字号 12）、
+ *   垃圾桶图标进入删除模式、标签行显示命名空间着色 + 词库译名、
+ *   **结果留在搜索面里**（`bodyType` 在「联想/历史」与「结果」之间切换）。
  *
- * @param query 当前查询串（与库页共用一份，展开时可直接继续编辑）
- * @param onSubmit 提交搜索（收起面板由调用方负责）
- * @param onCollapse 收起
- * @param onOpenAdvanced 进入完整搜索页（命名空间 + 标签面板）
- * @param onOpenFilter 打开库页既有的排序与筛选面板
- * @param onAppendTag 点选联想标签（追加进查询串）
+ * 与本项目现状的取舍（按用户裁决）：
+ * - 「标签浏览」独立页已删除，标签联想与热门标签都在这里；
+ * - 面板里不再显示「排序与筛选」（与搜索无关；库页顶栏左侧键仍是它）；
+ * - 结果不另画一套网格，由调用方传入 [resultsContent]（复用库页同一份列表状态）；
+ * - 浅色主题下玻璃底面加厚（[baseSurfaceAlpha]），否则文字读不清。
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun LibrarySearchOverlay(
     expanded: Boolean,
+    submitted: Boolean,
     query: String,
     onQueryChange: (String) -> Unit,
     onSubmit: () -> Unit,
+    onSubmitHistory: (String) -> Unit,
     onCollapse: () -> Unit,
-    onOpenAdvanced: () -> Unit,
-    onOpenFilter: () -> Unit,
-    onAppendTag: (String) -> Unit,
+    onAppendTag: (fullTag: String, excluded: Boolean) -> Unit,
     history: List<String>,
     onRemoveHistory: (String) -> Unit,
+    onClearHistory: () -> Unit,
     suggestions: List<TagStat>,
+    hotTags: List<TagStat>,
+    hotNamespaces: List<String>,
+    hotNamespace: String,
+    onHotNamespaceChange: (String) -> Unit,
+    resultCount: Int,
     backdrop: Backdrop?,
+    resultsContent: @Composable (Modifier) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     if (!expanded) return
 
-    val corner by animateDpAsState(
-        targetValue = 18.dp,
-        animationSpec = tween(durationMillis = 260),
-        label = "searchOverlayCorner",
-    )
+    val lightTheme = MaterialTheme.colorScheme.surface.luminance() > 0.5f
+    // 浅色主题下纯玻璃几乎读不清（用户实测反馈），垫一层较厚的 surface；深色主题保留通透感。
+    val baseAlpha = if (lightTheme) 0.86f else 0.42f
     val scrimAlpha by animateFloatAsState(
-        targetValue = if (expanded) 0.86f else 0f,
+        targetValue = if (submitted) 1f else if (lightTheme) 0.94f else 0.86f,
+        animationSpec = tween(durationMillis = 240),
+        label = "searchScrim",
+    )
+    val corner by animateDpAsState(
+        targetValue = if (submitted) 14.dp else 18.dp,
         animationSpec = tween(durationMillis = 260),
-        label = "searchOverlayScrim",
+        label = "searchCorner",
     )
     val focusRequester = remember { FocusRequester() }
-    var deleteMode by remember { mutableStateOf(false) }
-    val context = LocalContext.current
+    val scrimInteraction = remember { MutableInteractionSource() }
 
-    // 展开即聚焦（EhViewer 的展开态直接给输入焦点）
+    var deleteMode by remember { mutableStateOf(false) }
+    var hideHistory by remember { mutableStateOf(false) }
+
     LaunchedEffect(expanded) {
         if (expanded) runCatching { focusRequester.requestFocus() }
     }
 
-    Box(
-        modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background.copy(alpha = scrimAlpha))
-            // 点空白处收起（面板本体在下面，会自己吃掉点击）
-            .clickable(indication = null, interactionSource = remember { MutableInteractionSource() }) { onCollapse() },
-    ) {
+    Box(modifier.fillMaxSize()) {
+        // scrim 单独一层：只负责「点空白收起」，不覆盖面板（否则会把输入框的焦点/手势吃掉）
+        Box(
+            Modifier
+                .matchParentSize()
+                .background(MaterialTheme.colorScheme.background.copy(alpha = scrimAlpha))
+                .clickable(indication = null, interactionSource = scrimInteraction) { onCollapse() },
+        )
+
         Column(
             Modifier
                 .fillMaxSize()
@@ -138,126 +152,169 @@ fun LibrarySearchOverlay(
                 .imePadding()
                 .padding(horizontal = 8.dp, vertical = 6.dp),
         ) {
-            // ------------------------------------------------------------
-            // 形变中的玻璃面板：胶囊 → 圆角矩形
-            // ------------------------------------------------------------
-            Column(
+            // ============================================================
+            // 面板：收起 + 输入 + 清除（形变中的玻璃：胶囊 → 圆角矩形）
+            // ============================================================
+            Row(
                 Modifier
                     .fillMaxWidth()
-                    .liquidGlassCapsule(backdrop = backdrop, outline = true, shape = RoundedCornerShape(corner))
-                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                    .liquidGlassCapsule(
+                        backdrop = backdrop,
+                        outline = true,
+                        shape = RoundedCornerShape(corner),
+                        baseSurfaceAlpha = baseAlpha,
+                    )
+                    .padding(horizontal = 6.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    IconButton(onClick = onCollapse) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "收起搜索")
-                    }
-                    Box(Modifier.weight(1f)) {
-                        if (query.isEmpty()) {
-                            Text(
-                                "搜索标题或标签…",
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        BasicTextField(
-                            value = query,
-                            onValueChange = onQueryChange,
-                            singleLine = true,
-                            textStyle =
-                                MaterialTheme.typography.bodyLarge.copy(
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                ),
-                            cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
-                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                            keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
-                            modifier =
-                                Modifier
-                                    .fillMaxWidth()
-                                    .focusRequester(focusRequester),
+                IconButton(onClick = onCollapse) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "收起搜索")
+                }
+                Box(Modifier.weight(1f)) {
+                    if (query.isEmpty()) {
+                        Text(
+                            "搜索标题或标签…",
+                            style = MaterialTheme.typography.bodyLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (query.isNotEmpty()) {
-                        IconButton(onClick = { onQueryChange("") }) {
-                            Icon(Icons.Filled.Clear, contentDescription = "清除")
-                        }
-                    }
+                    BasicTextField(
+                        value = query,
+                        onValueChange = onQueryChange,
+                        singleLine = true,
+                        textStyle =
+                            MaterialTheme.typography.bodyLarge.copy(
+                                color = MaterialTheme.colorScheme.onSurface,
+                            ),
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                        keyboardActions = KeyboardActions(onSearch = { onSubmit() }),
+                        modifier =
+                            Modifier
+                                .fillMaxWidth()
+                                .focusRequester(focusRequester),
+                    )
                 }
-
-                // 展开区里的动作行（对应 EhViewer 展开态的 `filter` 槽位）
-                Row(
-                    Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    TextButton(onClick = onOpenFilter) {
-                        Icon(Icons.Filled.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("排序与筛选")
-                    }
-                    TextButton(onClick = onOpenAdvanced) {
-                        Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(6.dp))
-                        Text("标签浏览")
-                    }
-                    Spacer(Modifier.weight(1f))
-                    if (history.isNotEmpty()) {
-                        TextButton(onClick = { deleteMode = !deleteMode }) {
-                            Text(if (deleteMode) "完成" else "管理历史")
-                        }
+                if (query.isNotEmpty()) {
+                    IconButton(onClick = { onQueryChange("") }) {
+                        Icon(Icons.Filled.Clear, contentDescription = "清除")
                     }
                 }
             }
 
-            // ------------------------------------------------------------
-            // 联想列表：历史与标签合并成一条（EhViewer 的做法）
-            // ------------------------------------------------------------
-            AnimatedVisibility(
-                visible = true,
-                enter = fadeIn(tween(220)) + slideInVertically { it / 12 },
-                exit = fadeOut(tween(120)),
-            ) {
-                LazyColumn(
-                    Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(2.dp),
-                ) {
-                    items(history, key = { "h:$it" }) { h ->
-                        OverlayRow(
-                            leading = { Icon(Icons.Filled.History, contentDescription = null, modifier = Modifier.size(18.dp)) },
-                            title = h,
-                            subtitle = null,
-                            titleColor = MaterialTheme.colorScheme.onSurface,
-                            trailing = {
-                                if (deleteMode) {
-                                    IconButton(onClick = { onRemoveHistory(h) }) {
-                                        Icon(Icons.Filled.Close, contentDescription = "删除该历史", modifier = Modifier.size(18.dp))
-                                    }
-                                }
-                            },
-                            onClick = {
-                                if (deleteMode) {
-                                    onRemoveHistory(h)
-                                } else {
-                                    onQueryChange(h)
-                                    onSubmit()
-                                }
-                            },
-                        )
-                    }
+            if (submitted) {
+                // ------------------------------------------------------------
+                // 结果内嵌：与库页共用同一份列表状态（[resultsContent]）
+                // ------------------------------------------------------------
+                Text(
+                    "$resultCount 个结果",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp),
+                )
+                resultsContent(Modifier.fillMaxSize())
+                return@Column
+            }
 
-                    if (suggestions.isNotEmpty()) {
-                        item(key = "tag-header") {
+            // ------------------------------------------------------------
+            // 联想 / 历史态（JHenTai 的 suggestionAndHistory）
+            // ------------------------------------------------------------
+            LazyColumn(
+                Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                if (history.isNotEmpty()) {
+                    item(key = "history-header") {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text(
-                                "标签",
+                                "搜索历史",
+                                style = MaterialTheme.typography.titleSmall,
+                                modifier =
+                                    Modifier
+                                        .weight(1f)
+                                        .padding(start = 8.dp),
+                            )
+                            // JHenTai：垃圾桶图标切换删除模式；隐藏时换成「眼睛」
+                            IconButton(onClick = { deleteMode = !deleteMode }) {
+                                Icon(
+                                    Icons.Filled.Delete,
+                                    contentDescription = if (deleteMode) "退出删除模式" else "管理历史",
+                                    modifier = Modifier.size(20.dp),
+                                    tint =
+                                        if (deleteMode) {
+                                            MaterialTheme.colorScheme.error
+                                        } else {
+                                            MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                )
+                            }
+                            IconButton(onClick = { hideHistory = !hideHistory }) {
+                                Icon(
+                                    Icons.Filled.Visibility,
+                                    contentDescription = if (hideHistory) "显示历史" else "隐藏历史",
+                                    modifier = Modifier.size(20.dp),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Text(
+                                "清空",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(start = 12.dp, top = 8.dp, bottom = 2.dp),
+                                modifier =
+                                    Modifier
+                                        .clickable(onClick = onClearHistory)
+                                        .padding(horizontal = 8.dp, vertical = 6.dp),
                             )
                         }
                     }
-                    items(suggestions, key = { "t:${it.full}" }) { tag ->
+                    if (deleteMode) {
+                        item(key = "history-hint") {
+                            Text(
+                                "点历史条目即可删除，再点垃圾桶退出",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(start = 12.dp, bottom = 4.dp),
+                            )
+                        }
+                    }
+                    item(key = "history-chips") {
+                        AnimatedVisibility(
+                            visible = !hideHistory,
+                            enter = expandVertically() + fadeIn(),
+                            exit = shrinkVertically() + fadeOut(),
+                        ) {
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(7.dp),
+                                modifier = Modifier.padding(horizontal = 12.dp),
+                            ) {
+                                history.forEach { h ->
+                                    EhTagChip(
+                                        text = h,
+                                        inDeleteMode = deleteMode,
+                                        onClick = {
+                                            if (deleteMode) onRemoveHistory(h) else onSubmitHistory(h)
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---- 联想（有输入时）----
+                if (suggestions.isNotEmpty()) {
+                    item(key = "suggestion-header") {
+                        Text(
+                            "标签联想（点选=包含，长按=排除）",
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.padding(start = 8.dp, top = 4.dp),
+                        )
+                    }
+                    items(suggestions, key = { "s:${it.full}" }) { tag ->
                         val ns = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
-                        OverlayRow(
+                        SearchRow(
                             leading = {
                                 Icon(
                                     Icons.Filled.Search,
@@ -269,38 +326,77 @@ fun LibrarySearchOverlay(
                             title = "${ns.ifBlank { tag.namespace.orEmpty() }}:${tag.text}",
                             subtitle = rememberTagText(ns, tag.text),
                             titleColor = rememberTagColor(ns),
-                            trailing = {
-                                Text(
-                                    tag.weight.toString(),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            },
-                            onClick = { onAppendTag(tag.full) },
+                            onClick = { onAppendTag(tag.full, false) },
+                            onLongClick = { onAppendTag(tag.full, true) },
                         )
                     }
+                } else if (query.isNotBlank()) {
+                    item(key = "direct") {
+                        SearchRow(
+                            leading = {
+                                Icon(
+                                    Icons.Filled.Search,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            },
+                            title = "搜索「$query」",
+                            subtitle = null,
+                            titleColor = MaterialTheme.colorScheme.primary,
+                            onClick = { onSubmit() },
+                        )
+                    }
+                }
 
-                    if (history.isEmpty() && suggestions.isEmpty()) {
-                        item(key = "empty") {
-                            Text(
-                                "输入关键词开始搜索；也可以到「标签浏览」按命名空间挑标签",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 16.dp),
-                            )
+                // ---- 热门标签：单独一块区域（JHenTai 的标签面板做法）----
+                if (query.isBlank() && hotTags.isNotEmpty()) {
+                    item(key = "hot-header") {
+                        Text(
+                            "热门标签",
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.padding(start = 8.dp, top = 8.dp),
+                        )
+                    }
+                    item(key = "hot-namespaces") {
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.padding(horizontal = 12.dp),
+                        ) {
+                            hotNamespaces.forEach { ns ->
+                                FilterChipLike(
+                                    text = ns.ifBlank { "全部" },
+                                    selected = ns == hotNamespace,
+                                    tint =
+                                        if (ns.isBlank()) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            rememberTagColor(
+                                                TagNamespaceRegistry.canonicalNamespace(ns).orEmpty(),
+                                            )
+                                        },
+                                    onClick = { onHotNamespaceChange(ns) },
+                                )
+                            }
                         }
                     }
-
-                    item(key = "enter-hint") {
-                        if (query.isNotBlank()) {
-                            OverlayRow(
-                                leading = { Icon(Icons.Filled.Search, contentDescription = null, modifier = Modifier.size(18.dp)) },
-                                title = "搜索「$query」",
-                                subtitle = null,
-                                titleColor = MaterialTheme.colorScheme.primary,
-                                trailing = {},
-                                onClick = onSubmit,
-                            )
+                    item(key = "hot-chips") {
+                        val visible = remember(hotTags, hotNamespace) {
+                            hotTags.filter { hotNamespace.isBlank() || it.namespace == hotNamespace }
+                        }
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(7.dp),
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                        ) {
+                            visible.take(60).forEach { tag ->
+                                val ns = TagNamespaceRegistry.canonicalNamespace(tag.namespace).orEmpty()
+                                EhTagChip(
+                                    text = rememberTagText(ns, tag.text),
+                                    tint = rememberTagColor(ns),
+                                    onClick = { onAppendTag(tag.full, false) },
+                                )
+                            }
                         }
                     }
                 }
@@ -309,21 +405,97 @@ fun LibrarySearchOverlay(
     }
 }
 
-/** 展开层里的一行：两行文本 + 可选尾随动作（EhViewer 的 `ListItem` 造型）。 */
+/** JHenTai 的 EHTag：高 24 / 圆角 8 / 水平 6 / 垂直 3 / 字号 12；删除模式下弹入 × 徽章。 */
 @Composable
-private fun OverlayRow(
+private fun EhTagChip(
+    text: String,
+    tint: Color = MaterialTheme.colorScheme.onSurface,
+    inDeleteMode: Boolean = false,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .height(24.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceVariant)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 6.dp, vertical = 3.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp, lineHeight = 12.sp),
+            color = tint,
+        )
+        AnimatedVisibility(visible = inDeleteMode, enter = fadeIn(), exit = fadeOut()) {
+            Box(
+                Modifier
+                    .padding(start = 4.dp)
+                    .size(13.dp)
+                    .clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.error),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.Filled.Clear,
+                    contentDescription = "删除",
+                    tint = MaterialTheme.colorScheme.onError,
+                    modifier = Modifier.size(10.dp),
+                )
+            }
+        }
+    }
+}
+
+/** 命名空间筛选小胶囊（热门标签区用）。 */
+@Composable
+private fun FilterChipLike(
+    text: String,
+    selected: Boolean,
+    tint: Color,
+    onClick: () -> Unit,
+) {
+    Row(
+        Modifier
+            .height(28.dp)
+            .clip(RoundedCornerShape(999.dp))
+            .background(
+                if (selected) {
+                    tint.copy(alpha = 0.22f)
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                }
+            )
+            .clickable(onClick = onClick)
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (selected) tint else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** 两行联想行（EhViewer 的 `ListItem` 造型 + JHenTai 的命名空间着色与译名）。 */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SearchRow(
     leading: @Composable () -> Unit,
     title: String,
     subtitle: String?,
     titleColor: Color,
-    trailing: @Composable () -> Unit,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     Row(
         Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 12.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -342,11 +514,10 @@ private fun OverlayRow(
                     subtitle,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
-                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
+                    style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
         }
-        trailing()
     }
 }

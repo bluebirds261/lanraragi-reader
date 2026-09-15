@@ -274,6 +274,10 @@ class LibraryViewModel(
         viewModelScope.launch { container.searchHistoryRepository.remove(query) }
     }
 
+    fun clearSearchHistory() {
+        viewModelScope.launch { container.searchHistoryRepository.clear() }
+    }
+
     init {
         viewModelScope.launch {
             val s = container.settingsRepository.settings.first()
@@ -1558,10 +1562,33 @@ fun LibraryScreen(
      * 展开层直接铺在库页之上，历史与联想列表就在里面；「标签浏览」再去完整搜索页。
      */
     var searchExpanded by rememberSaveable { mutableStateOf(false) }
+    var searchSubmitted by rememberSaveable { mutableStateOf(false) }
     var overlayQuery by rememberSaveable { mutableStateOf("") }
     val overlayHistory by container.searchHistoryRepository.history
         .collectAsStateWithLifecycle(initialValue = emptyList())
     var overlaySuggestions by remember { mutableStateOf<List<TagStat>>(emptyList()) }
+    // 热门标签（服务端标签统计）：展开时拉一次，排除日期类元数据后按热度排
+    var overlayHotTags by remember { mutableStateOf<List<TagStat>>(emptyList()) }
+    var overlayHotNamespace by remember { mutableStateOf("") }
+    val overlayHotNamespaces = remember(overlayHotTags) {
+        buildList {
+            add("")
+            overlayHotTags.mapNotNull { it.namespace?.trim()?.takeIf(String::isNotBlank) }
+                .groupingBy { it }
+                .eachCount()
+                .entries
+                .sortedWith(compareByDescending<Map.Entry<String, Int>> { it.value }.thenBy { it.key })
+                .forEach { (ns, _) -> add(ns) }
+        }
+    }
+    LaunchedEffect(searchExpanded) {
+        if (!searchExpanded || overlayHotTags.isNotEmpty()) return@LaunchedEffect
+        overlayHotTags = runCatching {
+            container.repository.getTags()
+                .filterNot { it.isMetadataTag() }
+                .sortedWith(compareByDescending<TagStat> { it.weight }.thenBy { it.full.lowercase() })
+        }.getOrDefault(emptyList())
+    }
 
     // 联想去抖：词库 FTS 查询（与搜索页同一条数据源）
     LaunchedEffect(searchExpanded, overlayQuery) {
@@ -2185,44 +2212,65 @@ fun LibraryScreen(
         }
 
         // ================================================================
-        // 搜索胶囊的原地展开层（EhViewer 式展开：盖住库页，玻璃面板形变 + 联想列表）
+        // 搜索面（EhViewer 式原地展开；结果内嵌其中，不再有独立搜索页）
         // ================================================================
         LibrarySearchOverlay(
             expanded = searchExpanded,
+            submitted = searchSubmitted,
             query = overlayQuery,
-            onQueryChange = { overlayQuery = it },
+            onQueryChange = {
+                // 任何编辑都退回「历史 / 联想」态（JHenTai 的 bodyType 切换）
+                overlayQuery = it
+                searchSubmitted = false
+            },
             onSubmit = {
                 val q = overlayQuery.trim()
                 if (q.isNotEmpty()) {
                     vm.submitSearch(q)
-                } else {
-                    vm.clearQuery()
+                    searchSubmitted = true
                 }
-                searchExpanded = false
             },
-            onCollapse = { searchExpanded = false },
-            onOpenAdvanced = {
-                searchExpanded = false
-                navController.navigate(Routes.SEARCH)
+            onSubmitHistory = { h ->
+                overlayQuery = h
+                vm.submitSearch(h)
+                searchSubmitted = true
             },
-            onOpenFilter = {
+            onCollapse = {
                 searchExpanded = false
-                showFilter = true
+                searchSubmitted = false
             },
-            onAppendTag = { full ->
-                // 与搜索页同一写法：值用引号包住、结尾 $ 表示精确匹配（带空格的值更稳）
-                val token = full.substringBefore(':') + ":\"" + full.substringAfter(':') + "\$"
+            onAppendTag = { full, excluded ->
+                // 与拼写在一起的写法一致：值用引号包住、结尾 $ 表示精确匹配（带空格的值更稳）
+                val token =
+                    (if (excluded) "-" else "") +
+                        full.substringBefore(':') + ":\"" + full.substringAfter(':') + "\$"
                 overlayQuery =
                     if (overlayQuery.isBlank()) {
                         token
                     } else {
                         "${overlayQuery.trimEnd()},$token"
                     }
+                searchSubmitted = false
             },
             history = overlayHistory,
             onRemoveHistory = { h -> vm.removeSearchHistory(h) },
+            onClearHistory = { vm.clearSearchHistory() },
             suggestions = overlaySuggestions,
+            hotTags = overlayHotTags,
+            hotNamespaces = overlayHotNamespaces,
+            hotNamespace = overlayHotNamespace,
+            onHotNamespaceChange = { overlayHotNamespace = it },
+            resultCount = state.items.size,
             backdrop = backdrop,
+            resultsContent = { m ->
+                SearchResultsGrid(
+                    modifier = m,
+                    state = state,
+                    vm = vm,
+                    container = container,
+                    onOpen = openLibraryEntry,
+                )
+            },
         )
 
         // ================================================================
@@ -3543,4 +3591,68 @@ private fun LibraryDetailPane(
             TextButton(onClick = onRead) { Text("开始阅读") }
         }
     }
+}
+
+/*
+ * ============================================================
+ * 搜索面内嵌的结果列表（「结果内嵌」，JHenTai 的 SearchPageBodyType.galleries）
+ *
+ * 与库页网格共用同一份 LibraryViewModel 状态与 ArchiveCard，
+ * 因此卡片外观、点击/长按语义、分页加载与库页完全一致，
+ * 不会出现「两个列表两套行为」。差别只有顶部留白（结果从面板下方开始）。
+ * ============================================================
+ */
+@Composable
+private fun SearchResultsGrid(
+    modifier: Modifier,
+    state: LibraryState,
+    vm: LibraryViewModel,
+    container: AppContainer,
+    onOpen: (Archive) -> Unit,
+) {
+    val gridState = rememberLazyGridState()
+
+    // 触底续拉：与库页同一套 vm.loadMore()（可见尾项接近末尾时再拉一页）
+    LaunchedEffect(gridState) {
+        snapshotFlow { gridState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+            .collect { last ->
+                if (last >= state.items.size - 6 && state.hasMore && !state.loadingMore) {
+                    vm.loadMore()
+                }
+            }
+    }
+
+    LazyVerticalGrid(
+        columns = GridCells.Fixed(state.columns.coerceIn(2, 8)),
+        state = gridState,
+        modifier = modifier,
+        contentPadding = PaddingValues(start = 12.dp, top = 4.dp, end = 12.dp, bottom = 24.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        items(state.items, key = { it.arcid }) { archive ->
+            ArchiveCard(
+                archive = archive,
+                onClick = { onOpen(archive) },
+                selectionMode = false,
+                isSelected = false,
+                onLongPress = { vm.enterSelection(archive.arcid) },
+                thumbnailContainer = container,
+                isCached = archive.arcid in state.offlineArcidSet,
+            )
+        }
+    }
+}
+
+/** 热门标签要排除的机器元数据命名空间（日期/时间戳这类每个档案都有，会霸屏）。 */
+private val METADATA_NAMESPACES = setOf(
+    "date", "dates", "date_added", "timestamp", "timestamps", "temp", "temporary",
+    "日期", "添加日期", "时间戳", "临时",
+)
+
+private val DATE_LIKE = Regex("""^\d{4}-\d{2}-\d{2}([ T].*)?$""")
+
+private fun TagStat.isMetadataTag(): Boolean {
+    val ns = namespace?.trim()?.lowercase().orEmpty()
+    return ns in METADATA_NAMESPACES || DATE_LIKE.matches(text.trim())
 }
