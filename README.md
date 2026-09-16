@@ -4,7 +4,7 @@
 
 > **English** — A native Android client for self-hosted [LANraragi](https://github.com/Difegue/LANraragi) servers: Jetpack Compose UI, full REST API integration (library / search / reader / progress), offline archive caching, and a metadata-scraping + Chinese-localization workbench. Talks only to your own server; ships no content of its own.
 
-**状态**：`beta-0.1.1` · Kotlin 2.4 / Jetpack Compose (Material 3) / AGP 9.3 / Gradle 9.6 · minSdk 26（compileSdk 37）· 对接 LANraragi 0.9.81 · 单元测试 57 类 / 283 例全通过（另有 Room 迁移等仪器化测试）
+**状态**：`beta-0.1.1` · Kotlin 2.4 / Jetpack Compose (Material 3) / AGP 9.3 / Gradle 9.6 · minSdk 26（compileSdk 37）· 对接 LANraragi 0.9.81 · 单元测试 66 套件 / 332 例全通过（另有 Room 迁移等仪器化测试）
 
 > ⚠️ **免责声明**：本项目只是一个客户端，不提供、不托管、不索引任何内容，全部数据来自你自己部署的服务器。请遵守所在地法律法规，仅用于访问你有权访问的内容。
 
